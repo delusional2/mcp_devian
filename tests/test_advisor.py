@@ -488,3 +488,72 @@ def test_transferred_but_unpaid_is_not_revenue(conn):
     sales.set_status(conn, paid, "paid", now=NOW - 4 * DAY)
     by, _ = advisor._paid_by_format(conn, NOW)
     assert dict(by["usd"]) == {"flatsale": [30]}
+
+
+# --- 0.5: Boosty, перс до оплаты, ничего «накрученного» ---
+
+def test_listing_review_boosty_without_foreign_instructions(conn, cfg):
+    desc = ("SB: $15 MI: $2 AB: $80. Ends 48 hours after the last bid. Payment via Boosty. "
+            "You get a non-watermarked PNG. Please read my TOS.")
+    lot(conn, 1, "[OPEN] Dragon adopt auction", own=True, published=NOW - DAY, tags=["dragon"], extra={"desc": desc})
+    row = conn.execute("SELECT * FROM items WHERE id = 'da:1'").fetchone()
+    text = "\n".join(advisor.listing_review(row, conn, cfg, now=NOW))
+    assert advisor.BOOSTY_NO_HINT in text and "12.2025" in text
+    lot(conn, 2, "[OPEN] Dragon adopt auction", own=True, published=NOW - DAY, tags=["dragon"],
+        extra={"desc": desc + " Pick «card issued outside Russia», switch to USD, 3-D Secure."})
+    row = conn.execute("SELECT * FROM items WHERE id = 'da:2'").fetchone()
+    assert advisor.BOOSTY_NO_HINT not in "\n".join(advisor.listing_review(row, conn, cfg, now=NOW))
+
+
+def test_no_payment_hint_never_suggests_paypal_or_kofi(conn, cfg):
+    lot(conn, 1, "my new oc", lot_type="other", own=True, published=NOW - DAY, snippet="hi", tags=["art"])
+    row = conn.execute("SELECT * FROM items WHERE id = 'da:1'").fetchone()
+    line = next(x for x in advisor.listing_review(row, conn, cfg, now=NOW) if "оплаты" in x)
+    assert "Boosty" in line and "PayPal" not in line and "Ko-fi" not in line
+
+
+def test_transfer_before_payment_mentions_chargeback(conn, cfg):
+    sid = sales.add_sale(conn, title="Moth #1", amount=25, currency="usd", platform="toyhouse", format="flatsale",
+                         buyer="bob", now=NOW - 5 * DAY)
+    sales.set_status(conn, sid, "transferred", now=NOW - 4 * DAY)
+    unpaid = next(a for a in advisor.advice(conn, cfg, NOW) if a.kind == "unpaid")
+    assert "оплату картой можно оспорить через банк" in unpaid.detail
+    sales.set_status(conn, sid, "paid", now=NOW)
+    assert not [a for a in advisor.advice(conn, cfg, NOW) if a.kind == "unpaid"]
+
+
+BANNED = re.compile(r"buy\s+(?:likes|watchers|faves|followers)|накрут\w*|paid\s+boost|платн\w+\s+(?:продвижени|буст)|"
+                    r"куп\w+\s+(?:лайк|фав|подписчик|вотчер)|as\s+a\s+donation\s+to\s+avoid|"
+                    r"донат\w*\s+(?:вместо|чтобы\s+не)\s+\w*\s*налог|не\s+платить\s+налог|tax[-\s]free\s+donation", re.I)
+
+
+def test_no_banned_phrases_in_advice_checklist_offers(conn, cfg):
+    from mcp_devian import checklist, offers, selling
+    from mcp_devian.config import Posting
+
+    sid = sales.add_sale(conn, title="Moth #1", amount=25, currency="usd", platform="deviantart", format="auction",
+                         buyer="bob", now=NOW - 5 * DAY)
+    sales.set_status(conn, sid, "transferred", now=NOW - 4 * DAY)
+    for i in range(3):
+        lot(conn, 100 + i, f"Moth adopt {i}", lot_type="flatsale", usd=20, own=True, published=NOW - 20 * DAY,
+            tags=["moth"])
+    texts = [advisor.render_advice(advisor.advice(conn, cfg, NOW), limit=20)]
+    texts += [a.detail for a in advisor.advice(conn, cfg, NOW)]
+    p = Posting(boosty_url="https://boosty.to/m", payment_methods=["boosty", "points"], payment_plans=True)
+    for lot_type in ("auction", "flatsale", "raffle"):
+        items = checklist.check("hi", lot_type, p)
+        texts.append(checklist.render(items))
+    texts.append(checklist.facts_text())
+    texts.append(offers.render_bundles(offers.bundle_suggestions(conn, NOW)))
+    texts.append(offers.payment_plan_suggestion(100, 20, True)["text"])
+    texts.append(selling.payment_info(conn, boosty_url="https://boosty.to/m")["text"])
+    texts.append(sales.render_income(conn, 30, now=NOW))
+    for text in texts:
+        assert not BANNED.search(text), BANNED.search(text)
+        assert "donat" not in text.lower() or "не облагаются" not in text.lower()
+
+
+def test_boosty_hint_has_no_currency_switch():
+    """FAQ Boosty (12.2025): валюту доната не выбрать, конвертация автоматическая."""
+    assert "USD" not in advisor.BOOSTY_NO_HINT and "часто не проходят" not in advisor.BOOSTY_NO_HINT
+    assert "не для карт РФ" in advisor.BOOSTY_NO_HINT and "3-D Secure" in advisor.BOOSTY_NO_HINT

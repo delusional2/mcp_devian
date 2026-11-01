@@ -439,3 +439,26 @@ def test_render_scorecard_sorted_by_niche_times_pace():
     text = da_market.render_scorecard(rows)
     assert text.index("b / busy") < text.index("a / slow")
     assert "Групп для оценки нет" in da_market.render_scorecard([])
+
+
+# --- группы для истории рынка (backfill) ---
+
+def test_top_niche_groups_ordering(conn):
+    rows = [("alpha", "1", 2.0, 0.5), ("alpha", "2", 4.0, 0.5),   # у alpha лучшая папка — 2 (2.0)
+            ("beta", "7", 10.0, 0.1),                               # 1.0
+            ("gamma", "3", 1.0, 0.9),                               # 0.9
+            ("dead", "4", 0.0, 0.9),                                # мёртвая — нет
+            ("other", "5", 9.0, 0.0)]                               # не её ниша — нет
+    for grp, folder, lpd, share in rows:
+        conn.execute("INSERT INTO group_scores (grp, folder, size, lots_per_day, niche_share, n, ts) "
+                     "VALUES (?, ?, 10, ?, ?, 24, ?)", (grp, folder, lpd, share, NOW - DAY))
+    conn.execute("INSERT INTO group_scores (grp, folder, size, lots_per_day, niche_share, n, ts) "
+                 "VALUES ('stale', '9', 10, 50, 1, 24, ?)", (NOW - 90 * DAY,))
+    conn.execute("INSERT INTO da_folders (grp, folder_id, uuid, name, size, ts) VALUES ('alpha', '2', 'U-2', 'Auctions', 10, ?)",
+                 (NOW,))
+    cfg = cfg_with(groups=[DAGroup(url="https://www.deviantart.com/tracked/gallery/77/lots")])
+    got = da_market.top_niche_groups(conn, cfg, NOW, limit=4)
+    assert [g["grp"] for g in got] == ["alpha", "beta", "gamma", "tracked"]
+    assert got[0]["folder"] == "2" and got[0]["uuid"] == "U-2"
+    assert got[3]["folder"] is None  # без карточки — папку найдём потом
+    assert [g["grp"] for g in da_market.top_niche_groups(conn, cfg, NOW, limit=2)] == ["alpha", "beta"]

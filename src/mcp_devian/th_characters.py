@@ -753,7 +753,19 @@ def _ledger_id(url: str | None) -> str | None:
 
 
 def transfer_warnings(conn, character_url: str, buyer: str) -> list[str]:
-    """Сверка с журналом продаж перед передачей: оплачено ли, тот ли покупатель."""
+    """Сверка перед передачей: журнал продаж (оплачено ли, тот ли покупатель) и её списки — чёрный список,
+    отметки о неоплате и спорах (protection, только локально, без сети)."""
+    from . import protection
+
+    out = _ledger_warnings(conn, character_url, buyer)
+    try:
+        out += protection.transfer_warnings(conn, buyer)
+    except Exception as e:  # noqa: BLE001 — проверка-подсказка не мешает черновику передачи
+        out.append(f"Свои списки (чёрный список, отметки) не проверила: {type(e).__name__}.")
+    return out
+
+
+def _ledger_warnings(conn, character_url: str, buyer: str) -> list[str]:
     cid = character_id(character_url)
     buyer = _username(buyer).lower()
     if not cid:
@@ -769,7 +781,9 @@ def transfer_warnings(conn, character_url: str, buyer: str) -> list[str]:
     if sale["buyer"] and sale["buyer"].lstrip("@").lower() != buyer:
         out.append(f"В журнале покупатель — {sale['buyer']}, а передаёшь {buyer}.")
     if sale["status"] == "won":
-        out.append("Оплата по этой продаже ещё не отмечена — передавать до оплаты рискованно.")
+        from .sales import CHARGEBACK_NOTE
+
+        out.append(f"Оплата по этой продаже ещё не отмечена — передавать до оплаты рискованно; {CHARGEBACK_NOTE}.")
     return out
 
 

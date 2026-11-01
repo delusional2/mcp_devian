@@ -231,3 +231,66 @@ def test_ping_only_under_her_own_known_work(conn):
     own(conn, "da:7", mine=False)
     other = pinglist.mention_comments(conn, deviation_id="da:7", deviation_url="u")
     assert not other["ok"] and "не её" in other["reason"]
+
+
+# --- Выход из пинглиста = больше никаких предложений; ранний доступ ---
+
+@pytest.mark.parametrize("text", ["-", "−", " – ", "- pinglist", "−pl"])
+def test_bare_minus_is_leave(text):
+    assert pinglist.classify(text) == "out"
+
+
+def test_minus_comment_opts_out_of_offers(conn):
+    from mcp_devian import buyers
+
+    dev = own(conn, "da:1")
+    pinglist.ingest(conn, dev, [c("1", "Fan", "ping me please!", T0 + 10)], owner="her", now=T0 + 20)
+    assert not buyers.is_opted_out(conn, "fan")
+    out = pinglist.ingest(conn, dev, [c("2", "Fan", "−", T0 + 100)], owner="her", now=T0 + 200)
+    assert out["removed"] == ["Fan"]
+    assert buyers.is_opted_out(conn, "fan")
+    assert buyers.contact(conn, "fan")["opt_out_reason"] == "pinglist_leave"
+    # повторный разбор тех же комментариев после её opt_in не выключает снова
+    buyers.opt_in(conn, ["fan"], T0 + 300)
+    pinglist.ingest(conn, dev, [c("2", "Fan", "−", T0 + 100)], owner="her", now=T0 + 400)
+    assert not buyers.is_opted_out(conn, "fan")
+
+
+def test_stop_comment_opts_out_without_touching_pinglist(conn):
+    from mcp_devian import buyers
+
+    dev = own(conn, "da:1")
+    out = pinglist.ingest(conn, dev, [c("5", "Buyer", "stop", T0 + 10), c("6", "Other", "so cute!", T0 + 11)],
+                          owner="her", now=T0 + 20)
+    assert out == {"added": [], "removed": []}
+    assert buyers.is_opted_out(conn, "buyer") and not buyers.is_opted_out(conn, "other")
+    assert buyers.contact(conn, "buyer")["opt_out_reason"] == "comment_stop"
+
+
+def test_early_access_plan():
+    off = pinglist.early_access_plan(T0, 0)
+    assert off["enabled"] is False and off["public_at"] == T0 and off["steps"] == []
+    plan = pinglist.early_access_plan(T0, 6)
+    assert plan["enabled"] and plan["ping_at"] == T0 and plan["public_at"] == T0 + 6 * 3600
+    assert plan["steps"][0]["at"] == T0 and "пинг" in plan["steps"][0]["what"]
+    assert all(s["at"] == T0 + 6 * 3600 for s in plan["steps"][1:])
+    assert any("X" in s["what"] for s in plan["steps"]) and any("группы" in s["what"] for s in plan["steps"])
+    assert "группы DA через API" in plan["note"]
+    assert pinglist.early_access_plan(T0, 100)["public_at"] == T0 + 48 * 3600
+
+
+def test_undated_stop_after_opt_in_applies_once(conn):
+    """Регрессия: «stop» без даты после её opt_in раньше навсегда считался старым (signal_ts=0)."""
+    from mcp_devian import buyers
+
+    dev = own(conn, "da:1")
+    pinglist.ingest(conn, dev, [c("7", "Buyer", "stop", 0)], owner="her", now=T0 + 10)
+    assert buyers.is_opted_out(conn, "buyer")
+    buyers.opt_in(conn, ["buyer"], T0 + 100)
+    # тот же комментарий при повторном чтении — уже разобран, её opt_in в силе
+    pinglist.ingest(conn, dev, [c("7", "Buyer", "stop", 0)], owner="her", now=T0 + 200)
+    assert not buyers.is_opted_out(conn, "buyer")
+    # новый комментарий без даты — сказан сейчас, выключает снова
+    pinglist.ingest(conn, dev, [c("7", "Buyer", "stop", 0), c("8", "Buyer", "stop pls", 0)], owner="her",
+                    now=T0 + 300)
+    assert buyers.is_opted_out(conn, "buyer")

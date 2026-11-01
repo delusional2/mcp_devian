@@ -125,7 +125,8 @@ def _check(args, tick: float | None) -> int:
         results = monitor.run_check(conn, cfg, sources=sources, force=not args.scheduled, now=tick,
                                     interactive=not args.scheduled)
         _print_results(results)
-        if any(r.source == "deviantart" and not r.skipped for r in results):
+        da_read = any(r.source == "deviantart" and not r.skipped for r in results)
+        if da_read:
             bid_lines, events = monitor.refresh_auctions(conn, cfg)
             for line in bid_lines:
                 print(line)
@@ -154,6 +155,12 @@ def _check(args, tick: float | None) -> int:
                 print(f"дайджест: {sent['items']} шт. → {sent['file']}")
             if sent["telegram_error"]:
                 print(f"telegram: {sent['telegram_error']}")
+        if da_read or args.scheduled:
+            # Не только после чтения DA: у продавщицы только на Toyhouse (или пока DA на паузе) LF-уведомления
+            # Toyhouse, покупатели и палитры тоже нужны. Части DeviantArt growth_pass сам держит в паузе/бюджете.
+            # После её запланированных постов и дайджеста: долгий проход (история рынка, палитры) их не задержит.
+            for line in _growth(conn, cfg, tick):
+                print(line)
     return 0
 
 
@@ -162,6 +169,15 @@ def _market_sample(conn, cfg, tick: float | None) -> list[str]:
     try:
         return da_market.maybe_sample(conn, cfg, tick)
     except Exception:  # noqa: BLE001 — maybe_sample и так не бросает; на всякий случай
+        traceback.print_exc()
+        return []
+
+
+def _growth(conn, cfg, tick: float | None) -> list[str]:
+    """Покупатели, история рынка, палитры, LF Toyhouse (monitor.growth_pass). Ошибка не мешает проверке."""
+    try:
+        return monitor.growth_pass(conn, cfg, tick)
+    except Exception:  # noqa: BLE001 — growth_pass и так не бросает; на всякий случай
         traceback.print_exc()
         return []
 
@@ -311,7 +327,23 @@ def cmd_da_connect(args) -> int:
     if not cfg.posting.da_client_id:
         print("Нет client_id приложения DeviantArt.")
         return 1
-    return da_api.connect_main(cfg.posting.da_client_id)
+    code = da_api.connect_main(cfg.posting.da_client_id, scope=da_api.scope_string(cfg.posting.da_extra_scopes))
+    if code == 0:
+        _queue_market_history(cfg)
+    return code
+
+
+def _queue_market_history(cfg) -> None:
+    """После подключения DA: поставить в очередь историю рынка (её галерея и группы ниши, только чтение).
+    Читать будет фоновая проверка понемногу; сбой очереди не портит подключение."""
+    from . import backfill
+
+    try:
+        with db.session() as conn:
+            backfill.enqueue(conn, None, cfg.deviantart.my_username, cfg.deviantart.backfill_days, time.time(),
+                             cfg=cfg)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
 
 
 def cmd_serve(args) -> int:

@@ -13,7 +13,7 @@ import re
 import time
 from typing import Any
 
-from . import auctions, selling
+from . import auctions, buyers, selling
 
 # DeviantArt не публикует лимит упоминаний, но комментарий с десятками @ников похож на спам и
 # может попасть под фильтр. 10 на комментарий и не больше 5 комментариев за раз (50 человек) —
@@ -80,6 +80,8 @@ OUT = [
     re.compile(r"(?:убер\w*|удал\w*|исключ\w*|выкин\w*|вычеркн\w*)\s+(?:меня\s+)?(?:из\s+)?пинг", re.I),
     re.compile(r"(?<![\w])не\s+(?:надо\s+|нужно\s+)?(?:меня\s+)?(?:пинг\w*|тег\w*)", re.I),
     re.compile(r"больше\s+не\s+(?:пинг|тег)", re.I),
+    # Обычай пинглистов: «+» — добавить, «−» — убрать. Голый минус (можно с «pl»/«pinglist») — выход.
+    re.compile(r"^\s*[-−–—]\s*(?:pl|ping\s*-?\s*list|пинг-?лист)?\s*[.!]*\s*$", re.I),
 ]
 IN = [
     re.compile(rf"\b(?:add|put)\s+me\s+(?:to|on|in|into|onto)\s+{_WHOSE}{_PL}", re.I),
@@ -196,9 +198,19 @@ def ingest(conn, deviation_id: str, comments: list, owner: str, now: float | Non
         if not c.user or _key(c.user) == owner_key or not USERNAME.match(c.user.strip().lstrip("@")):
             continue
         signal = classify(c.text)
-        if not signal:
-            continue
         cid = str(c.comment_id or "")
+        if not signal:
+            if buyers.detect_opt_out(c.text):
+                # «stop» под её работой (например, в ответ на предложение): больше не предлагаем.
+                # Каждый комментарий решает один раз. Новый комментарий без даты — сказан сейчас (иначе
+                # после её opt_in он бы навсегда считался «старым»); без id и даты — «неизвестно когда».
+                if cid and conn.execute("SELECT 1 FROM pinglist_seen WHERE comment_id = ?", (cid,)).fetchone():
+                    continue
+                if cid:
+                    conn.execute("INSERT OR IGNORE INTO pinglist_seen (comment_id, ts) VALUES (?, ?)", (cid, now))
+                buyers.opt_out(conn, [c.user], "comment_stop", now,
+                               signal_ts=c.posted_ts or (now if cid else 0.0))
+            continue
         if cid and conn.execute("SELECT 1 FROM pinglist_seen WHERE comment_id = ?", (cid,)).fetchone():
             continue
         if cid:
@@ -214,7 +226,10 @@ def ingest(conn, deviation_id: str, comments: list, owner: str, now: float | Non
         if what == "added":
             removed = [u for u in removed if _key(u) != _key(name)]
             added.append(name)
-        elif what == "removed":
+        if signal == "out":
+            # Ушёл из пинглиста — значит, и предложения ему больше не нужны (пока она сама не вернёт).
+            buyers.opt_out(conn, [name], "pinglist_leave", now, signal_ts=signal_ts)
+        if what == "removed":
             if any(_key(u) == _key(name) for u in added):
                 added = [u for u in added if _key(u) != _key(name)]
             else:
@@ -294,14 +309,16 @@ def release(conn, deviation_id: str, users: list[str], reserved_until: float | N
 
 
 def not_wanted(conn, deviation_id: str, users: list[str]) -> list[str]:
-    """Перед самой отправкой: кто уже вышел из пинглиста или уже упомянут под этой работой."""
+    """Перед самой отправкой: кто уже вышел из пинглиста, уже упомянут под этой работой или попал в её
+    чёрный список (неоплата, спор)."""
     ensure(conn)
     out = []
+    bad = buyers.bad_deals(conn)
     for u in users:
         k = _key(u)
         row = conn.execute("SELECT status FROM pinglist WHERE key = ?", (k,)).fetchone()
         sent = conn.execute("SELECT 1 FROM pinglist_sent WHERE deviation_id = ? AND key = ?", (deviation_id, k)).fetchone()
-        if not row or row["status"] != "in" or sent:
+        if not row or row["status"] != "in" or sent or k in bad:
             out.append(u)
     return out
 
@@ -318,7 +335,8 @@ def mention_comments(conn, *, deviation_id: str, deviation_url: str, title: str 
     """Комментарии-пинги под её новой работой: её шаблон «pinglist» + до per_comment @ников в каждом.
 
     {"ok", "reason", "deviation_id", "deviation_url", "comments": [{"text", "users"}], "left_out": [ники],
-     "already": сколько уже упомянуто или стоит в черновике под этой работой}
+     "already": сколько уже упомянуто или стоит в черновике под этой работой,
+     "blocked": [(ник, почему)] — в её чёрном списке или с неоплатой/спором: их не отмечаем}
     Под одной работой — не больше MAX_PER_COMMENT × MAX_COMMENTS упоминаний за всё время, не только за раз.
     Работа должна быть её (items.own = 1). reserve_users=True — при создании черновика: ники занимаются,
     второй черновик их не возьмёт (после отправки — mark_pinged, при отмене — release).
@@ -330,7 +348,7 @@ def mention_comments(conn, *, deviation_id: str, deviation_url: str, title: str 
     per_comment = max(1, min(int(per_comment or MAX_PER_COMMENT), MAX_PER_COMMENT))
     max_comments = max(1, min(int(max_comments or MAX_COMMENTS), MAX_COMMENTS))
     base: dict[str, Any] = {"deviation_id": deviation_id, "deviation_url": deviation_url, "comments": [],
-                            "left_out": [], "already": 0}
+                            "left_out": [], "already": 0, "blocked": []}
     item = conn.execute("SELECT own FROM items WHERE id = ?", (deviation_id,)).fetchone()
     if not item:
         return {**base, "ok": False, "reason": "этой работы нет в базе — сначала обнови свои работы"}
@@ -345,7 +363,11 @@ def mention_comments(conn, *, deviation_id: str, deviation_url: str, title: str 
     taken = {r["key"] for r in conn.execute("SELECT key FROM pinglist_sent WHERE deviation_id = ?", (deviation_id,))}
     taken |= {r["key"] for r in conn.execute("SELECT key FROM pinglist_pending WHERE deviation_id = ? AND ts > ?",
                                              (deviation_id, now - PENDING_TTL_S))}
+    # Её чёрный список, неоплата, спор — даже из пинглиста не отмечаем.
+    bad = buyers.bad_deals(conn)
     everyone = [m["user"] for m in members(conn)]
+    base["blocked"] = [(u, bad[_key(u)]) for u in everyone if _key(u) in bad]
+    everyone = [u for u in everyone if _key(u) not in bad]
     todo = [u for u in everyone if _key(u) not in taken]
     base["already"] = len(taken)
     room = MAX_PER_COMMENT * MAX_COMMENTS - len(taken)
@@ -374,3 +396,27 @@ def mention_comments(conn, *, deviation_id: str, deviation_url: str, title: str 
     if reserve_users:
         reserve(conn, deviation_id, [u for users in use for u in users], now)
     return {**base, "ok": True, "reason": ""}
+
+
+# --- Ранний доступ пинглиста ---
+
+EARLY_ACCESS_MAX_H = 48
+GROUPS_NOTE = ("группы DA через API выбираются только в момент публикации: при раннем доступе работа выходит "
+               "в галерею сразу, а в группы она добавляет вручную позже")
+
+
+def early_access_plan(publish_ts: float, hours: float) -> dict:
+    """Пинглист видит работу раньше всех: пинг сразу после публикации, X/статус/группы — через hours часов.
+    hours = 0 — выключено (всё в момент публикации). {"enabled", "ping_at", "public_at", "steps", "note"}"""
+    hours = max(0.0, min(float(hours or 0), EARLY_ACCESS_MAX_H))
+    ping_at = float(publish_ts)
+    public_at = ping_at + hours * 3600
+    if not hours:
+        return {"enabled": False, "ping_at": ping_at, "public_at": ping_at, "steps": [], "note": ""}
+    steps = [
+        {"at": ping_at, "what": "пинг пинглиста комментарием под её работой (черновик → её «го»)"},
+        {"at": public_at, "what": "пост в X (черновик, «Post» жмёт она)"},
+        {"at": public_at, "what": "статус на DeviantArt (черновик → её «го»)"},
+        {"at": public_at, "what": "группы DA — вручную, по лимитам групп"},
+    ]
+    return {"enabled": True, "ping_at": ping_at, "public_at": public_at, "steps": steps, "note": GROUPS_NOTE}

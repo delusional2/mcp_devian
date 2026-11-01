@@ -84,3 +84,26 @@ def test_listing_review_uses_market_share_for_end_time(conn):
     text = "\n".join(advisor.listing_review(row, conn, Config(), now=NOW))
     assert "когда закончится аукцион" in text and "срок пишут 25 из 30 аукционов (83%)" in text
     assert "В названии нет цены" not in text and "поднимает клики" not in text
+
+
+@pytest.mark.parametrize("text, on, off", [
+    ("Payment via boosty.to/mothart (donate)", {"pay_boosty"}, {"pay_other", "foreign_pay_hint"}),
+    ("Pay on Boosty: pick «card issued outside Russia», switch the currency to USD, 3-D Secure needed",
+     {"pay_boosty", "foreign_pay_hint"}, {"pay_other"}),
+    ("Foreign cards work on my Boosty, 3DS required", {"pay_boosty", "foreign_pay_hint"}, set()),
+    # Валюту на Boosty не выбирают (FAQ 12.2025) — «switch to USD» подсказкой не считается.
+    ("Boosty only. I'll switch to USD later", {"pay_boosty"}, {"foreign_pay_hint"}),
+    ("Boosty, set price eur", {"pay_boosty"}, {"foreign_pay_hint"}),
+    ("Paying by card via Stripe", {"pay_other"}, {"pay_boosty"}),
+    ("Please pay within 48 hours after the auction ends", {"payment_window"}, set()),
+    ("You have 24h to pay, otherwise it goes to the 2nd bidder", {"payment_window"}, set()),
+    ("Payment is due in 2 days", {"payment_window"}, set()),
+    ("Auction ends in 48 hours", set(), {"payment_window"}),
+])
+def test_boosty_and_payment_facts(text, on, off):
+    f = listing.listing_facts(text)
+    for k in on:
+        assert f[k] is True, k
+    for k in off:
+        assert f[k] is False, k
+    assert listing.pays_any(f) is bool(f["pay_boosty"] or f["pay_other"])

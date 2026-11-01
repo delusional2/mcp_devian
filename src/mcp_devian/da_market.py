@@ -38,7 +38,8 @@ from .taxonomy import tag_text
 log = logging.getLogger(__name__)
 
 __all__ = ["SEARCH_PLACE_PREFIX", "SampleResult", "niche_profile", "niche_queries", "sample_market", "maybe_sample",
-           "render", "buyers", "render_buyers", "group_scorecard", "group_scorecard_many", "render_scorecard"]
+           "render", "buyers", "render_buyers", "group_scorecard", "group_scorecard_many", "render_scorecard",
+           "top_niche_groups"]
 
 RUN_SOURCE = "da_sampler"
 TAGS_SUGGEST_RUN = "da_tags_suggest"
@@ -710,6 +711,36 @@ def scorecard_candidates(conn, cfg: Config, now: float, limit: int = MAX_GROUPS)
         for g, _ in linked.most_common(5):
             add(g)
     return out[:limit]
+
+
+TOP_GROUPS_MAX_AGE_S = 60 * 86400
+
+
+def top_niche_groups(conn, cfg: Config, now: float, limit: int = 6) -> list[dict]:
+    """Самые живые группы её ниши для истории рынка (backfill): по одной лучшей папке на группу.
+
+    Сначала карточки групп (group_scores не старше 60 дней): доля её ниши × лотов в день, папки без её
+    ниши (доля 0) и мёртвые (0 лотов в день) не берём. Потом — кандидаты без карточки (scorecard_candidates),
+    у них папка ещё неизвестна (folder=None). → [{grp, folder, uuid, name, score}]."""
+    rows = conn.execute(
+        "SELECT s.grp, s.folder, s.lots_per_day, s.niche_share, f.uuid, f.name FROM group_scores s "
+        "LEFT JOIN da_folders f ON f.grp = s.grp AND f.folder_id = s.folder WHERE s.ts >= ?",
+        (now - TOP_GROUPS_MAX_AGE_S,)).fetchall()
+    best: dict[str, dict] = {}
+    for r in rows:
+        if not r["lots_per_day"] or (r["niche_share"] is not None and r["niche_share"] <= 0):
+            continue
+        score = (r["niche_share"] if r["niche_share"] is not None else 1.0) * r["lots_per_day"]
+        grp = (r["grp"] or "").lower()
+        if grp and (grp not in best or score > best[grp]["score"]):
+            best[grp] = {"grp": grp, "folder": str(r["folder"]), "uuid": r["uuid"], "name": r["name"], "score": score}
+    out = sorted(best.values(), key=lambda d: (-d["score"], d["grp"]))[:max(0, limit)]
+    for grp in scorecard_candidates(conn, cfg, now):
+        if len(out) >= limit:
+            break
+        if grp not in best:
+            out.append({"grp": grp, "folder": None, "uuid": None, "name": None, "score": 0.0})
+    return out
 
 
 def _cached(conn, group: str, now: float) -> list[dict] | None:

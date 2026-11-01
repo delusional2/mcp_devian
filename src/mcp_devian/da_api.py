@@ -47,6 +47,13 @@ SCOPES = "basic user browse stash publish gallery comment.post"
 EDIT_SCOPES = ("stash", "publish")
 GALLERY_SCOPES = ("browse", "gallery")
 COMMENT_SCOPES = ("browse", "comment.post")
+# Статусы и журналы от её имени (только по её «го») и чтение её уведомлений: права сверх SCOPES,
+# которые она даёт отдельным переподключением. Других прав помощник не просит никогда
+# (подписки на людей, лайки и т.п. он не делает и методов для них нет).
+MANAGE_SCOPES = ("user.manage",)
+MESSAGE_SCOPES = ("message",)
+EXTRA_SCOPES = ("user.manage", "message")
+WHOFAVED_PAGE = 50  # limit у /deviation/whofaved — не больше 50
 MINOR_VERSION = "20240701"
 TOKEN_FILE = "da-token.json"
 
@@ -248,12 +255,21 @@ def pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-def authorize_url(client_id: str, state: str, challenge: str, redirect_uri: str = REDIRECT_URI) -> str:
+def scope_string(extra=()) -> str:
+    """SCOPES плюс разрешённые дополнительные права (только из EXTRA_SCOPES); неизвестное отбрасывается."""
+    if isinstance(extra, str):
+        extra = re.split(r"[\s,]+", extra)
+    wanted = {str(x).strip() for x in extra or () if str(x).strip()}
+    return " ".join([SCOPES, *(s for s in EXTRA_SCOPES if s in wanted)])
+
+
+def authorize_url(client_id: str, state: str, challenge: str, redirect_uri: str = REDIRECT_URI,
+                  scope: str = SCOPES) -> str:
     params = {
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": SCOPES,
+        "scope": scope or SCOPES,
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
@@ -280,7 +296,7 @@ PAGE = """<!doctype html><html lang="ru"><meta charset="utf-8"><title>DeviantArt
 
 
 def run_oauth_flow(client_id: str, store: TokenStore, port: int = 8765, timeout_s: float = 300,
-                   opener=webbrowser.open, http: httpx.Client | None = None) -> dict:
+                   opener=webbrowser.open, http: httpx.Client | None = None, scope: str = SCOPES) -> dict:
     """Открыть страницу «Разрешить» в браузере и дождаться возврата на localhost.
 
     Блокирует, пока она не нажмёт кнопку (или до таймаута). Возвращает {"username": ...}.
@@ -363,7 +379,7 @@ def run_oauth_flow(client_id: str, store: TokenStore, port: int = 8765, timeout_
         raise DAApiError(f"Не получилось открыть порт {port} для входа: {e}") from e
     try:
         # Браузер открываем в отдельном потоке: сервер уже слушает, а opener может блокировать.
-        threading.Thread(target=opener, args=(authorize_url(client_id, state, challenge, redirect_uri),),
+        threading.Thread(target=opener, args=(authorize_url(client_id, state, challenge, redirect_uri, scope),),
                          daemon=True).start()
         deadline = time.time() + timeout_s
         while time.time() < deadline and not outcome:
@@ -408,14 +424,14 @@ def _localhost_servers(port: int, handler) -> list[HTTPServer]:
     return servers
 
 
-def connect_main(client_id: str) -> int:
+def connect_main(client_id: str, scope: str = SCOPES) -> int:
     """Точка входа для команды подключения: открывает браузер и ждёт «Разрешить»."""
     if not client_id:
         print("Нет client_id приложения DeviantArt.")
         return 1
     print("Открываю DeviantArt в браузере. Нажми «Разрешить» (Authorize) — пароль сюда вводить не нужно.")
     try:
-        result = run_oauth_flow(client_id, TokenStore())
+        result = run_oauth_flow(client_id, TokenStore(), scope=scope)
     except DAApiError as e:
         print(f"Не получилось: {e}")
         return 1
@@ -449,8 +465,9 @@ def normalize_publish_fields(title: str, tags=()) -> tuple[str, list[str], list[
     if not clean_title:
         raise DAApiError("Нужно название работы.", "title_empty")
     if len(clean_title) > MAX_TITLE:
-        raise DAApiError(f"Название длиннее {MAX_TITLE} символов ({len(clean_title)}) — DeviantArt его обрежет. "
-                         "Попроси её сократить.", "title_too_long")
+        raise DAApiError(f"Название длиннее {MAX_TITLE} символов ({len(clean_title)}): DeviantArt может его обрезать, "
+                         "а в описании API предел не назван — держусь 50, чтобы не рисковать. Попроси её сократить.",
+                         "title_too_long")
     clean_tags = _clean_tags(tags)
     notes: list[str] = []
     seen = {t.lower() for t in clean_tags}
@@ -1140,6 +1157,113 @@ class DAClient:
         res = self._write(f"/comments/post/deviation/{deviationid}", data, COMMENT_SCOPES, "комментарий")
         return {"commentid": res.get("commentid")}
 
+    # кто фавнул её работу и её уведомления (чтение)
+
+    def whofaved(self, deviationid: str, max_users: int = 100) -> list[dict]:
+        """Кто добавил работу в избранное: [{username, is_minor, is_watching, ts}] (GET /deviation/whofaved).
+
+        Постранично по 50, не больше max_users; каждый запрос — в общем бюджете da_access."""
+        out: list[dict] = []
+        offset: int | None = 0
+        while offset is not None and len(out) < max_users:
+            rows, offset = self.whofaved_page(deviationid, offset, min(WHOFAVED_PAGE, max_users - len(out)))
+            out += rows[:max_users - len(out)]
+        return out
+
+    def whofaved_page(self, deviationid: str, offset: int = 0, limit: int = WHOFAVED_PAGE) -> tuple[list[dict], int | None]:
+        """Одна страница whofaved (один запрос): (строки, следующий offset или None — дальше никого).
+        is_minor / is_watching — None, если DeviantArt поле не прислал (возраст неизвестен ≠ «взрослый»)."""
+        body = self._request("GET", "/deviation/whofaved",
+                             params={"deviationid": deviationid, "limit": max(1, min(WHOFAVED_PAGE, int(limit))),
+                                     "offset": int(offset)})
+        rows: list[dict] = []
+        for row in body.get("results") or []:
+            user = (row or {}).get("user") or {}
+            name = str(user.get("username") or "")
+            if not name:
+                continue
+            rows.append({"username": name, "is_minor": _opt_bool(user, "is_minor"),
+                         "is_watching": _opt_bool(user, "is_watching"), "ts": _posted_ts((row or {}).get("time"))})
+        nxt = _next_offset(body, offset)
+        return rows, nxt
+
+    def comments_page(self, deviationid: str, offset: int = 0, limit: int = 50) -> tuple[list[Comment], int | None]:
+        """Одна страница комментариев под работой (один запрос, ответы до 5 уровней внутри страницы):
+        (комментарии, следующий offset или None — дальше ничего)."""
+        body = self._request("GET", f"/comments/deviation/{deviationid}",
+                             params={"maxdepth": 5, "limit": max(1, min(50, int(limit))), "offset": int(offset),
+                                     "expand": "comment.fulltext"})
+        out = [_comment_from_api(raw) for raw in body.get("thread") or []
+               if isinstance(raw, dict) and raw.get("commentid") and not raw.get("hidden")]
+        nxt = _next_offset(body, offset)
+        return out, nxt
+
+    def deviation_url(self, deviationid: str) -> str:
+        """Ссылка на работу/журнал по UUID (GET /deviation/{id}); '' — DeviantArt её не назвал."""
+        return str((self._request("GET", f"/deviation/{deviationid}") or {}).get("url") or "")
+
+    def messages_feedback(self, kind: str = "comments", max_items: int = 50) -> list[dict]:
+        """Её уведомления (GET /messages/feedback, право message): [{type, username, ts, deviationid, text}].
+
+        Без права message — NeedsReconnect. Что входит в activity, DeviantArt не описывает."""
+        if kind not in ("comments", "replies", "activity"):
+            raise DAApiError("Тип уведомлений: comments, replies или activity.", "bad_kind")
+        self.require_scopes(*MESSAGE_SCOPES)
+        out: list[dict] = []
+        cursor = None
+        while len(out) < max_items:
+            params: dict = {"type": kind, "stack": "false"}
+            if cursor:
+                params["cursor"] = cursor
+            body = self._request("GET", "/messages/feedback", params=params)
+            for m in body.get("results") or []:
+                if not isinstance(m, dict):
+                    continue
+                subject = m.get("subject") or {}
+                dev = subject.get("deviation") or (m.get("deviation") or {})
+                comment = m.get("comment") or {}
+                out.append({"type": str(m.get("type") or ""),
+                            "username": str((m.get("originator") or {}).get("username") or ""),
+                            "ts": _posted_ts(m.get("ts")), "deviationid": str((dev or {}).get("deviationid") or ""),
+                            "text": _plain(comment.get("body") or "") if isinstance(comment, dict) else ""})
+                if len(out) >= max_items:
+                    break
+            new = body.get("cursor")
+            if not body.get("has_more") or not new or new == cursor:
+                break
+            cursor = new
+        return out
+
+    # статус и журнал от её имени — только по её «го» (черновики da_status / da_journal)
+
+    def post_status(self, body: str, deviationid: str | None = None) -> dict:
+        """Статус в её профиле (её текст как есть), можно с её работой. Не идемпотентно: нет ответа — UncertainPublish."""
+        data = {"body": body}
+        if deviationid:
+            data["id"] = deviationid
+        res = self._write("/user/statuses/post", data, MANAGE_SCOPES, "статус")
+        return {"statusid": res.get("statusid")}
+
+    def create_journal(self, title: str, body: str, is_mature: bool = False, tags=(),
+                       allow_comments: bool = True) -> dict:
+        """Журнал от её имени (POST /deviation/journal/create, право user.manage). Не повторяется."""
+        data: dict = {"title": title, "body": body, "is_mature": _bool(is_mature),
+                      "allow_comments": _bool(allow_comments)}
+        clean = _clean_tags(tags)
+        if clean:
+            data["tags[]"] = clean
+        res = self._write("/deviation/journal/create", data, MANAGE_SCOPES, "журнал")
+        devid = res.get("deviationid")
+        # По документации ответ — только deviationid; ссылку дочитываем одним GET. Журнал уже создан:
+        # сбой этого чтения не делает публикацию «неизвестной», просто ссылки не будет.
+        url = str(res.get("url") or "")
+        if not url and devid:
+            try:
+                url = self.deviation_url(str(devid))
+            except Exception:  # noqa: BLE001
+                url = ""
+        return {"deviationid": devid, "url": url}
+
     def revoke(self) -> str:
         """Отключить DeviantArt. Локальный токен удаляется в любом случае.
 
@@ -1186,6 +1310,20 @@ def _posted_ts(value) -> float:
 def _plain(body_html: str) -> str:
     text = re.sub(r"<br\s*/?>|</p>", "\n", body_html or "", flags=re.I)
     return re.sub(r"[ \t]+", " ", html.unescape(_TAG.sub("", text))).strip()
+
+
+def _next_offset(body: dict, offset: int) -> int | None:
+    """Следующий offset страницы или None — дальше ничего (has_more = false или offset не сдвинулся)."""
+    nxt = body.get("next_offset")
+    if not body.get("has_more") or nxt is None or int(nxt) == int(offset):
+        return None
+    return int(nxt)
+
+
+def _opt_bool(d: dict, key: str) -> bool | None:
+    """Поле-флаг из ответа: True/False как есть, None — поля нет (неизвестно)."""
+    v = d.get(key)
+    return None if v is None else bool(v)
 
 
 def _comment_from_api(raw: dict) -> Comment:

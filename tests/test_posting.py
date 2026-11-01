@@ -249,3 +249,101 @@ def test_sending_switched_off_in_this_release(tmp_path, monkeypatch):
     for call in (lambda: mcp_server.submit_draft("x"), lambda: mcp_server.prepare_toyhouse_reply("th:1", "Луна"),
                  lambda: mcp_server.prepare_deviantart_publish("/x.png", "T"), mcp_server.da_connect):
         assert call() == posting.NOT_YET
+
+
+# --- 0.5: правила групп и честная заметка о длине названия ---
+
+@pytest.mark.parametrize("text, want", [("1/week", {"count": 1, "days": 7}), ("2/day", {"count": 2, "days": 1}),
+                                        ("1/month", {"count": 1, "days": 30}), ("3/7d", {"count": 3, "days": 7}),
+                                        (" 1 / 2 weeks ", {"count": 1, "days": 14}), ("1/неделю", {"count": 1, "days": 7}),
+                                        ("", None)])
+def test_group_limit_parsing(text, want):
+    assert posting.parse_group_limit(text) == want
+
+
+@pytest.mark.parametrize("text", ["weekly", "1/fortnight", "0/day", "5", "1/400d", "-1/week"])
+def test_group_limit_bad_strings_rejected(text):
+    with pytest.raises(SettingsError, match="1/week"):
+        posting.parse_group_limit(text)
+
+
+class FakeGroups:
+    def resolve_group_folder(self, group, folder):
+        return {"group": group, "group_id": "g", "folder_id": "f", "folder_name": folder}
+
+
+def test_preset_stores_limit_and_keeps_it_on_readd(cfg, monkeypatch):
+    monkeypatch.setattr(posting, "da_client", lambda c: FakeGroups())
+    entry = posting.add_group_to_preset(cfg, "a", "Adopt-Club", "Open", limit="1/week")
+    assert entry["limit"] == {"count": 1, "days": 7}
+    posting.add_group_to_preset(cfg, "a", "adopt-club", "Open")
+    assert cfg.posting.group_presets["a"][0]["limit"] == {"count": 1, "days": 7}
+    with pytest.raises(SettingsError):
+        posting.add_group_to_preset(cfg, "a", "x", "y", limit="often")
+
+
+def test_group_window_blocks_with_manual_logs(conn, cfg):
+    from mcp_devian import limits
+
+    cfg.posting.group_presets = {"a": [{"group": "Adopt-Club", "group_id": "g", "folder_id": "f", "folder_name": "x",
+                                        "limit": {"count": 2, "days": 7}}],
+                                 "b": [{"group": "adopt-club", "group_id": "g", "folder_id": "f", "folder_name": "y",
+                                        "limit": {"count": 3, "days": 7}}]}
+    assert limits.group_limit(cfg.posting, "ADOPT-CLUB") == (2, 7)  # самое строгое правило
+    drafts.log_sent(conn, "da_group", "adopt-club", "d1", True, now=NOW - 5 * 86400)
+    assert limits.deviantart_group_block(conn, cfg.posting, "Adopt-Club", now=NOW) is None
+    drafts.log_sent(conn, "da_group_manual", "adopt-club", "da:5", True, now=NOW - 3 * 86400)
+    why = limits.deviantart_group_block(conn, cfg.posting, "Adopt-Club", now=NOW)
+    assert why and "2 за 7 дн" in why and "уже отправлено 2" in why
+    assert limits.deviantart_group_block(conn, cfg.posting, "Adopt-Club", now=NOW + 3 * 86400) is None
+    assert limits.deviantart_group_block(conn, cfg.posting, "other", now=NOW) is None
+
+
+def test_group_window_in_publish_preview(conn, cfg, home):
+    img = home / "Downloads" / "m.png"
+    img.write_bytes(b"x")
+    cfg.posting.group_presets = {"a": [{"group": "club", "group_id": "g", "folder_id": "f", "folder_name": "x",
+                                        "limit": {"count": 1, "days": 7}}]}
+    drafts.log_sent(conn, "da_group_manual", "club", "da:5", True, now=NOW - 2 * 86400)
+    _, preview = posting.prepare_da_publish(conn, cfg, str(img), "T", preset="a", now=NOW)
+    assert "пропущу club: правило группы club: 1 за 7 дн" in preview
+
+
+def test_publish_preview_checks_each_group_rule(conn, cfg, home):
+    img = home / "Downloads" / "m.png"
+    img.write_bytes(b"x")
+    cfg.posting.group_presets = {"a": [{"group": "club", "group_id": "g", "folder_id": "f", "folder_name": "x",
+                                        "limit": {"count": 3, "days": 30}}],
+                                 "b": [{"group": "club", "group_id": "g", "folder_id": "f", "folder_name": "x",
+                                        "limit": {"count": 1, "days": 2}}]}
+    drafts.log_sent(conn, "da_group_manual", "club", "da:5", True, now=NOW - 86400 - 3600)
+    _, preview = posting.prepare_da_publish(conn, cfg, str(img), "T", preset="a", now=NOW)
+    assert "пропущу club: правило группы club: 1 за 2 дн" in preview
+
+
+def test_title_51_chars_has_honest_note(conn, cfg, home):
+    img = home / "Downloads" / "m.png"
+    img.write_bytes(b"x")
+    d, text = posting.prepare_da_publish(conn, cfg, str(img), "x" * 51, now=NOW)
+    assert d is None and "51 символов" in text
+    assert "в описании API предел не назван — оставляю 50, чтобы не рисковать" in text
+    assert posting.prepare_da_publish(conn, cfg, str(img), "x" * 50, now=NOW)[0]
+
+
+def test_every_group_rule_is_enforced(conn, cfg):
+    """Регрессия: из правил 1/день и 3/30 дней проверялось одно (3/30) — второй раз в тот же день проходил."""
+    from mcp_devian import limits
+
+    cfg.posting.group_presets = {"a": [{"group": "Adopt-Club", "group_id": "g", "folder_id": "f", "folder_name": "x",
+                                        "limit": {"count": 1, "days": 1}}],
+                                 "b": [{"group": "adopt-club", "group_id": "g", "folder_id": "f", "folder_name": "y",
+                                        "limit": {"count": 3, "days": 30}}]}
+    assert limits.group_limits(cfg.posting, "ADOPT-CLUB") == [(1, 1), (3, 30)]
+    drafts.log_sent(conn, "da_group_manual", "adopt-club", "da:5", True, now=NOW - 3600)
+    why = limits.deviantart_group_block(conn, cfg.posting, "Adopt-Club", now=NOW)
+    assert why and "1 за 1 дн" in why
+    drafts.log_sent(conn, "da_group", "adopt-club", "d2", True, now=NOW - 10 * 86400)
+    drafts.log_sent(conn, "da_group", "adopt-club", "d3", True, now=NOW - 5 * 86400)
+    why = limits.deviantart_group_block(conn, cfg.posting, "Adopt-Club", now=NOW + 2 * 86400)
+    assert why and "3 за 30 дн" in why
+    assert limits.limits_text(limits.group_limits(cfg.posting, "adopt-club")) == "1 за 1 дн и 3 за 30 дн"

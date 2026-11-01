@@ -71,11 +71,17 @@ _NS = r"(\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?!\d)|\d{1,3}(?:[.,]\d{3})+(?!\d)|\d+(
 _K = r"(?:\s?(k)\b)?"
 NO_NUM_BEFORE = r"(?<![#\w/.,])"
 # «C$», «A$», «NZ$» — канадские, австралийские, новозеландские доллары: это не USD.
-CUR_SYM = re.compile(r"(?-i:\b(?:CA?|AU?|NZ)\$)|[$€£]|\b(?:usd|eur|euros?|gbp|dollars?|cad|aud|nzd)\b", re.I)
+# «₽», «руб», «rub» — рубли: отдельная валюта, не доллары.
+CUR_SYM = re.compile(r"(?-i:\b(?:CA?|AU?|NZ)\$)|[$€£₽]|\b(?:usd|eur|euros?|gbp|dollars?|cad|aud|nzd|rub|rubles?|"
+                     r"roubles?|руб(?:лей|ля|ль)?)(?:\b|(?<=руб)\.)", re.I)
 NUM_HEAD = re.compile(_N + r"(?![\d.,]\d)" + _K, re.I)
 NUM_TAIL = re.compile(NO_NUM_BEFORE + _N + r"(?:\s?(k))?(\s?)$", re.I)
 POINTS = re.compile(r"(?<![#\w.,])" + _NS + _K + r"\s*(?:da\s*)?(?:pts\b|points?\b|:points:)", re.I)
 LABEL_PUNCT = re.compile(r"[:=\-–(|]\s*$")
+# Рубли с тысячами через пробел («1 500 руб», «цена 12 000 ₽») — обычная русская запись; как у поинтов,
+# только после метки/знака или русского «за/цена/от», иначе «Cat 3 500 руб» — это «3» в названии.
+RUB_TAIL = re.compile(NO_NUM_BEFORE + r"(\d{1,3}(?:[ \u00a0\u202f]\d{3})+)(?!\d)(\s?)$")
+RU_BEFORE = re.compile(r"(?:^|\b(?:за|цена|ставка|старт|от|выкуп|всего|стоит)|[:=\-–—(|/~≈])\s*$", re.I)
 SPACED_BEFORE = re.compile(r"(?:^|[:=\-–—(|/~≈]|\b(?:sb|ab|mi|md|price|prices?|for|at|bid|offer|start(?:ing)?|"
                            r"autobuy|buyout|approx\w*|or))\s*$", re.I)
 
@@ -125,7 +131,7 @@ class Lot:
     multi: bool = False
 
 
-OTHER_CURRENCIES = {"eur": "€", "gbp": "£", "cad": "CA$", "aud": "AU$", "nzd": "NZ$"}
+OTHER_CURRENCIES = {"eur": "€", "gbp": "£", "cad": "CA$", "aud": "AU$", "nzd": "NZ$", "rub": "₽"}
 
 
 def normalize_text(s: str) -> str:
@@ -145,6 +151,8 @@ def _currency_of(symbol: str) -> str:
         return "aud"
     if s in ("nz$", "nzd"):
         return "nzd"
+    if s == "₽" or s.startswith(("rub", "roub", "руб")):
+        return "rub"
     return "usd"
 
 
@@ -172,6 +180,14 @@ def _amounts(text: str) -> list[_Amount]:
         currency = _currency_of(sym.group())
         before = text[:sym.start()]
         tail = NUM_TAIL.search(before)
+        if currency == "rub":
+            spaced = RUB_TAIL.search(before)
+            lead = before[:spaced.start(1)][-30:] if spaced else ""
+            if spaced and (SPACED_BEFORE.search(lead) or RU_BEFORE.search(lead)) and (
+                    word or not spaced.group(2) or not re.match(r"\s?\d", text[sym.end():])):
+                start = spaced.start(1)
+                found.setdefault(start, _Amount(_num(spaced.group(1), None), currency, start, sym.end()))
+                continue
         # «5$» — символ после числа; для «5 usd» допускаем пробел, для «5 $» нет.
         if tail and (word or not tail.group(3) or not re.match(r"\s?\d", text[sym.end():])):
             start = tail.start(1)
@@ -290,7 +306,8 @@ def _price_label(p: _Prices) -> str | None:
     if p.usd is not None:
         parts.append(f"${p.usd:g}")
     if p.other is not None:
-        parts.append(f"{OTHER_CURRENCIES[p.other[1]]}{p.other[0]:g}")
+        value, cur = p.other
+        parts.append(f"{value:g} ₽" if cur == "rub" else f"{OTHER_CURRENCIES[cur]}{value:g}")
     if p.points is not None:
         parts.append(f"{p.points:g} pts")
     if not parts:

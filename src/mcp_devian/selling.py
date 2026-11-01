@@ -31,18 +31,19 @@ MARKET_DAYS = 180         # рынок для сравнения формато�
 MARKET_MIN_AGE_DAYS = 3   # свежие рыночные лоты ещё не успели закрыться
 MIN_MARKET = 5            # меньше похожих лотов — вывод по формату не делаем
 PRICE_GAP = 1.15          # её фикс-цена выше медианы проданных похожих на 15% — предлагаем снизить
-REMIND_AFTER_DAYS = 3
+REMIND_AFTER_DAYS = 2      # = payment_window_hours по умолчанию (48 ч)
+PAYMENT_WINDOW_HOURS = 48
 REMIND_COOLDOWN_DAYS = 3  # не чаще одного напоминания на продажу за столько дней
 DRAFT_GUARD_S = DAY       # черновики не прочитать — сутки после черновика напоминания второй не готовим
-REMIND_MAX_PER_SALE = 2   # больше двух напоминаний одному покупателю — уже давление; дальше решает она сама
-TOO_MANY_REMINDERS = (f"напоминаний по этой продаже уже {REMIND_MAX_PER_SALE} — больше не готовлю: "
-                      "дальше реши сама (написать лично или перевыставить)")
+REMIND_MAX_PER_SALE = 1   # одно напоминание покупателю; второе — уже давление, дальше решает она сама
+TOO_MANY_REMINDERS = ("напоминание по этой продаже уже было — второе не готовлю: "
+                      "дальше реши сама (написать лично, отдать второму по ставке или перевыставить)")
 PLAUSIBLE_BEFORE = 2 * DAY
 PLAUSIBLE_AFTER = 31 * DAY
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS selling_templates (
-    kind TEXT PRIMARY KEY,         -- payment_reminder | pinglist
+    kind TEXT PRIMARY KEY,         -- см. TEMPLATE_SLOTS
     text TEXT NOT NULL,            -- её текст слово в слово
     updated_ts REAL NOT NULL
 );
@@ -90,7 +91,37 @@ def _left(seconds: float) -> str:
 # --- Её шаблоны (слово в слово) ---
 
 TEMPLATE_SLOTS = {"payment_reminder": ("buyer", "amount", "title", "days", "url"),
-                  "pinglist": ("title", "url", "mentions")}
+                  "pinglist": ("title", "url", "mentions"),
+                  # Как заплатить (Boosty / поинты): её текст или DEFAULT_TEMPLATES["payment_info"].
+                  "payment_info": ("buyer", "title", "amount", "boosty_url", "window_hours"),
+                  # Предложение тёплому покупателю или ответ на LF-пост (outreach, leads) — её слова.
+                  "offer": ("name", "title", "link", "why"),
+                  # Пост в X через intent: она жмёт «Post» сама (слоты — как в xpost.TEMPLATE_SLOTS).
+                  "x_post": ("title", "url", "price", "species"),
+                  # Раффл: правила и итог (слоты — как в raffle.TEMPLATE_SLOTS).
+                  "raffle": ("title", "prize", "ends", "method", "rules", "commitment"),
+                  "raffle_winner": ("winner", "title", "prize", "seed", "commitment", "list_hash", "count",
+                                    "entrants", "verify"),
+                  # Статус на DA (user.manage) о новом лоте.
+                  "status": ("title", "url", "price")}
+
+# Текст по умолчанию — только для payment_info и только как ПРЕДЛОЖЕНИЕ: в черновик (комментарий, письмо) он
+# не попадает никогда — сначала она сохраняет свой текст (set_template kind=payment_info). Факты — FAQ Boosty
+# (обновлено 12.2025): метод оплаты «не для карт РФ», конвертация автоматическая (валюту доната не выбрать),
+# обязателен 3-D Secure. Строка про DA Points — только если поинты есть в её способах оплаты.
+DEFAULT_TEMPLATES = {
+    "payment_info": (
+        "Hi {buyer}! Thank you for {title}. You can pay {amount} on my Boosty: {boosty_url}\n"
+        "- please choose the payment option for cards issued outside Russia (not the one for Russian cards)\n"
+        "- the currency is converted automatically, your bank does the rest\n"
+        "- your card needs 3-D Secure (the confirmation code from your bank)\n"
+        "- PayPal is not available on Boosty, sorry!\n"
+        "- if the payment fails, please don't retry many times in a row, just message me\n"
+        "- after paying, send me your DA/TH name so I can match the payment\n"
+        "{points_line}Please pay within {window_hours}h. Thank you!"),
+}
+DEFAULT_POINTS_LINE = "If your card doesn't work, DA Points are an option too. "
+NO_BOOSTY_LINK = "link in my profile"
 SLOT_RE = re.compile(r"\{(\w*)\}")
 
 
@@ -117,6 +148,35 @@ def get_template(conn, kind: str) -> str | None:
     ensure(conn)
     row = conn.execute("SELECT text FROM selling_templates WHERE kind = ?", (kind,)).fetchone()
     return row["text"] if row else None
+
+
+def template_or_default(conn, kind: str) -> tuple[str | None, bool]:
+    """(текст, это текст по умолчанию?). Её шаблон важнее; по умолчанию есть только у payment_info."""
+    text = get_template(conn, kind)
+    if text:
+        return text, False
+    default = DEFAULT_TEMPLATES.get(kind)
+    return default, default is not None
+
+
+def payment_info(conn, *, buyer: str = "", title: str = "", amount: str = "", boosty_url: str = "",
+                 window_hours: int = PAYMENT_WINDOW_HOURS, currency: str | None = None,
+                 methods: list[str] | tuple[str, ...] | None = None) -> dict:
+    """Как заплатить: {"text", "default": bool}. Без ссылки Boosty — «link in my profile».
+
+    default=True — это НЕ её текст, а предложение: показать ей, в черновик не класть.
+    Продажа за поинты — text=None: Boosty тут ни при чём, поинты переводят на DA."""
+    if currency == "points":
+        return {"text": None, "default": False}
+    text, is_default = template_or_default(conn, "payment_info")
+    if is_default and text:
+        points = DEFAULT_POINTS_LINE if "points" in (methods or ()) else ""
+        text = text.replace("{points_line}", points)
+    values = {"buyer": buyer or "there", "title": title or "the adopt", "amount": amount or "",
+              "boosty_url": boosty_url or NO_BOOSTY_LINK, "window_hours": window_hours}
+    rendered = render_template(text or "", values)
+    rendered = re.sub(r" {2,}", " ", rendered)
+    return {"text": rendered, "default": is_default}
 
 
 def render_template(text: str, values: dict) -> str:
@@ -816,15 +876,23 @@ def mark_reminded(conn, sale_id: str, status: str = "sent", now: float | None = 
     conn.commit()
 
 
-def payment_reminders(conn, now: float | None = None, older_than_days: float = REMIND_AFTER_DAYS,
-                      limit: int = 10) -> dict:
-    """Продажи «ждёт оплаты» старше older_than_days дней → кому можно напомнить.
+def payment_reminders(conn, now: float | None = None, older_than_days: float | None = None,
+                      limit: int = 10, payment_window_hours: float = PAYMENT_WINDOW_HOURS,
+                      boosty_url: str = "", payment_methods: list[str] | tuple[str, ...] = ()) -> dict:
+    """Продажи «ждёт оплаты» дольше срока оплаты → кому можно напомнить (одно напоминание на продажу).
+
+    Срок — payment_window_hours (её настройка, по умолчанию 48 ч); older_than_days, если задан, важнее.
 
     {"due": [{"sale_id","title","buyer","amount","days","item_id","deviation_url","deviation_uuid","text","ref"}],
      "skipped": [{"sale_id","title","buyer","reason"}], "template": bool, "more": int, "older_than_days"}
     text — её шаблон payment_reminder со слотами; None, если шаблона нет (тогда черновик не готовим).
+    payment_info — её шаблон payment_info со слотами (можно дописать к её напоминанию) или None.
+    payment_info_suggestion — текст по умолчанию, если её шаблона нет: только показать ей, в черновик НЕ класть
+    (публичный текст — только её слова). Для продаж за поинты оба None.
     Продажи с непроверенным покупателем или суммой (запись по ставкам) — в skipped: сначала проверить."""
     now = now or time.time()
+    if older_than_days is None:
+        older_than_days = max(0.0, float(payment_window_hours)) / 24
     template = get_template(conn, "payment_reminder")
     due, skipped = [], []
     for s in sales.unpaid(conn, older_than_days, now):
@@ -860,9 +928,14 @@ def payment_reminders(conn, now: float | None = None, older_than_days: float = R
         item = db.get_item(conn, s["item_id"])
         url = item["url"] if item else None
         values = {**base, "url": url or "", "days": days}
+        info = payment_info(conn, buyer=s["buyer"], title=s["title"], amount=base["amount"], boosty_url=boosty_url,
+                            window_hours=int(payment_window_hours), currency=s["currency"], methods=payment_methods)
+        own = info["text"] if not info["default"] else None
         due.append({**base, "item_id": s["item_id"], "deviation_url": url,
                     "deviation_uuid": auctions.known_uuid(item) if item else None,
-                    "text": render_template(template, values) if template else None, "ref": f"payment:{s['id']}"})
+                    "text": render_template(template, values) if template else None, "ref": f"payment:{s['id']}",
+                    "payment_info": own, "payment_info_default": bool(info["default"] and info["text"]),
+                    "payment_info_suggestion": info["text"] if info["default"] else None})
     return {"due": due[:limit], "skipped": skipped, "template": bool(template), "more": max(0, len(due) - limit),
             "older_than_days": older_than_days}
 
@@ -881,6 +954,11 @@ def render_reminders(res: dict) -> str:
         if not res["template"]:
             lines.append("Её шаблона напоминания нет: попроси текст своими словами (слоты {buyer} {amount} {title} "
                          "{days} {url}) — без него черновик не готовлю.")
+        hint = next((d["payment_info_suggestion"] for d in res["due"] if d.get("payment_info_suggestion")), None)
+        if hint:
+            lines.append("Её текста «как платить» нет. Предложение (не отправляю и в черновик не кладу — сохрани "
+                         "своими словами: set_template('payment_info', …), слоты {buyer} {title} {amount} "
+                         "{boosty_url} {window_hours}):\n" + hint)
     for s in res["skipped"]:
         lines.append(f"- [{s['sale_id']}] {s['buyer'] or '?'} — «{s['title'][:50]}»: {s['reason']}")
     return "\n".join(lines)

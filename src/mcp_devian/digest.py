@@ -152,6 +152,23 @@ def notify_bids(cfg: Config, events: list) -> str | None:
     return None
 
 
+def notify_lines(cfg: Config, title: str, lines: list[str]) -> bool:
+    """Короткое уведомление строками (например, «нашла покупателя на Toyhouse»). True — дошло хоть куда-то."""
+    lines = [str(x) for x in lines or [] if str(x).strip()]
+    if not lines:
+        return False
+    delivered = False
+    if cfg.notify.macos:
+        more = f" (+ещё {len(lines) - 1})" if len(lines) > 1 else ""
+        delivered = notify_macos(title, (lines[0][:200] + more)[:240]) or delivered
+    if cfg.notify.telegram:
+        err = send_telegram([_telegram_text("\n".join([title, *lines]))])
+        if err:
+            log.warning("notify_lines to telegram failed: %s", err)
+        delivered = delivered or not err
+    return delivered
+
+
 def deliver(conn, cfg: Config, problems: list[str] | None = None) -> dict:
     """Отправляет всё новое, что ещё не уходило. Возвращает, что сделано."""
     rows = db.pending_digest(conn)

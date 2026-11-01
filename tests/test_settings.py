@@ -168,3 +168,151 @@ def test_broken_paging_values_fall_back(tmp_path):
     cfg = load_config(path)
     assert cfg.toyhouse.boards == [13] and cfg.toyhouse.pages_per_board == 3
     assert cfg.toyhouse.max_pages_per_board == 6 and len(cfg.warnings) == 2
+
+
+# --- 0.5: оплата, X, тёплые покупатели, история рынка ---
+
+def test_new_defaults_are_safe_and_roundtrip_without_warnings(tmp_path):
+    cfg = Config()
+    p, da = cfg.posting, cfg.deviantart
+    assert (p.boosty_url, p.payment_methods, p.payment_window_hours, p.payment_plans) == ("", [], 48, False)
+    assert p.x_hashtags == ["adoptables", "adoptsopen"] and p.x_rt_accounts == []
+    assert (p.outreach_per_day, p.outreach_cooldown_days, p.outreach_window_days) == (5, 14, 180)
+    assert p.pinglist_early_access_hours == 0 and p.da_extra_scopes == []
+    assert (da.backfill_days, da.backfill_groups, da.backfill_api_per_run) == (75, 6, 40)
+    assert da.palette_downloads_per_hour == 30 and da.similar_watch and da.similar_artists == []
+    assert cfg.toyhouse.background_lf is False
+    path = tmp_path / "s.json"
+    save_config(cfg, path)
+    assert not load_config(path).warnings
+
+
+def test_hand_edited_file_cannot_raise_caps(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text('{"posting": {"outreach_per_day": 9, "outreach_cooldown_days": 3, "outreach_window_days": 900,'
+                    ' "pinglist_early_access_hours": 100, "payment_window_hours": 2,'
+                    ' "x_hashtags": ["a1", "b2", "c3", "d4", "e5", "f6"], "da_extra_scopes": ["message", "user.watch"],'
+                    ' "payment_methods": ["boosty", "paypal"], "boosty_url": "https://evil.example/x"},'
+                    ' "deviantart": {"backfill_days": 200, "backfill_groups": 0, "backfill_api_per_run": "x",'
+                    ' "palette_downloads_per_hour": 500, "similar_watch": "yes"},'
+                    ' "toyhouse": {"background_lf": "on"}}')
+    cfg = load_config(path)
+    p, da = cfg.posting, cfg.deviantart
+    assert (p.outreach_per_day, p.outreach_cooldown_days, p.outreach_window_days) == (5, 14, 180)
+    assert p.pinglist_early_access_hours == 48 and p.payment_window_hours == 12
+    assert p.x_hashtags == ["a1", "b2", "c3", "d4"]
+    assert p.da_extra_scopes == ["message"] and p.payment_methods == ["boosty"] and p.boosty_url == ""
+    assert (da.backfill_days, da.backfill_groups, da.backfill_api_per_run) == (90, 1, 40)
+    assert da.palette_downloads_per_hour == 60 and da.similar_watch is True
+    assert cfg.toyhouse.background_lf is False
+    assert any("outreach_per_day" in w for w in cfg.warnings)
+
+
+@pytest.mark.parametrize("changes", [
+    {"outreach_per_day": 9}, {"outreach_cooldown_days": 3}, {"outreach_window_days": 365},
+    {"pinglist_early_access_hours": 72}, {"payment_window_hours": 6}, {"backfill_days": 200},
+    {"backfill_groups": 11}, {"palette_downloads_per_hour": 61},
+    {"x_hashtags": ["a1", "b2", "c3", "d4", "e5", "f6"]}, {"x_hashtags": ["two words"]},
+    {"da_extra_scopes": ["user.manage", "user.watch"]}, {"payment_methods": ["paypal"]},
+    {"boosty_url": "https://boosty.to/name/posts/123"}, {"boosty_url": "https://patreon.com/name"},
+    {"x_rt_accounts": [{"handle": "bad handle!"}]}, {"x_rt_accounts": [{"handle": "rtacc", "tag_ok": "yes"}]},
+    {"tos_url": "моё TOS"}, {"payment_plans": "может быть"}, {"similar_artists": ["bad nick!"]},
+])
+def test_new_bad_values_rejected_in_russian(changes):
+    with pytest.raises(SettingsError) as e:
+        apply_changes(Config(), changes)
+    assert any("а" <= c <= "я" for c in str(e.value).lower())
+
+
+def test_boosty_url_normalised_and_turns_on_boosty():
+    cfg = Config()
+    apply_changes(cfg, {"boosty_url": "boosty.to/moth_art/"})
+    assert cfg.posting.boosty_url == "https://boosty.to/moth_art"
+    assert cfg.posting.payment_methods == ["boosty"]
+    apply_changes(cfg, {"boosty_url": "http://boosty.to/Moth.Art-2"})
+    assert cfg.posting.boosty_url == "https://boosty.to/Moth.Art-2"
+    apply_changes(cfg, {"boosty_url": ""})
+    assert cfg.posting.boosty_url == ""
+
+
+def test_x_settings_parsed():
+    cfg = Config()
+    apply_changes(cfg, {"x_handle": "https://x.com/@MothArt", "x_hashtags": ["#adoptables", "OCadopt", "adoptables"],
+                        "x_rt_accounts": ["@rt_one", {"handle": "rt_two", "method": "tag us + #adoptables",
+                                                      "tag_ok": True}]})
+    assert cfg.posting.x_handle == "MothArt"
+    assert cfg.posting.x_hashtags == ["adoptables", "OCadopt"]
+    assert cfg.posting.x_rt_accounts == [{"handle": "rt_one", "method": "", "tag_ok": False},
+                                         {"handle": "rt_two", "method": "tag us + #adoptables", "tag_ok": True}]
+
+
+def test_new_ranges_accept_edges():
+    cfg = Config()
+    done = apply_changes(cfg, {"outreach_per_day": 0, "outreach_cooldown_days": 90, "payment_window_hours": "72",
+                               "backfill_days": 60, "toyhouse_background_lf": True, "payment_plans": True,
+                               "da_extra_scopes": ["user.manage", "message"], "pinglist_early_access_hours": 24})
+    assert len(done) == 8
+    assert cfg.posting.outreach_per_day == 0 and cfg.posting.payment_window_hours == 72
+    assert cfg.deviantart.backfill_days == 60 and cfg.toyhouse.background_lf and cfg.posting.payment_plans
+
+
+def test_group_preset_limits_validated(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text('{"posting": {"group_presets": {"moths": ['
+                    '{"group": "a", "folder_id": "1", "limit": {"count": 1, "days": 7}},'
+                    '{"group": "b", "folder_id": "2", "limit": {"count": 0, "days": 7}},'
+                    '{"group": "c", "folder_id": "3", "limit": "1/week"},'
+                    '{"group": "d", "folder_id": "4"}]}}}')
+    cfg = load_config(path)
+    entries = cfg.posting.group_presets["moths"]
+    assert entries[0]["limit"] == {"count": 1, "days": 7}
+    assert [("limit" in e) for e in entries] == [True, False, False, False]
+    assert sum("limit" in w for w in cfg.warnings) == 2
+    assert config.valid_group_limit({"count": "2", "days": 1}) == {"count": 2, "days": 1}
+    assert config.valid_group_limit({"count": 2}) is None
+
+
+def test_every_apply_key_is_described():
+    import inspect
+    import re
+
+    src = inspect.getsource(apply_changes)
+    keys = set(re.findall(r'key == "(\w+)"', src))
+    for group in re.findall(r"key in \(([^)]*)\)", src):
+        keys |= set(re.findall(r'"(\w+)"', group))
+    keys |= set(config.RANGES)
+    assert keys <= set(config.SETTING_KEYS), keys - set(config.SETTING_KEYS)
+    assert "outreach_per_day: 0–5" in config.describe_keys()
+
+
+@pytest.mark.parametrize("raw", ["Infinity", "-Infinity", "NaN", "1e400"])
+def test_non_finite_number_in_file_falls_back_with_warning(tmp_path, raw):
+    path = tmp_path / "s.json"
+    path.write_text('{"posting": {"outreach_per_day": ' + raw + ', "payment_window_hours": ' + raw + '},'
+                    ' "deviantart": {"backfill_days": ' + raw + '}}')
+    cfg = load_config(path)
+    assert cfg.posting.outreach_per_day == 5 and cfg.posting.payment_window_hours == 48
+    assert cfg.deviantart.backfill_days == 75
+    assert any("outreach_per_day" in w for w in cfg.warnings)
+
+
+def test_hand_edited_strings_split_and_drops_warned(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text('{"posting": {"payment_methods": "boosty, points", "x_hashtags": "#adoptables #adoptsopen",'
+                    ' "x_rt_accounts": [{"handle": "okacc"}, {"handle": "rtacc", "tag_ok": "yes"}],'
+                    ' "da_extra_scopes": ["message", "user.watch"]}}')
+    cfg = load_config(path)
+    p = cfg.posting
+    assert p.payment_methods == ["boosty", "points"] and p.x_hashtags == ["adoptables", "adoptsopen"]
+    assert [a["handle"] for a in p.x_rt_accounts] == ["okacc"] and p.da_extra_scopes == ["message"]
+    assert any("x_rt_accounts" in w and "rtacc" in w for w in cfg.warnings)
+    assert any("da_extra_scopes" in w and "user.watch" in w for w in cfg.warnings)
+
+
+def test_hand_edited_bad_hashtags_warned(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text('{"posting": {"x_hashtags": ["ok_tag", "bad tag!", "a1", "b2", "c3", "d4"]}}')
+    cfg = load_config(path)
+    assert cfg.posting.x_hashtags == ["ok_tag", "a1", "b2", "c3"]
+    warned = [w for w in cfg.warnings if "x_hashtags" in w]
+    assert warned and "bad tag!" in warned[0] and "d4" in warned[0]

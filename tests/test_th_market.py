@@ -295,3 +295,81 @@ def test_age_number_does_not_spoil_character_fit(conn):
     add(conn, "LF dragon", "USD only, budget 50", author="k2")
     [d] = tm.character_demand(conn, [{"name": "Ember", "price": "$40", "tags": ["dragon"]}], now=NOW)
     assert (d.people, d.numeric, d.fits) == (2, 1, 1)
+
+
+# ---------- заявленные цены из первых постов (th_prices) ----------
+
+def _stated(conn, n_sellers: int, amount=20.0, cur="usd"):
+    from mcp_devian import th_prices
+
+    th_prices.ensure(conn)
+    for i in range(n_sellers):
+        iid = add(conn, f"Purge #{i}", side="sale", author=f"seller{i}")
+        conn.execute("INSERT INTO th_stated (item_id, amount, currency, label, ts, n_prices, raw) "
+                     "VALUES (?, ?, ?, 'заявлено в первом посте', ?, 1, '')", (iid, amount + i, cur, NOW - DAY))
+    conn.commit()
+
+
+def test_stated_segment_separate_from_realized(conn):
+    _market(conn)
+    sales.add_sale(conn, title="Ember", amount=35, currency="usd", platform="toyhouse", format="auction",
+                   status="paid", now=NOW - DAY)
+    before = tm.demand_supply(conn, days=30, now=NOW)
+    _stated(conn, 9)
+    r = tm.demand_supply(conn, days=30, now=NOW)
+    assert r.realized["usd"].median == before.realized["usd"].median == 35   # заявленные не смешиваются
+    assert r.stated["usd"].n == 9 and r.stated["usd"].median == 24
+    text = tm.render_market(r)
+    line = next(ln for ln in text.splitlines() if ln.startswith("Заявленные цены продаж (первые посты"))
+    assert "медиана $24" in line and "(n=9" in line and "не сделки" in line
+    assert "Твои оплаченные продажи на TH за период: $35, медиана $35 (n=1)" in text
+
+
+def test_stated_segment_refuses_below_min_side(conn):
+    _market(conn)
+    _stated(conn, 3)
+    text = tm.render_market(tm.demand_supply(conn, days=30, now=NOW))
+    line = next(ln for ln in text.splitlines() if ln.startswith("Заявленные цены продаж"))
+    assert "Вывода нет: продавцов с ценой в $ — 3 из нужных 8" in line
+    assert "медиана" not in line and "$21" not in line   # ниже порога — без числа
+
+
+def test_no_stated_segment_without_first_posts(conn):
+    _market(conn)
+    assert "Заявленные цены" not in tm.render_market(tm.demand_supply(conn, days=30, now=NOW))
+
+
+def test_stated_one_number_per_seller_is_median(conn):
+    from mcp_devian import th_prices
+
+    th_prices.ensure(conn)
+    for i, amount in enumerate((10.0, 30.0, 50.0)):
+        iid = add(conn, f"Purge #{i}", side="sale", author="seller")
+        conn.execute("INSERT INTO th_stated (item_id, amount, currency, label, ts, n_prices, raw) "
+                     "VALUES (?, ?, 'usd', 'заявлено в первом посте', ?, 1, '')", (iid, amount, NOW - DAY))
+    conn.commit()
+    stats_by_cur, _, values = tm.stated_prices(conn, NOW - 30 * DAY, NOW)
+    assert values["usd"] == [30.0] and stats_by_cur["usd"].n == 1
+
+
+def test_stated_starting_bids_reported_apart_from_asking_prices(conn):
+    """Регрессия: старт аукциона и цена продажи шли в одну медиану «Заявленные цены продаж» и тянули её вниз."""
+    from mcp_devian import th_prices
+
+    assert th_prices.per_character_kind("SB: $10 / MI: $2 / AB: $80")[2] == "sb"
+    assert th_prices.per_character_kind("Each design is $40")[2] == "price"
+    th_prices.ensure(conn)
+    _market(conn)
+    for i in range(9):
+        iid = add(conn, f"Purge #{i}", side="sale", author=f"seller{i}")
+        conn.execute("INSERT INTO th_stated (item_id, amount, currency, label, ts, n_prices, raw, kind) "
+                     "VALUES (?, 40, 'usd', 'заявлено в первом посте', ?, 1, '', 'price')", (iid, NOW - DAY))
+        iid = add(conn, f"Auction #{i}", side="sale", author=f"auctioneer{i}")
+        conn.execute("INSERT INTO th_stated (item_id, amount, currency, label, ts, n_prices, raw, kind) "
+                     "VALUES (?, 5, 'usd', 'заявлено в первом посте', ?, 1, '', 'sb')", (iid, NOW - DAY))
+    conn.commit()
+    r = tm.demand_supply(conn, days=30, now=NOW)
+    assert r.stated["usd"].median == 40 and r.stated_sb["usd"].median == 5
+    text = tm.render_market(r)
+    assert any(ln.startswith("Заявленные цены продаж") and "медиана $40" in ln for ln in text.splitlines())
+    assert any(ln.startswith("Стартовые ставки аукционов") and "медиана $5" in ln for ln in text.splitlines())

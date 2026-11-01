@@ -15,7 +15,19 @@ PATTERNS: dict[str, re.Pattern] = {
     "pay_paypal": re.compile(r"\bpay\s?pal\b|\bpp\b(?=\s*(?:only|invoice|$|[,./]))", _F),
     "pay_kofi": re.compile(r"\bko-?\s?fi\b", _F),
     "pay_points": re.compile(r"\b(?:da\s*)?(?:points?|pts)\b|\d\s*(?:pts|points?)\b", _F),
-    "pay_other": re.compile(r"\b(?:stripe|cash\s?app|venmo|wise|boosty|vgen|card|crypto|zelle|revolut)\b", _F),
+    "pay_boosty": re.compile(r"\bboosty(?:\.to)?\b|бусти", _F),
+    # «card issued outside Russia» — подсказка для Boosty, а не отдельный способ оплаты.
+    "pay_other": re.compile(r"\b(?:stripe|cash\s?app|venmo|wise|vgen|(?<!foreign\s)card(?!s?\s+(?:issued|outside))|"
+                            r"crypto|zelle|revolut|hipolink)\b", _F),
+    # Как платить иностранной картой на Boosty: метод «card issued outside Russia», 3-D Secure (FAQ Boosty 12.2025).
+    # «switch to USD» подсказкой не считаем: валюту на Boosty не выбирают, конвертация автоматическая.
+    "foreign_pay_hint": re.compile(r"\b(?:issued\s+)?outside\s+(?:of\s+)?russia\b|\bforeign\s+cards?\b|"
+                                   r"\bnon[\s-]?russian\s+cards?\b|\b3[\s-]?d[\s-]?secure\b|\b3ds\b", _F),
+    # Срок оплаты: «pay within 48h», «payment due in 24 hours», «48h to pay», «оплата в течение 48 ч».
+    "payment_window": re.compile(r"\bpay(?:ment)?\s+(?:with)?in\s+\d{1,3}\s*(?:h|hrs?|hours?|days?)\b|"
+                                 r"\bpayment\s+(?:is\s+)?due\b|\b\d{1,3}\s*(?:h|hrs?|hours?|days?)\s+to\s+pay\b|"
+                                 r"\bpay(?:ment)?\s+(?:deadline|window)\b|\bmust\s+(?:be\s+)?pa(?:y|id)\s+"
+                                 r"(?:with)?in\b|оплат\w*\s+в\s+течение", _F),
     "sb": re.compile(r"\b(?:sb|starting\s+bid|start(?:ing)?\s+price)\b", _F),
     "mi": re.compile(r"\b(?:mi|mb|min(?:imum)?\.?\s*(?:bid|increase|increment|raise)?)\s*[:=\-–|]|"
                      r"\bmin(?:imum)?\.?\s+(?:bid|increase|increment)\b", _F),
@@ -38,8 +50,8 @@ FACT_KEYS = (*PATTERNS, "desc_len")
 
 
 def listing_facts(text: str) -> dict[str, bool | int]:
-    """{tos, pay_paypal, pay_kofi, pay_points, pay_other, sb, mi, ab, end_time, timezone, unwatermarked,
-    fullres, rights, hold, toyhouse: bool, desc_len: int}."""
+    """{tos, pay_paypal, pay_kofi, pay_points, pay_boosty, pay_other, foreign_pay_hint, payment_window, sb, mi, ab,
+    end_time, timezone, unwatermarked, fullres, rights, hold, toyhouse: bool, desc_len: int}."""
     text = text or ""
     out: dict[str, bool | int] = {k: bool(p.search(text)) for k, p in PATTERNS.items()}
     out["desc_len"] = len(text)
@@ -47,7 +59,7 @@ def listing_facts(text: str) -> dict[str, bool | int]:
 
 
 def pays_any(facts: dict) -> bool:
-    return any(facts.get(k) for k in ("pay_paypal", "pay_kofi", "pay_points", "pay_other"))
+    return any(facts.get(k) for k in ("pay_paypal", "pay_kofi", "pay_points", "pay_boosty", "pay_other"))
 
 
 def buyer_gets(facts: dict) -> bool:

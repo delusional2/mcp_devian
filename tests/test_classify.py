@@ -390,3 +390,29 @@ def test_offers_on_anything_is_a_seller():
 def test_custom_adopt_auction_is_an_auction():
     assert classify_lot("Custom Dragon Adopt Auction", "SB: 45 USD").lot_type == "auction"
     assert classify_lot("Custom dragon commission", "").lot_type == "commission"
+
+
+@pytest.mark.parametrize("title,text,other,label", [
+    ("Moth adopt 1500₽", "", (1500, "rub"), "1500 ₽"),
+    ("Moth adopt", "Price: 1500 руб", (1500, "rub"), "1500 ₽"),
+    ("Moth adopt", "цена 2000 рублей", (2000, "rub"), "2000 ₽"),
+    ("Moth adopt", "SB: 900 RUB", (900, "rub"), "SB 900 ₽"),
+    ("Moth adopt", "SB 500₽ AB 2000₽", (500, "rub"), "SB 500 ₽"),
+    # Тысячи через пробел — обычная русская запись (раньше «1 500 руб» читалось как 500 ₽).
+    ("Moth adopt", "Цена: 1 500 руб", (1500, "rub"), "1500 ₽"),
+    ("Moth adopt", "за 12 000 ₽", (12000, "rub"), "12000 ₽"),
+    ("Moth adopt", "price 1 200₽", (1200, "rub"), "1200 ₽"),
+    ("Moth adopt", "SB 1 200 rub", (1200, "rub"), "SB 1200 ₽"),
+    # Без метки число перед тысячами — из названия («Cat 3»), как у поинтов.
+    ("Cat 3 500 руб", "", (500, "rub"), "500 ₽"),
+])
+def test_rub_prices_not_read_as_usd(title, text, other, label):
+    lot = classify_lot(title, text)
+    assert lot.usd is None
+    assert (lot.other_price, lot.price_text) == (other, label)
+
+
+def test_rub_next_to_usd_kept_apart():
+    lot = classify_lot("Moth", "$10 or 900 руб")
+    assert lot.usd == 10 and lot.other_price == (900, "rub")
+    assert classify_lot("рубин adopt $5").other_price is None

@@ -425,3 +425,58 @@ def test_da_preview_says_terms_are_agreed(db_path, da_cfg, tmp_path, monkeypatch
     with db.session(db_path) as c:
         _, preview = posting.prepare_da_publish(c, da_cfg, str(image(tmp_path)), "Moth")
         assert "Submission Policy" in preview and "её «го» означает и это согласие" in preview
+
+
+# --- 0.5: новые типы черновиков уходят только по её «го» ---
+
+class PromoDA:
+    def __init__(self):
+        self.calls = []
+
+    def is_connected(self):
+        return True
+
+    def require_scopes(self, *needed):
+        pass
+
+    def whoami(self):
+        return {"username": "mothy"}
+
+    def post_status(self, body, deviationid=None):
+        self.calls.append(("status", body))
+        return {"statusid": "s"}
+
+    def create_journal(self, title, body, is_mature=False, tags=()):
+        self.calls.append(("journal", title))
+        return {"deviationid": "J"}
+
+
+@pytest.mark.parametrize("kind", ["da_status", "da_journal"])
+def test_new_kinds_not_sent_by_send_due_unless_she_scheduled(db_path, cfg, monkeypatch, kind):
+    fake = PromoDA()
+    monkeypatch.setattr(posting, "da_client", lambda c: fake)
+    cfg.posting.da_client_id = "CID"
+    cfg.deviantart.my_username = "mothy"
+    with db.session(db_path) as conn:
+        if kind == "da_status":
+            d, _ = posting.prepare_status(conn, cfg, "Batch open", now=NOW)
+        else:
+            d, _ = posting.prepare_journal(conn, cfg, "Sale", "Text", now=NOW)
+        assert d
+        assert posting.send_due(conn, cfg, now=NOW + 3600) == [] and fake.calls == []
+        assert drafts.get(conn, d, NOW)["status"] == "pending"
+        posting.approve_draft(conn, cfg, d, send_at=NOW + 7200, now=NOW)
+        assert posting.send_due(conn, cfg, now=NOW + 3600) == [] and fake.calls == []
+        posting.send_due(conn, cfg, now=NOW + 7300)
+        assert len(fake.calls) == 1
+        posting.send_due(conn, cfg, now=NOW + 7400)
+        assert len(fake.calls) == 1  # второй раз не уходит
+
+
+def test_unknown_kind_is_never_published(db_path, cfg, monkeypatch):
+    called = []
+    monkeypatch.setattr(posting, "_send_da_publish", lambda *a: called.append(a) or ("sent", "x"))
+    with db.session(db_path) as conn:
+        d = drafts.create(conn, "da_mystery", {"title": "?"}, "?", now=NOW)
+        assert "не умеет" in posting.send(conn, cfg, d, now=NOW)
+    assert called == []

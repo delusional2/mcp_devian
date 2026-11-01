@@ -29,14 +29,17 @@ COMPARE_P = 0.9            # P(одно лучше другого), начина
 FAMILY_ERROR = 0.1         # на семейство сравнений: ожидаемо не больше 0.1 ложной «победы»
 STALE_DAYS = 3
 
-Source = Literal["her_lots", "her_sales", "market_da", "market_da_search", "th_lf", "model", "rule_of_thumb"]
+Source = Literal["her_lots", "her_sales", "market_da", "market_da_search", "th_lf", "model", "rule_of_thumb",
+                 "palette", "experiment", "market_th_stated", "x_manual", "crm"]
 Kind = Literal["observed", "estimate", "heuristic"]
 Level = Literal["нет вывода", "низкая", "средняя", "высокая"]
 LEVELS: tuple[str, ...] = ("нет вывода", "низкая", "средняя", "высокая")
 
 SOURCE_LABEL = {"her_lots": "её лоты", "her_sales": "её продажи", "market_da": "рынок DA",
                 "market_da_search": "рынок DA, из поиска", "th_lf": "LF-треды Toyhouse", "model": "модель",
-                "rule_of_thumb": "общая практика"}
+                "rule_of_thumb": "общая практика", "palette": "палитры лотов",
+                "experiment": "её эксперимент", "market_th_stated": "заявленные цены TH",
+                "x_manual": "X — ссылки, которые она принесла", "crm": "её покупатели и участники"}
 KIND_LABEL = {"observed": "наблюдение", "estimate": "оценка", "heuristic": "общая практика"}
 
 
@@ -172,7 +175,7 @@ def tag(ev: Evidence) -> str:
     n = f"n={ev.n}"
     if ev.n_eff is not None and abs(ev.n_eff - ev.n) >= 1:
         n += f", эфф. {ev.n_eff:.0f}"
-    bits = [n, period(ev), SOURCE_LABEL.get(ev.source, ev.source), KIND_LABEL.get(ev.kind, ev.kind)]
+    bits = [n, period(ev), SOURCE_LABEL.get(ev.source, str(ev.source)), KIND_LABEL.get(ev.kind, str(ev.kind))]
     if ev.kind != "heuristic":
         bits.append(f"уверенность {level(ev)}")
     return "(" + ", ".join(bits) + ")"
@@ -277,6 +280,14 @@ def render_health(conn, now: float | None = None) -> str:
                  f"{known}" + (f" ({pct(known / sampled)})" if sampled else "")
                  + (f" — для прогнозов нужно ≥{pct(forecast.MIN_COVERAGE)}" if sampled and known / sampled
                     < forecast.MIN_COVERAGE else "") + ".")
+    try:
+        market = [o for o in forecast.load_outcomes(conn, now) if not o.own and not o.search]
+    except Exception:  # noqa: BLE001
+        market = []
+    if market:
+        back = sum(1 for o in market if o.backfill)
+        lines.append(f"Из них с известным итогом {len(market)}, задним числом (история рынка) {back} "
+                     f"({pct(back / len(market))})" + (f" — {forecast.BACKFILL_CAVEAT}." if back else "."))
     if ages:
         lines.append(f"Дочитаны в возрасте ≥{forecast.MATURE_DAYS} дн: {mature} из {len(ages)} "
                      f"({pct(mature / len(ages))}), медианный возраст чтения {statistics.median(ages):.1f} дн.")

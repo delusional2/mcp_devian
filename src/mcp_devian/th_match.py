@@ -756,3 +756,23 @@ def render_suggestions(conn, cfg, days: float = 5, limit: int = 10, show_blocked
         lines.append(f"  {s['url']}")
         out.append("\n".join(lines))
     return "\n\n".join(out)
+
+
+def strong_matches(conn, cfg, since_ts: float, min_score: int = 40, now: float | None = None,
+                   limit: int = 20) -> list[dict]:
+    """Для уведомлений: только треды, впервые замеченные не раньше since_ts, где лучший её перс без помех
+    и rank (подходит + шанс заметить) ≥ min_score. Только чтение базы."""
+    now = now or time.time()
+    days = max(1.0, (now - since_ts) / DAY + 1)
+    out = []
+    for s in suggestions(conn, cfg, days=days, limit=max(limit, 50), now=now):
+        if s["thread_blockers"] or s["rank"] < min_score:
+            continue
+        row = conn.execute("SELECT first_seen_ts FROM items WHERE id = ?", (s["id"],)).fetchone()
+        if not row or (row["first_seen_ts"] or 0) < since_ts:
+            continue
+        best = next(((ch, f) for ch, f in s["fits"] if not f.blockers), None)
+        if best is None:
+            continue
+        out.append({**s, "character": best[0].get("name") or best[0].get("url") or "", "fit": best[1]})
+    return out[:limit]

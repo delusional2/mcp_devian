@@ -996,3 +996,159 @@ def test_deviation_metadata_not_connected(store):
     with pytest.raises(NotConnected):
         c.deviation_metadata(["U1"])
     assert router.calls == []
+
+
+# --- 0.5: кто фавнул, уведомления, статус и журнал, дополнительные права ---
+
+def faved_page(names, has_more, next_offset):
+    return {"results": [{"user": {"username": n, "is_minor": n.startswith("kid"), "is_watching": n.endswith("w")},
+                         "time": 1_700_000_000} for n in names],
+            "has_more": has_more, "next_offset": next_offset}
+
+
+def test_whofaved_pages_and_respects_limit(store):
+    connected(store)
+    pages = {0: faved_page([f"u{i}" for i in range(50)], True, 50),
+             50: faved_page([f"v{i}" for i in range(50)], True, 100),
+             100: faved_page(["kid1", "x2w"], False, None)}
+
+    def handler(r):
+        q = parse_qs(r.url.query.decode())
+        assert int(q["limit"][0]) <= 50 and q["deviationid"] == ["DEV"]
+        return httpx.Response(200, json=pages[int(q["offset"][0])])
+
+    c, router = client(store, {("GET", "/api/v1/oauth2/deviation/whofaved"): handler})
+    users = c.whofaved("DEV", max_users=60)
+    assert len(users) == 60 and len(router.calls) == 2
+    assert int(parse_qs(router.calls[1].url.query.decode())["limit"][0]) == 10
+    every = c.whofaved("DEV", max_users=500)
+    assert len(every) == 102
+    assert every[-2] == {"username": "kid1", "is_minor": True, "is_watching": False, "ts": 1_700_000_000.0}
+    assert every[-1]["is_watching"] is True
+
+
+def test_messages_feedback_needs_message_scope(store):
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": NOW + 3600, "scope": da_api.SCOPES})
+    c, router = client(store, {})
+    with pytest.raises(da_api.NeedsReconnect):
+        c.messages_feedback("comments")
+    assert router.calls == []
+
+
+def test_messages_feedback_reads_with_scope(store):
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": NOW + 3600,
+                "scope": da_api.scope_string(["message"])})
+    body = {"results": [{"type": "comment", "originator": {"username": "fan"}, "ts": "2026-10-31T20:30:45-0700",
+                         "subject": {"deviation": {"deviationid": "D1"}}, "comment": {"body": "love <b>it</b>"}}],
+            "has_more": False, "cursor": "c1"}
+    c, _ = client(store, {("GET", "/api/v1/oauth2/messages/feedback"): lambda r: httpx.Response(200, json=body)})
+    got = c.messages_feedback("comments")
+    assert got[0]["username"] == "fan" and got[0]["deviationid"] == "D1" and got[0]["text"] == "love it"
+    with pytest.raises(DAApiError):
+        c.messages_feedback("watchers")
+
+
+@pytest.mark.parametrize("call", [lambda c: c.post_status("hi"), lambda c: c.create_journal("T", "body")])
+def test_status_and_journal_need_user_manage(store, call):
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": NOW + 3600, "scope": da_api.SCOPES})
+    c, router = client(store, {})
+    with pytest.raises(da_api.NeedsReconnect):
+        call(c)
+    assert router.calls == []
+
+
+def test_status_and_journal_post_her_text(store):
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": NOW + 3600,
+                "scope": da_api.scope_string("user.manage")})
+    c, router = client(store, {
+        ("POST", "/api/v1/oauth2/user/statuses/post"): lambda r: httpx.Response(200, json={"statusid": "S1"}),
+        ("POST", "/api/v1/oauth2/deviation/journal/create"): lambda r: httpx.Response(200, json={"deviationid": "J1"})})
+    assert c.post_status("New batch!", "DEV") == {"statusid": "S1"}
+    assert form(router.calls[0]) == {"body": ["New batch!"], "id": ["DEV"]}
+    assert c.create_journal("Sale", "Text", tags=["adopt", "мотылёк"])["deviationid"] == "J1"
+    sent = form(router.calls[1])
+    assert sent["title"] == ["Sale"] and sent["is_mature"] == ["false"] and sent["tags[]"] == ["adopt"]
+
+
+def test_status_lost_response_is_uncertain(store):
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": NOW + 3600,
+                "scope": da_api.scope_string("user.manage")})
+    c, router = client(store, {("POST", "/api/v1/oauth2/user/statuses/post"): lambda r: httpx.Response(502, text="x")})
+    with pytest.raises(da_api.UncertainPublish):
+        c.post_status("hi")
+    assert len(router.calls) == 1  # запись не повторяется
+
+
+def test_scope_string_only_known_extras():
+    assert da_api.SCOPES == "basic user browse stash publish gallery comment.post"
+    assert da_api.scope_string() == da_api.SCOPES
+    assert da_api.scope_string(["message", "user.manage", "user.manage"]) == da_api.SCOPES + " user.manage message"
+    assert da_api.scope_string("message, note collection") == da_api.SCOPES + " message"
+    url = da_api.authorize_url("CID", "ST", "CH", scope=da_api.scope_string(["user.manage"]))
+    assert parse_qs(urlparse(url).query)["scope"] == [da_api.SCOPES + " user.manage"]
+
+
+def test_module_never_touches_watch_endpoints():
+    from pathlib import Path
+
+    src = Path(da_api.__file__).read_text(encoding="utf-8")
+    assert "friends/watch" not in src and "/user/friends" not in src
+
+
+# --- регрессии проверки W4 ---
+
+def test_whofaved_unknown_age_stays_unknown(store):
+    """Регрессия: отсутствующее is_minor превращалось в False («взрослый»)."""
+    connected(store)
+    body = {"results": [{"user": {"username": "noage"}, "time": 1}, {"user": {"username": "adult", "is_minor": False}},
+                        {"user": {"username": "kid", "is_minor": True}}], "has_more": False, "next_offset": None}
+    c, _ = client(store, {("GET", "/api/v1/oauth2/deviation/whofaved"): lambda r: httpx.Response(200, json=body)})
+    rows = {r["username"]: r for r in c.whofaved("DEV")}
+    assert rows["noage"]["is_minor"] is None and rows["noage"]["is_watching"] is None
+    assert rows["adult"]["is_minor"] is False and rows["kid"]["is_minor"] is True
+
+
+def test_whofaved_page_reports_where_to_continue(store):
+    connected(store)
+    pages = {0: faved_page([f"u{i}" for i in range(50)], True, 50), 50: faved_page(["z"], False, None)}
+
+    def handler(r):
+        return httpx.Response(200, json=pages[int(parse_qs(r.url.query.decode())["offset"][0])])
+
+    c, router = client(store, {("GET", "/api/v1/oauth2/deviation/whofaved"): handler})
+    rows, nxt = c.whofaved_page("DEV", 0)
+    assert len(rows) == 50 and nxt == 50
+    rows, nxt = c.whofaved_page("DEV", 50)
+    assert [r["username"] for r in rows] == ["z"] and nxt is None and len(router.calls) == 2
+
+
+def test_comments_page_one_request_with_next_offset(store):
+    connected(store)
+    body = {"thread": [{"commentid": "c1", "user": {"username": "fan"}, "body": "+", "posted": "2027-01-01T00:00:00Z"},
+                       {"commentid": "c2", "user": {"username": "gone"}, "body": "+", "hidden": "hidden_by_owner"}],
+            "has_more": True, "next_offset": 50}
+    c, router = client(store, {("GET", "/api/v1/oauth2/comments/deviation/DEV"): lambda r: httpx.Response(200, json=body)})
+    rows, nxt = c.comments_page("DEV", 0)
+    assert [x.user for x in rows] == ["fan"] and rows[0].text == "+" and nxt == 50 and len(router.calls) == 1
+
+
+def test_journal_url_is_read_after_create(store):
+    """По документации DA journal/create отдаёт только deviationid — ссылку дочитываем."""
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": NOW + 3600,
+                "scope": da_api.scope_string("user.manage")})
+    c, router = client(store, {
+        ("POST", "/api/v1/oauth2/deviation/journal/create"): lambda r: httpx.Response(200, json={"deviationid": "J1"}),
+        ("GET", "/api/v1/oauth2/deviation/J1"): lambda r: httpx.Response(
+            200, json={"deviationid": "J1", "url": "https://www.deviantart.com/mothy/journal/Sale-123"})})
+    assert c.create_journal("Sale", "Text") == {"deviationid": "J1",
+                                                "url": "https://www.deviantart.com/mothy/journal/Sale-123"}
+
+
+def test_journal_url_read_failure_keeps_success(store):
+    store.save({"access_token": "AT", "refresh_token": "RT", "expires_at": NOW + 3600,
+                "scope": da_api.scope_string("user.manage")})
+    c, router = client(store, {
+        ("POST", "/api/v1/oauth2/deviation/journal/create"): lambda r: httpx.Response(200, json={"deviationid": "J1"}),
+        ("GET", "/api/v1/oauth2/deviation/J1"): lambda r: httpx.Response(500, text="x")})
+    assert c.create_journal("Sale", "Text") == {"deviationid": "J1", "url": ""}
+    assert sum(1 for r in router.calls if r.method == "POST") == 1  # запись не повторялась

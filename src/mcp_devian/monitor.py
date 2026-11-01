@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from . import da_access, da_feeds, db, th_match
+from . import da_access, da_api, da_feeds, db, th_match
 from . import deviantart as da
 from . import toyhouse as th
 from .classify import classify_lot, classify_thread, keyword_hits, match_lot, within_budget
@@ -809,6 +809,160 @@ def seller_pass(conn, cfg: Config, now: float | None = None, enrich: bool = True
         lines.append(f"статистика: просмотры и фавы для {done['snapshots']} лотов")
     if done["stopped"]:
         lines.append(f"статистика: {done['stopped']}")
+    return lines
+
+
+BUYERS_BG_SOURCE = "buyers_bg"
+BUYERS_BG_INTERVAL_S = 3600            # фавнувшие, LF-теги DA, ответы «stop» — не чаще раза в час
+TH_LF_ALERT_SOURCE = "th_lf_alerts"
+GOAL_NUDGE_SOURCE = "goal_nudge"
+GOAL_NUDGE_INTERVAL_S = 7 * 86400      # цель месяца — не чаще раза в неделю
+COMMISSION_NOTIFY_MAX = 3              # напоминаний по слотам за один проход фона
+FAVER_CALLS = 3
+LF_CALLS = 2
+OFFER_WATCH_WORKS = 2
+
+
+def _bg(name: str, fn, default=None):
+    """Каждая фоновая добавка — отдельно: её сбой только в лог, остальное и сама проверка идут дальше."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        log.warning("%s failed: %s: %s", name, type(e).__name__, e)
+        return default
+
+
+class _NetBreaker:
+    """Клиент DA для фонового прохода: после первой сетевой ошибки (DeviantArt завис, таймаут) остальные
+    запросы прохода не идут в сеть, а сразу получают ту же ошибку. Иначе каждая часть ждала бы свои 60 с,
+    и проход вылезал бы за 15-минутный слот, задерживая её запланированные посты."""
+    NET = ("network", "network_unsent")
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self.down: Exception | None = None
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kw):
+            if self.down is not None:
+                raise self.down
+            try:
+                return attr(*args, **kw)
+            except da_api.DAApiError as e:
+                if getattr(e, "code", None) in self.NET:
+                    self.down = e
+                raise
+
+        return call
+
+
+def growth_pass(conn, cfg: Config, now: float | None = None, client=None, palette_fetch=None,
+                palette_sleep=None) -> list[str]:
+    """Фон 0.5 после ставок и рынка: тёплые покупатели (только база), история рынка, похожие продавцы,
+    кто фавнул её лоты, LF-посты DA, ответы «stop» под её предложениями, палитры превью, LF Toyhouse.
+
+    Только чтение и уведомления: ни черновиков, ни сообщений. DeviantArt — в общем бюджете (низкий
+    приоритет), каждая часть в своих пределах; при паузе DeviantArt палитры не качаем. Не бросает."""
+    from . import backfill, buyers, da_market, digest, leads, outreach, palette, similar
+
+    ts = now or time.time()
+    lines: list[str] = []
+    d, me = cfg.deviantart, cfg.deviantart.my_username
+    _bg("buyers.sync", lambda: buyers.sync(conn, ts, me, cfg.posting.th_username))
+    if client is None:
+        client = _api_client(cfg)
+    breaker = _NetBreaker(client) if client is not None else None
+    client = breaker
+    if client is not None:
+        with da_access.session(conn):
+            lines += _bg("backfill", lambda: backfill.step(conn, client, ts, days=d.backfill_days,
+                                                           max_api=d.backfill_api_per_run, cfg=cfg, quiet=True), [])
+            if d.similar_watch:
+                lines += _bg("similar", lambda: similar.step(conn, client, ts, manual=d.similar_artists, cfg=cfg),
+                             [])
+            last = db.last_run(conn, BUYERS_BG_SOURCE)
+            if me and not (last and last["last_run_ts"] and ts - last["last_run_ts"] < BUYERS_BG_INTERVAL_S):
+                _bg("favers", lambda: buyers.refresh_favers(conn, client, ts, FAVER_CALLS, me))
+                found = _bg("da_lf", lambda: leads.da_lf_scan(conn, client, ts, max_calls=LF_CALLS,
+                                                              characters=cfg.posting.characters,
+                                                              my_username=me), {})
+                if found and found.get("new"):
+                    lines.append(f"покупатели: новых LF-постов на DA под её персов — {found['new']} (buyers:leads)")
+                watched = _bg("offer_replies", lambda: outreach.watch_offer_replies(
+                    conn, client, ts, owner=me, max_works=OFFER_WATCH_WORKS), {})
+                if watched and watched.get("opted_out"):
+                    lines.append(f"покупатели: попросили больше не отмечать — {watched['opted_out']}, запомнила")
+                _bg("buyers_bg run", lambda: db.record_run(conn, BUYERS_BG_SOURCE, None, ts))
+    if breaker is not None and breaker.down is not None:
+        lines.append("фон: DeviantArt не отвечает — остальное чтение DA и палитры отложила до следующей проверки")
+    elif d.palette_downloads_per_hour > 0 and not _bg("cooldowns", lambda: da_access.cooldowns(conn, ts), {"?": 1}):
+        def colors() -> None:
+            niche = da_market.niche_terms(conn, cfg)
+            if palette_fetch is not None:
+                palette.step(conn, palette_fetch, ts, per_hour=d.palette_downloads_per_hour, niche=niche,
+                             sleep=palette_sleep)
+                return
+            with palette.client() as http:
+                palette.step(conn, palette.make_fetch(http), ts, per_hour=d.palette_downloads_per_hour,
+                             niche=niche, sleep=palette_sleep)
+
+        _bg("palette", colors)
+    if cfg.toyhouse.background_lf:  # по умолчанию выключено: включает она (toyhouse_background_lf)
+        def th_lf() -> None:
+            last = db.last_run(conn, TH_LF_ALERT_SOURCE)
+            since = last["last_run_ts"] if last and last["last_run_ts"] else None
+            found = leads.th_alerts(conn, cfg, ts, since_ts=since)
+            db.record_run(conn, TH_LF_ALERT_SOURCE, None, ts)
+            if found:
+                lines.extend(found)
+                digest.notify_lines(cfg, "Нашла покупателя на Toyhouse", found)
+
+        _bg("th_lf_alerts", th_lf)
+    lines += _bg("money", lambda: money_pass(conn, cfg, ts), [])
+    return lines
+
+
+def money_pass(conn, cfg: Config, now: float | None = None) -> list[str]:
+    """Её деньги в фоне — только ей, клиентам ничего не уходит, черновиков нет:
+    - напоминания по её слотам YCH/коммишенов (commission_reminders, по умолчанию да): каждое — один раз,
+      не больше COMMISSION_NOTIFY_MAX за проход, остальные — в следующий раз;
+    - цель месяца (goal_nudges, по умолчанию нет): раз в неделю, только если цель задана."""
+    from . import commissions, digest, earnings, evidence
+
+    ts = now or time.time()
+    p = cfg.posting
+    lines: list[str] = []
+    if p.commission_reminders:
+        commissions.ensure_tables(conn)
+        st = commissions.settings_from(cfg)
+        fresh = commissions.pending_reminders(conn, ts, mark=False, deposit_days=st.deposit_days,
+                                              deadline_warn_days=st.deadline_warn_days, final_days=st.final_days,
+                                              deliver_days=st.deliver_days, tz=st.tz)[:COMMISSION_NOTIFY_MAX]
+        if fresh:
+            texts = [f"слоты: {r['text']}" for r in fresh]
+            shown = digest.notify_lines(cfg, "YCH и коммишены", [r["text"] for r in fresh])
+            # Уведомление не дошло (macOS/Telegram сломались) — не отмечаем: напомню в следующий раз.
+            # Уведомления выключены совсем — она видит напоминания в чате (sales:ych), отмечаем как раньше.
+            if shown or not (cfg.notify.macos or cfg.notify.telegram):
+                commissions.mark_reminded(conn, fresh, ts)
+            lines += texts
+    if p.goal_nudges:
+        last = db.last_run(conn, GOAL_NUDGE_SOURCE)
+        if not (last and last["last_run_ts"] and ts - last["last_run_ts"] < GOAL_NUDGE_INTERVAL_S):
+            g = earnings.goal_status(conn, ts, p.timezone or earnings.DEFAULT_TZ)
+            db.record_run(conn, GOAL_NUDGE_SOURCE, None, ts)
+            if g["target"]:
+                left = (f"осталось {earnings._rub(g['remaining'])} за {g['days_left']} дн" if g["remaining"] > 0
+                        else "цель достигнута")
+                text = (f"Цель месяца: дошло {earnings._rub(g['got'])} из {earnings._rub(g['target'])} "
+                        f"({evidence.pct(g['got'] / g['target'])}, {g['got_n']} оплач. с суммой в ₽); {left}. "
+                        "Подробнее — спроси в чате про цель месяца.")
+                digest.notify_lines(cfg, "Цель месяца", [text])
+                lines.append(text)
     return lines
 
 

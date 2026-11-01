@@ -45,8 +45,59 @@ def deviantart_group_used(conn, group: str, now: float | None = None, exclude_dr
     return used
 
 
+GROUP_KINDS = ("da_group", "da_group_manual")  # через API и руками (она отметила сама)
+
+
+def group_limits(posting: Posting, group: str) -> list[tuple[int, int]]:
+    """Все правила группы из её наборов: [(сколько работ, за сколько дней)], без повторов. Если группа в
+    нескольких наборах с разными правилами — соблюдаем каждое (1 в день И 3 в месяц)."""
+    key = group.strip().lower()
+    found: set[tuple[int, int]] = set()
+    for items in (posting.group_presets or {}).values():
+        for g in items or []:
+            lim = g.get("limit") if isinstance(g, dict) else None
+            if str(g.get("group", "")).lower() == key and isinstance(lim, dict):
+                try:
+                    count, days = int(lim["count"]), int(lim["days"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if count > 0 and days > 0:
+                    found.add((count, days))
+    return sorted(found, key=lambda cd: (cd[1], cd[0]))
+
+
+def group_limit(posting: Posting, group: str) -> tuple[int, int] | None:
+    """Одно правило для подписи (самое строгое по доле в день) или None. Проверять — group_limits."""
+    found = group_limits(posting, group)
+    return min(found, key=lambda cd: cd[0] / cd[1]) if found else None
+
+
+def limit_text(count: int, days: int) -> str:
+    return f"{count} за {days} дн"
+
+
+def limits_text(rules) -> str:
+    return " и ".join(limit_text(c, d) for c, d in rules)
+
+
+def group_window_used(conn, group: str, days: int, now: float | None = None,
+                      exclude_draft: str | None = None) -> int:
+    """Сколько её работ ушло в группу за окно правила группы: через API, отмеченные руками и в полёте."""
+    now = now or time.time()
+    key = group.lower()
+    used = sum(drafts.count_sent(conn, kind, now - days * DAY, target=key) for kind in GROUP_KINDS)
+    used += sum(1 for _, p in drafts.inflight(conn, "da_publish", exclude_draft)
+                for g in p.get("groups", []) if str(g.get("group", "")).lower() == key)
+    return used
+
+
 def deviantart_group_block(conn, posting: Posting, group: str, now: float | None = None,
                            exclude_draft: str | None = None) -> str | None:
     if deviantart_group_used(conn, group, now, exclude_draft) >= posting.da_submissions_per_group_per_day:
         return f"в группу {group} сегодня уже отправлено {posting.da_submissions_per_group_per_day}"
+    for lim in group_limits(posting, group):
+        used = group_window_used(conn, group, lim[1], now, exclude_draft)
+        if used >= lim[0]:
+            return (f"правило группы {group}: {limit_text(*lim)}, а за эти {lim[1]} дн уже отправлено {used} "
+                    "(считаю и то, что она отметила руками)")
     return None

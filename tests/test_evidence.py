@@ -122,3 +122,16 @@ def test_render_health_populated(conn):
     assert "Дочитаны в возрасте ≥7 дн: 6 из 9 (67%)" in text
     assert "$30 (1)" in text and "без валюты: 1" in text
     assert "Лоты рынка: 10, из них найдены только поиском: 1" in text
+
+
+@pytest.mark.parametrize("source, label", [
+    ("palette", "палитры лотов"), ("experiment", "её эксперимент"), ("market_th_stated", "заявленные цены TH"),
+    ("x_manual", "X — ссылки, которые она принесла"), ("crm", "её покупатели и участники")])
+def test_new_source_labels(source, label):
+    assert evidence.SOURCE_LABEL[source] == label
+    assert f", {label}, оценка, " in evidence.tag(ev(source=source))
+
+
+def test_unknown_source_falls_back_to_raw_key():
+    assert evidence.tag(ev(source="brand_new_source")) == \
+        "(n=12, 01.09–31.10.2026, brand_new_source, оценка, уверенность низкая)"

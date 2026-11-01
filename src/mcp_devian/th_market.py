@@ -4,7 +4,8 @@
 Что из этого можно честно вытащить:
 - LF-треды (ищут персов): заявленные бюджеты — «budget $30», «up to 50 USD», «can pay 2k pts»,
   «$20–40», а ещё «trades only», «art only», «no budget». Это намерения покупателей, не сделки;
-- треды продаж: запрошенные цены (обычно только из названия: первый пост у них мы не читаем);
+- треды продаж: запрошенные цены из названия; если первый пост прочитан (th_prices → th_stated) —
+  отдельной строкой «заявленные цены продаж (первые посты)», никогда не в реальные продажи;
 - реальные продажи на Toyhouse мы почти не видим: чужие сделки нигде не публикуются. Есть только
   её собственные продажи из таблицы sales (platform='toyhouse').
 
@@ -19,7 +20,9 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any, cast
 
+from . import evidence
 from .taxonomy import tag_text
 
 DAY = 86400
@@ -455,15 +458,25 @@ class Report:
     segments: list[Segment]
     realized: dict[str, Stats]
     realized_no_cur: int = 0
+    # Цены из первых постов тредов продаж (th_prices → th_stated): заявленные, отдельно от реальных продаж.
+    stated: dict[str, Stats] = field(default_factory=dict)
+    stated_ts: dict[str, list[float]] = field(default_factory=dict)
+    stated_values: dict[str, list[float]] = field(default_factory=dict)
+    # Стартовые ставки аукционных тредов — отдельно: старт ниже цены продажи, вместе медиана врёт.
+    stated_sb: dict[str, Stats] = field(default_factory=dict)
+    stated_sb_ts: dict[str, list[float]] = field(default_factory=dict)
+    stated_sb_values: dict[str, list[float]] = field(default_factory=dict)
 
 
 def realized_sales(conn, since: float, until: float) -> tuple[dict[str, Stats], int]:
     """Её оплаченные продажи на Toyhouse за период — единственные настоящие цены, что у нас есть.
+    Предоплаты и остатки YCH/коммишенов — не цены адоптов: не берём.
     → (по валютам, сколько оплаченных без валюты: их в суммы не берём — 4000 чего, непонятно)."""
     try:
         rows = conn.execute("SELECT amount, currency, buyer FROM sales WHERE platform = 'toyhouse' AND amount IS NOT NULL "
                             "AND status IN ('paid', 'transferred', 'done') AND (status != 'transferred' OR paid_ts "
-                            "IS NOT NULL) AND COALESCE(paid_ts, created_ts) BETWEEN ? AND ?",
+                            "IS NOT NULL) AND COALESCE(paid_ts, created_ts) BETWEEN ? AND ? "
+                            "AND COALESCE(item_id, '') NOT LIKE 'comm:%'",
                             (since, until)).fetchall()
     except Exception:  # noqa: BLE001 — нет таблицы sales в старой базе
         return {}, 0
@@ -488,9 +501,64 @@ def demand_supply(conn, days: int = 30, now: float | None = None, my_username: s
     segments.sort(key=lambda s: (s.lf_people, s.lf, -s.sale), reverse=True)
     lf = [t for t in threads if t.side == "lf"]
     realized = realized_sales(conn, now - days * DAY, now)
+    stated, stated_ts, stated_values = stated_prices(conn, now - days * DAY, now, my_username)
+    sb, sb_ts, sb_values = stated_prices(conn, now - days * DAY, now, my_username, kind="sb")
     return Report(days=days, since=now - days * DAY, until=now, n_lf=len(lf), n_lf_text=sum(t.has_text for t in lf),
                   n_sale=sum(t.side == "sale" for t in threads), overall=_segment("всё", threads), segments=segments,
-                  realized=realized[0], realized_no_cur=realized[1])
+                  realized=realized[0], realized_no_cur=realized[1], stated=stated, stated_ts=stated_ts,
+                  stated_values=stated_values, stated_sb=sb, stated_sb_ts=sb_ts, stated_sb_values=sb_values)
+
+
+STATED_SOURCE = "market_th_stated"   # подпись источника добавляет evidence.SOURCE_LABEL
+
+
+def stated_prices(conn, since: float, until: float, my_username: str = "", kind: str = "price"
+                  ) -> tuple[dict[str, Stats], dict[str, list[float]], dict[str, list[float]]]:
+    """Заявленные цены из первых постов (th_stated) по валютам: один продавец — одно число
+    (медиана его тредов, момент — самый свежий тред). kind: price — цены продаж, sb — стартовые ставки
+    аукционов (их не смешиваем). → (Stats, моменты, значения)."""
+    import statistics
+
+    from .th_prices import stated_rows
+
+    raw: dict[str, dict[str, list[tuple[float, float]]]] = {}
+    for r in stated_rows(conn, since, until, my_username):
+        row_kind = (r["kind"] if "kind" in r.keys() else None) or "price"  # noqa: SIM118 — sqlite3.Row: in — по значениям
+        if row_kind != kind:
+            continue
+        who = r["author"] or r["item_id"]
+        raw.setdefault(r["currency"], {}).setdefault(who, []).append((float(r["amount"]), float(r["ts"])))
+    per = {cur: {who: (float(statistics.median(v for v, _ in rows)), max(t for _, t in rows))
+                 for who, rows in m.items()} for cur, m in raw.items()}
+    out = {cur: stats([v for v, _ in m.values()]) for cur, m in per.items() if m}
+    return (out, {cur: [t for _, t in m.values()] for cur, m in per.items()},
+            {cur: [v for v, _ in m.values()] for cur, m in per.items()})
+
+
+def _stated_line(r: Report, kind: str = "price") -> str | None:
+    """«Заявленные цены продаж (первые посты): …» (kind price) или «Стартовые ставки аукционов …» (kind sb)
+    с меткой evidence; меньше MIN_SIDE — «вывода нет»."""
+    stated, values, moments = ((r.stated, r.stated_values, r.stated_ts) if kind == "price"
+                               else (r.stated_sb, r.stated_sb_values, r.stated_sb_ts))
+    if not stated:
+        return None
+    parts = []
+    for cur, s in sorted(stated.items(), key=lambda kv: -kv[1].n):
+        vals = values.get(cur) or []
+        if s.n < evidence.MIN_SIDE:   # ниже порога — без числа, только отказ
+            unit = "pts" if cur == "points" else SYMBOL.get(cur, cur).strip()
+            parts.append(evidence.refuse(f"продавцов с ценой в {unit}", s.n, evidence.MIN_SIDE).rstrip("."))
+            continue
+        lo, hi = evidence.median_ci(vals)
+        pop = "треды продаж Toyhouse, первый пост" if kind == "price" else "аукционы Toyhouse, старт в первом посте"
+        ev = evidence.span(moments.get(cur) or [], cast(Any, STATED_SOURCE), pop,
+                           cur, "observed", measure="price", value=s.median, interval=(lo, hi), data_as_of=r.until)
+        parts.append(f"{_span(s, cur)}, медиана {money(s.median, cur)} {evidence.tag(ev)}")
+    if kind == "sb":
+        return ("Стартовые ставки аукционов (первые посты, продавец — одно число): " + "; ".join(parts)
+                + ". Это старт, не итог торгов и не цена продажи.")
+    return ("Заявленные цены продаж (первые посты, продавец — одно число): " + "; ".join(parts)
+            + ". Это просьбы продавцов, не сделки — в реальные продажи не входят.")
 
 
 def _budget_line(stats_by_cur: dict[str, Stats]) -> str:
@@ -527,6 +595,10 @@ def render_market(r: Report, top: int = 8) -> str:
             parts.append(fl)
         n = max((x.n for x in s.budgets.values()), default=0)
         lines.append("; ".join(parts) + f". Уверенность: {confidence(n)}.")
+    for kind in ("price", "sb"):
+        stated = _stated_line(r, kind)
+        if stated:
+            lines.append(stated)
     real = "; ".join(f"{_span(s, c)}, медиана {money(s.median, c)} (n={s.n})" for c, s in r.realized.items())
     no_cur = (f" Ещё {r.realized_no_cur} оплаченных без валюты — в цены не вошли; укажи валюту (sales:list)."
               if r.realized_no_cur else "")

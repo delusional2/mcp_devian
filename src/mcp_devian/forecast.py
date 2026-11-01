@@ -143,6 +143,7 @@ class Outcome:
     place: str | None = None
     bidder_names: tuple[str, ...] = ()
     read_age: float | None = None
+    backfill: bool = False # дочитан задним числом (история рынка): удалённые с тех пор лоты туда не попали
 
 
 def _extra(row, key: str = "extra") -> dict:
@@ -303,7 +304,8 @@ def load_outcomes(conn, now: float | None = None, days: int = HISTORY_DAYS) -> l
             bidders=len(names) or int(r["a_bidders"] or 0) or (1 if n_bids else 0), final=final, ratio=ratio,
             ab=ab_price(r["snippet"], unit), ab_hit=ab_hit, tags=t, group=season_group(t),
             search=is_search(r["place"]), multi=is_multi(r), place=r["place"], bidder_names=names,
-            read_age=read_age_days(a_extra, r["a_updated"], ts)))
+            read_age=read_age_days(a_extra, r["a_updated"], ts),
+            backfill="backfill" in (_extra(r).get("via") or [])))
     return out
 
 
@@ -634,6 +636,7 @@ class NicheReport:
     base_ev: evidence.Evidence | None = None
     sold: int = 0
     skipped_small: int = 0
+    backfilled: int = 0
 
 
 def fav_snapshots(conn, rows) -> dict[str, dict]:
@@ -682,6 +685,7 @@ def niches(conn, now: float | None = None, min_lots: int = evidence.MIN_SIDE) ->
     k0 = sum(1 for o in pool if o.sold)
     report = NicheReport(tier, fallback, k0 / len(pool) if pool else 0.0, len(pool), n_eff(pool, ref), _cutoff(pool))
     report.sold = k0
+    report.backfilled = sum(1 for o in pool if o.backfill)
     report.phases = {g: season_phase(g, now) for g in SEASONS}
     report.coverage = outcome_coverage(conn, now)
     report.refusal = coverage_refusal(*report.coverage)
@@ -806,6 +810,7 @@ class PricePlan:
     niche_pool: bool = False
     niche_ev: evidence.Evidence | None = None
     niche_level: str = "нет вывода"
+    backfilled: int = 0
 
 
 def _ratio_ci(obs: list[Outcome]) -> tuple[float, float, float | None, int]:
@@ -833,6 +838,7 @@ def price_plan(conn, *, species=(), styles=(), themes=(), keywords=(), unit: str
                      population=_population(unit, tier, fallback))
     if note and pool:
         plan.caveats.append(note)
+    plan.backfilled = sum(1 for o in pool if o.backfill)
     plan.refusal = coverage_refusal(*outcome_coverage(conn, now))
     if plan.refusal:
         return plan
@@ -942,8 +948,14 @@ def calibration(conn, now: float | None = None, outcomes: list[Outcome] | None =
 
 # --- Тексты ---
 
-def _basis_line(n_lots: int, cutoff: float | None, now: float | None = None) -> str:
+BACKFILL_CAVEAT = ("дочитаны задним числом (история рынка): лоты, которые продавцы с тех пор удалили, спрятали или "
+                   "переложили, туда не попали — доля со ставкой может быть завышена")
+
+
+def _basis_line(n_lots: int, cutoff: float | None, now: float | None = None, backfilled: int = 0) -> str:
     line = f"Опора: {n_lots} завершённых аукционов рынка, данные по {_date(cutoff)}."
+    if backfilled and n_lots:
+        line += f" Из них {backfilled} ({_pct(backfilled / n_lots)}) {BACKFILL_CAVEAT}."
     if cutoff and (now or time.time()) - cutoff > evidence.STALE_DAYS * DAY:
         line += f" Внимание, {evidence.stale(evidence.Evidence(0, None, 0, 0, cutoff, 'market_da', '', None, 'observed'), now)}."
     return line
@@ -1013,7 +1025,7 @@ def render_niches(rep: NicheReport, limit: int = 8, now: float | None = None) ->
     lines += [f"Оговорка: {c}." for c in rep.caveats]
     if not rep.tier_fallback:
         lines.append(TIER_NOTE)
-    lines += [_basis_line(rep.n_lots, rep.cutoff_ts, now), GENTLE]
+    lines += [_basis_line(rep.n_lots, rep.cutoff_ts, now, rep.backfilled), GENTLE]
     return "\n".join(lines)
 
 
@@ -1059,7 +1071,7 @@ def render_price_plan(plan: PricePlan, now: float | None = None) -> str:
     if plan.season:
         lines.append(f"Сезон: {plan.season}.")
     lines += [f"Оговорка: {c}." for c in plan.caveats]
-    lines += [_basis_line(plan.pool_n, plan.cutoff_ts, now), GENTLE]
+    lines += [_basis_line(plan.pool_n, plan.cutoff_ts, now, plan.backfilled), GENTLE]
     return "\n".join(lines)
 
 

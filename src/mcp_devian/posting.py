@@ -90,10 +90,41 @@ def da_client(cfg: Config):
     return da_api.DAClient(cfg.posting.da_client_id, da_api.TokenStore())
 
 
-def add_group_to_preset(cfg: Config, preset: str, group: str, folder_name: str) -> dict:
-    """Найти группу и папку через API и добавить в набор."""
+# Правило группы («1/week», «2/day», «1/month», «3/7d»): лимиты задают админы каждой группы сами.
+GROUP_LIMIT_RE = re.compile(r"^\s*(\d{1,3})\s*/\s*(\d{1,3})?\s*([a-zа-яё]+)\s*$", re.I)
+GROUP_LIMIT_UNITS = {
+    **dict.fromkeys(("d", "day", "days", "д", "дн", "день", "дня", "дней", "сутки"), 1),
+    **dict.fromkeys(("w", "wk", "week", "weeks", "н", "нед", "неделя", "неделю", "недели", "недель"), 7),
+    **dict.fromkeys(("m", "mo", "month", "months", "мес", "месяц", "месяца", "месяцев"), 30),
+}
+GROUP_LIMIT_HINT = "Правило группы пишется так: 1/week, 2/day, 1/month или 3/7d (3 работы за 7 дней)."
+
+
+def parse_group_limit(text: str) -> dict | None:
+    """«1/week» → {"count": 1, "days": 7}; пусто — None; непонятное — SettingsError с подсказкой."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    m = GROUP_LIMIT_RE.match(raw)
+    unit = GROUP_LIMIT_UNITS.get(m.group(3).lower()) if m else None
+    if not m or unit is None:
+        raise SettingsError(f"Не поняла правило «{raw}». {GROUP_LIMIT_HINT}")
+    count, days = int(m.group(1)), int(m.group(2) or 1) * unit
+    if not 1 <= count <= 100 or not 1 <= days <= 365:
+        raise SettingsError(f"Правило «{raw}» вне разумных границ (1–100 работ за 1–365 дней). {GROUP_LIMIT_HINT}")
+    return {"count": count, "days": days}
+
+
+def add_group_to_preset(cfg: Config, preset: str, group: str, folder_name: str, limit: str = "") -> dict:
+    """Найти группу и папку через API и добавить в набор; limit — правило группы («1/week»)."""
+    rule = parse_group_limit(limit)  # до запроса: неверное правило не тратит обращение к DeviantArt
     entry = da_client(cfg).resolve_group_folder(group.strip(), folder_name.strip())
-    items = [g for g in cfg.posting.group_presets.get(preset, []) if g.get("group", "").lower() != entry["group"].lower()]
+    old = cfg.posting.group_presets.get(preset, [])
+    same = [g for g in old if g.get("group", "").lower() == entry["group"].lower()]
+    rule = rule or next((g["limit"] for g in same if isinstance(g.get("limit"), dict)), None)
+    if rule:
+        entry["limit"] = rule
+    items = [g for g in old if g.get("group", "").lower() != entry["group"].lower()]
     items.append(entry)
     cfg.posting.group_presets[preset] = items
     return entry
@@ -146,6 +177,11 @@ def prepare_toyhouse_reply(conn, cfg: Config, thread_id: str, character: str, te
         rendered = render_reply(templates[name], char, note)
     except ValueError as e:
         return None, f"Шаблон не подошёл: {e}"
+    from . import translate_guard
+
+    why = translate_guard.check_toyhouse(conn, rendered["text"])
+    if why:  # перевод от ИИ на Toyhouse нельзя (правило 4.8)
+        return None, f"Отклик не готовлю: {why}"
     rules = op_restrictions(row["title"], row["snippet"])
     payload = {"thread_id": item_id, "thread_url": row["url"], "thread_title": row["title"],
                "character_url": char["url"], "character": char["name"], "html": rendered["html"],
@@ -166,7 +202,9 @@ def prepare_toyhouse_reply(conn, cfg: Config, thread_id: str, character: str, te
     return draft_id, preview
 
 
-TITLE_MAX = 50  # DeviantArt обрезает название до 50 символов — лучше сказать заранее
+TITLE_MAX = 50  # предел названия в API не назван; DeviantArt может обрезать — держимся 50
+TITLE_NOTE = ("DeviantArt может обрезать название длиннее 50; в описании API предел не назван — оставляю 50, "
+              "чтобы не рисковать")
 
 
 def image_roots() -> list[Path]:
@@ -364,8 +402,7 @@ def _da_item(conn, cfg: Config, item: dict, now: float | None, used: dict[str, i
     if not clean_title:
         return None, ["Нужно название работы."]
     if len(clean_title) > TITLE_MAX:
-        return None, [f"Название длиннее {TITLE_MAX} символов ({len(clean_title)}), DeviantArt его обрежет. "
-                      "Попроси её сократить."]
+        return None, [f"Название {len(clean_title)} символов. {TITLE_NOTE}. Попроси её сократить."]
     description = str(item.get("description") or "")
     tags = list(item.get("tags") or [])
     # Теги показываем ровно такими, какими они уйдут: DeviantArt принимает только латиницу, цифры и _.
@@ -393,10 +430,26 @@ def _da_item(conn, cfg: Config, item: dict, now: float | None, used: dict[str, i
         key = g["group"].lower()
         if key not in used:
             used[key] = outside[key] = limits.deviantart_group_used(conn, g["group"], now)
+        in_batch = used[key] - outside[key]
+        full = spent = None
+        for rule in limits.group_limits(cfg.posting, g["group"]):  # каждое её правило, не одно «самое строгое»
+            win_key = f"window:{key}:{rule[1]}"
+            if win_key not in outside:
+                outside[win_key] = limits.group_window_used(conn, g["group"], rule[1], now)
+            if full is None and outside[win_key] >= rule[0]:
+                full = (rule, outside[win_key])
+            elif spent is None and outside[win_key] + in_batch >= rule[0]:
+                spent = rule
         if outside[key] >= limit:
             skipped.append((g, f"в группу {g['group']} сегодня уже отправлено {limit}"))
         elif used[key] >= limit:
             skipped.append((g, f"с работами выше в этой партии в неё уже уйдёт {limit} за сутки — это лимит"))
+        elif full:
+            skipped.append((g, f"правило группы {g['group']}: {limits.limit_text(*full[0])}, уже отправлено "
+                               f"{full[1]} за {full[0][1]} дн"))
+        elif spent:
+            skipped.append((g, f"с работами выше в этой партии правило группы ({limits.limit_text(*spent)}) "
+                               "уже исчерпано"))
         else:
             used[key] += 1
             allowed.append(g)
@@ -569,7 +622,7 @@ def approve_draft(conn, cfg: Config, draft_or_batch_id: str, send_at: str | floa
                 "по её «го» (submit_draft).")
     if any(r["kind"] == "th_reply" for r in rows if r):
         return "Отклики Toyhouse по расписанию не отправляю: только сразу по её «го» (submit_draft)."
-    if any(r["kind"] != "da_publish" for r in rows if r):
+    if any(r["kind"] not in SCHEDULABLE_KINDS for r in rows if r):
         return "Этот черновик по расписанию не делаю: только сразу по её «го» (submit_draft)."
     if send_at is None:
         planned = json.loads(rows[0]["payload"]).get("planned_send_at") if rows[0] else None
@@ -598,6 +651,10 @@ def approve_draft(conn, cfg: Config, draft_or_batch_id: str, send_at: str | floa
     if not done:
         return "Не получилось запланировать: " + "; ".join(errors)
     return text + ("".join(f"\nНе вышло: {e}" for e in errors))
+
+
+# Что можно отложить на время (её «го» со временем): публикация, статус, журнал. Комментарии с @никами — нет.
+SCHEDULABLE_KINDS = ("da_publish", "da_status", "da_journal")
 
 
 def cancel_any(conn, draft_or_batch_id: str) -> int:
@@ -1725,6 +1782,10 @@ def _needed_scopes(kind: str, payload: dict) -> list[str]:
 
     if kind == "da_folders":
         return list(da_api.GALLERY_SCOPES)
+    if kind in MANAGE_KINDS:
+        return list(da_api.MANAGE_SCOPES)
+    if kind == "da_offer":
+        return list(da_api.COMMENT_SCOPES)
     works = payload.get("works") or []
     return [*da_api.EDIT_SCOPES, *(da_api.GALLERY_SCOPES if any(w.get("to_folder") for w in works) else ()),
             *(da_api.COMMENT_SCOPES if any(w.get("comment") for w in works) else ())]
@@ -2138,7 +2199,19 @@ def _sender(kind: str):
         return _send_th_character
     if kind == "da_comment_reminder":
         return _send_reminder
+    if kind == "da_status":
+        return _send_status
+    if kind == "da_journal":
+        return _send_journal
+    if kind == "da_offer":
+        return _send_offer
+    if kind != "da_publish":
+        return _send_unknown_kind
     return _send_da_publish
+
+
+def _send_unknown_kind(conn, cfg: Config, payload: dict, draft_id: str, now: float | None) -> tuple[str, str]:
+    return "failed", "не отправила: этот тип черновика помощник не умеет отправлять"
 
 
 def _send_th_character(conn, cfg: Config, payload: dict, draft_id: str, now: float | None) -> tuple[str, str]:
@@ -2199,7 +2272,11 @@ def prepare_payment_reminder(conn, cfg: Config, sale_id: str, now: float | None 
     from . import selling
 
     sale_id = str(sale_id or "").strip()
-    res = selling.payment_reminders(conn, now, older_than_days=0, limit=1000)
+    p = cfg.posting
+    res = selling.payment_reminders(conn, now, older_than_days=0, limit=1000,
+                                    payment_window_hours=getattr(p, "payment_window_hours", 48),
+                                    boosty_url=getattr(p, "boosty_url", ""),
+                                    payment_methods=getattr(p, "payment_methods", ()))
     d = next((x for x in res["due"] if str(x["sale_id"]) == sale_id), None)
     if d is None:
         s = next((x for x in res["skipped"] if str(x["sale_id"]) == sale_id), None)
@@ -2214,13 +2291,15 @@ def prepare_payment_reminder(conn, cfg: Config, sale_id: str, now: float | None 
         return None, why
     if comment_quota(conn, cfg, now)[0] <= 0:
         return None, f"Не готовлю: {COMMENT_LIMIT}."
+    # Её напоминание + её «как заплатить» (только её сохранённый шаблон; текст по умолчанию сюда не попадает).
+    text = d["text"] + (f"\n{d['payment_info']}" if d.get("payment_info") else "")
     payload = {"title": f"напоминание {d['buyer']}", "sale_id": d["sale_id"], "ref": d["ref"], "buyer": d["buyer"],
-               "deviation_uuid": d.get("deviation_uuid"), "deviation_url": d.get("deviation_url"), "text": d["text"]}
+               "deviation_uuid": d.get("deviation_uuid"), "deviation_url": d.get("deviation_url"), "text": text}
     preview = "\n".join([
         f"Напоминание об оплате: {d['buyer']} — «{d['title']}», {d['amount']}, {d['days']} дн.",
         f"Комментарий под её работой: {d.get('deviation_url') or '—'}",
-        "Текст (её шаблон, без изменений):",
-        d["text"],
+        "Текст (её шаблоны, без изменений):",
+        text,
         "Как отправится: через API DeviantArt после её «го», один раз."])
     draft_id = drafts.create(conn, "da_comment_reminder", payload, preview, now)
     _quietly(selling.mark_reminded, conn, d["sale_id"], "draft", now)
@@ -2253,6 +2332,8 @@ def prepare_ping(conn, cfg: Config, url: str, now: float | None = None) -> tuple
         lines += [f"Комментарий {i} ({len(c['users'])} ник.):", c["text"]]
     if res["left_out"]:
         lines.append(f"Не вошли сейчас (лимит): {len(res['left_out'])} — в следующий раз.")
+    if res.get("blocked"):
+        lines.append("Не пингую: " + "; ".join(f"{u} — {why}" for u, why in res["blocked"]) + ".")
     lines.append("Текст — её шаблон без изменений; @ники — те, кто сам просил в пинглист.")
     preview = "\n".join(lines)
     return drafts.create(conn, "da_ping", payload, preview, now), preview
@@ -2436,3 +2517,505 @@ def _ping_run(conn, cfg: Config, draft_id: str, payload: dict, now, lock_timeout
 def _heartbeat_draft(conn, draft_id: str, now: float | None) -> None:
     conn.execute("UPDATE drafts SET sent_ts = ? WHERE id = ? AND status = 'sending'", (now or time.time(), draft_id))
     conn.commit()
+
+
+# --- Продвижение: статус, журнал, предложение под её работой (только по её «го») ---
+#
+# Политика DeviantArt (Etiquette Policy, «Promote meaningful interactions»): «Don't post spam, and don't
+# artificially post repetitive comments or content» и не писать людям по коммерческим поводам без их согласия.
+# Поэтому: статусов не больше 2 в сутки и никогда два одинаковых подряд, журнал — 1 в сутки, а предложение
+# (@ники в комментарии под её же работой) — только тем, кто сам в пинглисте или уже покупал у неё,
+# не больше 5 человек в сутки и одному человеку не чаще раза в 14 дней.
+
+MANAGE_KINDS = ("da_status", "da_journal")
+STATUS_PER_DAY = 2
+JOURNALS_PER_DAY = 1
+STATUS_MAX = 2000
+JOURNAL_MAX = 60000
+OFFER_USERS_PER_DAY = 5
+OFFER_COOLDOWN_DAYS = 14
+MANAGE_RECONNECT = "нужно разрешение на статусы/журналы — переподключи DA"
+MANAGE_RECONNECT_TEXT = (f"{MANAGE_RECONNECT}: она один раз нажмёт «Разрешить» (accounts:da_connect с правом "
+                         "user.manage). Её «го» на черновик в силе.")
+OFFER_RULE = ("Предложение — комментарий с @никами под её же работой: только тем, кто сам просился в пинглист "
+              "или уже покупал у неё; не больше 5 человек в сутки, одному — не чаще раза в 14 дней.")
+
+
+def _norm_text(text: str) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _manage_ctx(cfg: Config) -> tuple[Any, str]:
+    """(клиент, её ник) для статусов и журналов. NotConnected / NeedsReconnect / SettingsError — наверх."""
+    from . import da_api
+
+    client = da_client(cfg)
+    if not client.is_connected():
+        raise da_api.NotConnected("DeviantArt не подключён: нужно accounts:da_connect")
+    client.require_scopes(*da_api.MANAGE_SCOPES)
+    return client, cfg.deviantart.my_username or (client.whoami().get("username") or "")
+
+
+def _ctx_or_why(fn, cfg: Config) -> tuple[Any, str, str]:
+    from . import da_api
+
+    try:
+        client, username = fn(cfg)
+    except SettingsError as e:
+        return None, "", str(e)
+    except da_api.NeedsReconnect:
+        return None, "", MANAGE_RECONNECT_TEXT if fn is _manage_ctx else da_api.RECONNECT
+    except da_api.DAApiError as e:
+        return None, "", str(e)
+    if not username:
+        return None, "", "Не знаю её ник на DeviantArt: укажи его в настройках (my_da_username)."
+    return client, username, ""
+
+
+def _last_status_ref(conn) -> str | None:
+    row = conn.execute("SELECT ref FROM sent_log WHERE kind = 'da_status' AND ok = 1 ORDER BY ts DESC, id DESC "
+                       "LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def status_block(conn, body: str, now: float | None = None, exclude_draft: str | None = None) -> str | None:
+    now = now or time.time()
+    busy = drafts.inflight(conn, "da_status", exclude_draft)
+    if drafts.count_sent(conn, "da_status", now - limits.DAY) + len(busy) >= STATUS_PER_DAY:
+        return f"статусов за сутки уже {STATUS_PER_DAY} — больше не надо, это выглядит как спам"
+    ref = _comment_ref(_norm_text(body))
+    if _last_status_ref(conn) == ref or any(p.get("ref") == ref for _, p in busy):
+        return "такой же текст был в прошлом статусе — DeviantArt считает повторы спамом, пусть скажет иначе"
+    return None
+
+
+def journal_block(conn, now: float | None = None, exclude_draft: str | None = None) -> str | None:
+    now = now or time.time()
+    busy = drafts.inflight(conn, "da_journal", exclude_draft)
+    if drafts.count_sent(conn, "da_journal", now - limits.DAY) + len(busy) >= JOURNALS_PER_DAY:
+        return f"журнал за сутки уже был ({JOURNALS_PER_DAY}) — следующий завтра"
+    return None
+
+
+def _text_label(helper_note: str) -> str:
+    """Чья это речь: её текст — или её шаблон, в который помощник вставил свои слова (их показываем отдельно)."""
+    if not helper_note:
+        return "её, без изменений"
+    return (f"её шаблон; помощник вписал: {helper_note} — это НЕ её слова, покажи их ей дословно; "
+            "«го» = её согласие и на них")
+
+
+def prepare_status(conn, cfg: Config, text: str, deviation_ref: str = "",
+                   now: float | None = None, helper_note: str = "") -> tuple[str | None, str]:
+    """Черновик статуса в её профиле: её текст слово в слово, можно с её работой. (id или None, текст)."""
+    from . import da_api
+
+    body = str(text or "").strip()
+    if not body:
+        return None, "Нужен её текст статуса — своими словами."
+    if len(body) > STATUS_MAX:
+        return None, f"Статус длиннее {STATUS_MAX} символов — пусть сократит."
+    block = status_block(conn, body, now)
+    if block:
+        return None, f"Не готовлю: {block}."
+    client, username, why = _ctx_or_why(_manage_ctx, cfg)
+    if why:
+        return None, why
+    work: dict = {}
+    if str(deviation_ref or "").strip():
+        try:
+            found, why = _resolve_work(conn, client, username, deviation_ref, {})
+        except da_api.DAApiError as e:
+            return None, f"Не получилось найти работу: {e}"
+        if not found:
+            return None, f"Не готовлю: {why}."
+        work = found
+    payload = {"title": f"статус: {body[:40]}", "body": body, "ref": _comment_ref(_norm_text(body)),
+               "deviationid": work.get("uuid"), "deviation_url": work.get("url"), "username": username}
+    preview = "\n".join([
+        f"Статус в её профиле DeviantArt (текст: {_text_label(helper_note)}):",
+        body,
+        *([f"С работой: {work.get('title') or ''} {work.get('url') or ''}".rstrip()] if work else []),
+        f"Лимит: не больше {STATUS_PER_DAY} статусов в сутки, одинаковые подряд не пишу.",
+        "Как отправится: через API DeviantArt после её «го», один раз (можно и по времени)."])
+    return drafts.create(conn, "da_status", payload, preview, now), preview
+
+
+def _journal_html(text: str) -> str:
+    import html as _html
+
+    return "<br />".join(_html.escape(line) for line in str(text).strip().split("\n"))
+
+
+RAFFLE_HELPER_NOTE = "блок правил раффла ({rules}: англ., бесплатный вход, один аккаунт, конец, commitment)"
+
+
+def prepare_journal(conn, cfg: Config, title: str, text: str, tags: list[str] | None = None,
+                    now: float | None = None, raffle_id: str = "", helper_note: str = "",
+                    ) -> tuple[str | None, str]:
+    """Черновик журнала от её имени (распродажа, пинглист, раффл): её текст, без правок. (id или None, текст)."""
+    from .da_api import _clean_tags
+
+    clean_title = " ".join(str(title or "").split())
+    body = str(text or "").strip()
+    if not clean_title or not body:
+        return None, "Для журнала нужны её название и текст."
+    if len(clean_title) > TITLE_MAX:
+        return None, f"Название {len(clean_title)} символов. {TITLE_NOTE}. Попроси её сократить."
+    if len(body) > JOURNAL_MAX:
+        return None, "Текст журнала слишком длинный — пусть сократит."
+    block = journal_block(conn, now)
+    if block:
+        return None, f"Не готовлю: {block}."
+    _, username, why = _ctx_or_why(_manage_ctx, cfg)
+    if why:
+        return None, why
+    if raffle_id and not helper_note:
+        helper_note = RAFFLE_HELPER_NOTE
+    raw_tags = [t for t in (tags or []) if str(t).strip()]
+    clean = _clean_tags(raw_tags)
+    payload = {"title": clean_title, "body_html": _journal_html(body), "text": body, "tags": clean,
+               "username": username, "raffle_id": raffle_id or None}
+    preview = "\n".join([
+        f"Журнал на её DeviantArt: «{clean_title}»",
+        f"Текст ({_text_label(helper_note)}; переносы строк сохраню):",
+        body,
+        f"Теги: {', '.join(clean) or '—'}"
+        + (" (DeviantArt принимает в тегах только латиницу, цифры и _)" if len(clean) != len(raw_tags) else ""),
+        "Комментарии под журналом: открыты · 18+: нет.",
+        f"Лимит: {JOURNALS_PER_DAY} журнал в сутки.",
+        "Как отправится: через API DeviantArt после её «го», один раз (можно и по времени)."])
+    return drafts.create(conn, "da_journal", payload, preview, now), preview
+
+
+def _manage_send(conn, cfg: Config, kind: str, target: str, ref: str | None, call,
+                 now: float | None) -> tuple[str, str, dict]:
+    """Общая отправка статуса/журнала: место в лимитах — до запроса, исход — честно."""
+    from . import da_api
+
+    try:
+        client, _ = _manage_ctx(cfg)
+    except SettingsError as e:
+        return "failed", f"не отправила: {e}", {}
+    except da_api.NeedsReconnect:
+        return "pending", f"ничего не отправила: {MANAGE_RECONNECT_TEXT}", {}
+    except da_api.NotConnected as e:
+        return "pending", f"ничего не отправила: {e}. Её «го» в силе.", {}
+    rid = drafts.reserve(conn, kind, target, ref, now)
+    try:
+        res = call(client) or {}
+    except da_api.NeedsReconnect:
+        _quietly(drafts.release, conn, rid)
+        return "pending", f"ничего не отправила: {MANAGE_RECONNECT_TEXT}", {}
+    except (da_api.RateLimited, da_api.NotConnected) as e:
+        _quietly(drafts.release, conn, rid)
+        return "pending", f"ничего не отправила: {e}. Её «го» в силе — можно повторить позже.", {}
+    except Exception as e:  # noqa: BLE001
+        if _uncertain(e):
+            _quietly(drafts.settle, conn, rid, "unknown")
+            return "unknown", f"{drafts.UNKNOWN_RESULT}: DeviantArt не ответил ({e})", {}
+        _quietly(drafts.release, conn, rid)
+        return "failed", f"DeviantArt не принял: {e}", {}
+    _quietly(drafts.settle, conn, rid, str(res.get("statusid") or res.get("deviationid") or "ok"))
+    return "sent", "", res
+
+
+def _send_status(conn, cfg: Config, payload: dict, draft_id: str, now: float | None) -> tuple[str, str]:
+    block = status_block(conn, payload["body"], now, exclude_draft=draft_id)
+    if block:
+        return "failed", f"не отправила: {block}"
+    status, text, res = _manage_send(conn, cfg, "da_status", payload.get("deviationid") or "", payload["ref"],
+                                     lambda c: c.post_status(payload["body"], payload.get("deviationid")), now)
+    return status, text or "статус опубликован в её профиле"
+
+
+def _send_journal(conn, cfg: Config, payload: dict, draft_id: str, now: float | None) -> tuple[str, str]:
+    block = journal_block(conn, now, exclude_draft=draft_id)
+    if block:
+        return "failed", f"не отправила: {block}"
+    status, text, res = _manage_send(
+        conn, cfg, "da_journal", payload["title"], _comment_ref(_norm_text(payload["text"])),
+        lambda c: c.create_journal(payload["title"], payload["body_html"], is_mature=False, tags=payload["tags"]),
+        now)
+    if status != "sent":
+        return status, text
+    if payload.get("raffle_id") and res.get("deviationid"):
+        from . import raffle
+
+        _quietly(raffle.attach, conn, payload["raffle_id"], str(res["deviationid"]), str(res.get("url") or ""))
+    if res.get("url"):
+        return "sent", f"журнал опубликован: {res['url']}"
+    return "sent", ("журнал опубликован (ссылку DeviantArt не назвал — он в разделе Journal её профиля; "
+                    f"id {res.get('deviationid')})")
+
+
+# Предложение под её работой
+
+def _user_list(users) -> tuple[list[str], list[str]]:
+    """(годные ники без @, без повторов; негодные)."""
+    if isinstance(users, str):
+        users = re.split(r"[\s,]+", users)
+    good: list[str] = []
+    bad: list[str] = []
+    for u in users or []:
+        name = _username(u)
+        if not name:
+            if str(u).strip():
+                bad.append(str(u).strip())
+        elif name.casefold() not in {g.casefold() for g in good}:
+            good.append(name)
+    return good, bad
+
+
+def _past_buyers(conn) -> set[str]:
+    """Покупатели на DeviantArt: ник с Toyhouse на DA может принадлежать другому человеку."""
+    try:
+        rows = conn.execute("SELECT DISTINCT buyer FROM sales WHERE status != 'cancelled' AND buyer IS NOT NULL "
+                            "AND platform = 'deviantart'")
+        return {str(r[0]).strip().lstrip("@").casefold() for r in rows if r[0]}
+    except sqlite3.Error:
+        return set()
+
+
+def _opted_out(conn) -> set[str]:
+    """Кто сказал «не надо»: вышел из пинглиста или отписался от предложений (outreach, если есть)."""
+    from . import pinglist
+
+    pinglist.ensure(conn)
+    out = {r[0] for r in conn.execute("SELECT key FROM pinglist WHERE status = 'out'")}
+    try:
+        from . import outreach
+
+        fn = getattr(outreach, "opted_out", None)
+        if fn:
+            out |= {str(u).casefold() for u in fn(conn)}
+    except Exception:  # noqa: BLE001 — модуля ещё нет или он сломан: остаётся пинглист
+        pass
+    return out
+
+
+def offer_cap(cfg: Config) -> int:
+    try:
+        wanted = int(getattr(cfg.posting, "outreach_per_day", OFFER_USERS_PER_DAY))
+    except (TypeError, ValueError):
+        wanted = OFFER_USERS_PER_DAY
+    return max(0, min(wanted, OFFER_USERS_PER_DAY))
+
+
+OFFER_PING_GAP_DAYS = 1  # после пинга пинглиста — не раньше чем через сутки и не под той же работой
+
+
+def _offer_drafts_users(conn, now: float, exclude_draft: str | None) -> list[str]:
+    """Ники во всех живых черновиках da_offer (ждут «го», запланированы, отправляются), кроме exclude_draft:
+    и наших, и сделанных подбором (outreach) — места в лимите они уже заняли."""
+    out: list[str] = []
+    for r in conn.execute("SELECT id, payload FROM drafts WHERE kind = 'da_offer' AND ("
+                          "(status = 'pending' AND created_ts >= ?) OR (status = 'scheduled' AND created_ts >= ?) "
+                          "OR status = 'sending')", (now - drafts.DRAFT_TTL_S, now - drafts.SCHEDULE_MAX_AGE_S)):
+        if r["id"] == exclude_draft:
+            continue
+        try:
+            out += [str(u).strip().lstrip("@").casefold() for u in json.loads(r["payload"]).get("users") or []]
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def _pinged(conn, now: float, deviation_ids=()) -> set[str]:
+    """Кого пинговал пинглист за последние сутки (под любой работой) или вообще под этой работой
+    (deviation_ids — её id в базе и UUID: пинглист пишет тот, что знал)."""
+    from . import pinglist
+
+    pinglist.ensure(conn)
+    keys = {r[0] for r in conn.execute("SELECT key FROM pinglist_sent WHERE ts >= ?",
+                                        (now - OFFER_PING_GAP_DAYS * limits.DAY,))}
+    for dev in {str(d) for d in deviation_ids or () if d}:
+        keys |= {r[0] for r in conn.execute("SELECT key FROM pinglist_sent WHERE deviation_id = ? UNION "
+                                            "SELECT key FROM pinglist_pending WHERE deviation_id = ?", (dev, dev))}
+    return {str(k).casefold() for k in keys}
+
+
+def offer_check(conn, cfg: Config, users: list[str], now: float | None = None,
+                exclude_draft: str | None = None, deviation_ids=(),
+                ) -> tuple[list[tuple[str, str]], str | None]:
+    """([(ник, почему нельзя)], общая причина или None) для предложения этим людям прямо сейчас.
+    Те же правила, что у подбора (outreach): stop, младше 18, пауза после любого её предложения
+    (отметка или руками), черновик уже есть, недавний пинг пинглиста, общий лимит в сутки."""
+    from . import buyers as buyers_mod
+    from . import outreach, pinglist
+
+    now = now or time.time()
+    pinglist.ensure(conn)
+    outreach.ensure(conn)
+    members = {r[0] for r in conn.execute("SELECT key FROM pinglist WHERE status = 'in'")}
+    buyers = _past_buyers(conn)
+    out = _opted_out(conn)
+    manual = [str(u).casefold() for u in outreach._pending_manual(conn, now - limits.DAY)]
+    busy_users = _offer_drafts_users(conn, now, exclude_draft)
+    pinged = _pinged(conn, now, deviation_ids)
+    bad = buyers_mod.bad_deals(conn)  # её чёрный список, неоплата, спор, чарджбэк
+    kinds = outreach.OFFER_KINDS
+    marks = ",".join("?" * len(kinds))
+    refused: list[tuple[str, str]] = []
+    for u in users:
+        key = u.casefold()
+        contact = buyers_mod.contact(conn, key) or {}
+        last = conn.execute(f"SELECT MAX(ts) FROM sent_log WHERE ok = 1 AND target = ? AND kind IN ({marks})",
+                            (key, *kinds)).fetchone()[0]
+        last = max(float(last or 0), float(contact.get("last_contact_ts") or 0),
+                   float(outreach.last_drafted(conn, key) or 0))  # неотмеченный черновик лички — «может, ушёл»
+        if key in out or contact.get("opted_out_ts"):
+            refused.append((u, "сказал(а), что не надо, — не пишем"))
+        elif key in bad:
+            refused.append((u, bad[key]))
+        elif key not in members and key not in buyers:
+            refused.append((u, "не в её пинглисте и не покупал(а) у неё — незнакомым предложения не пишем"))
+        elif contact.get("is_minor") == 1:
+            refused.append((u, "младше 18 по данным DeviantArt — предложения не пишем"))
+        elif last and now - last < OFFER_COOLDOWN_DAYS * limits.DAY:
+            refused.append((u, f"уже получал(а) предложение за последние {OFFER_COOLDOWN_DAYS} дн"))
+        elif key in busy_users or key in manual:
+            refused.append((u, "черновик предложения для него(неё) уже есть"))
+        elif key in pinged:
+            refused.append((u, "недавно получил(а) пинг пинглиста (или под этой работой) — второй раз не тревожим"))
+    cap = offer_cap(cfg)
+    sent = conn.execute(f"SELECT COUNT(*) FROM sent_log WHERE ok = 1 AND ts >= ? AND kind IN ({marks})",
+                        (now - limits.DAY, *kinds)).fetchone()[0]
+    used = int(sent) + len(busy_users) + len(manual)
+    if used + len(users) > cap:
+        return refused, f"за сутки можно предложить не больше чем {cap} людям, уже {used} — сейчас влезет {max(0, cap - used)}"
+    if comment_quota(conn, cfg, now)[0] <= 0:
+        return refused, COMMENT_LIMIT
+    return refused, None
+
+
+def _offer_text(text: str, users: list[str]) -> str:
+    mentions = " ".join(f"@{u}" for u in users)
+    body = str(text or "").strip()
+    if "{mentions}" in body:
+        return body.replace("{mentions}", mentions, 1)
+    missing = [u for u in users if not re.search(rf"@{re.escape(u)}(?![\w-])", body, re.I)]
+    return f"{body}\n{' '.join('@' + u for u in missing)}" if missing else body
+
+
+MENTION_RE = re.compile(r"(?<![\w@.-])@([A-Za-z0-9_-]{1,40})")
+
+
+def _stray_mentions(body: str, users: list[str], owner: str = "") -> list[str]:
+    """@ники в тексте, которых нет среди получателей (её собственный ник не в счёт): каждый @ — уведомление
+    человеку, поэтому и они проходят все правила предложений."""
+    known = {u.casefold() for u in users} | ({owner.casefold()} if owner else set())
+    out: list[str] = []
+    for name in MENTION_RE.findall(str(body or "")):
+        name = name.rstrip("-_")
+        if name and name.casefold() not in known and name.casefold() not in {o.casefold() for o in out}:
+            out.append(name)
+    return out
+
+
+def prepare_offer(conn, cfg: Config, deviation_ref: str, users, text: str,
+                  now: float | None = None) -> tuple[str | None, str]:
+    """Черновик предложения: её текст + @ники под ЕЁ работой. (id или None, текст)."""
+    from . import da_api
+
+    names, bad = _user_list(users)
+    if bad:
+        return None, f"Не похоже на ники DeviantArt: {', '.join(bad)}."
+    if not names:
+        return None, "Кому предложить? Нужны ники (из её пинглиста или покупатели)."
+    if not str(text or "").strip():
+        return None, "Нужен её текст предложения — своими словами (слот {mentions} — куда поставить @ники)."
+    refused, block = offer_check(conn, cfg, names, now)
+    if refused:
+        return None, "Не готовлю: " + "; ".join(f"{u} — {why}" for u, why in refused) + "."
+    if block:
+        return None, f"Не готовлю: {block}."
+    client, username, why = _ctx_or_why(_comment_ctx, cfg)
+    if why:
+        return None, why
+    try:
+        work, why = _resolve_work(conn, client, username, deviation_ref, {})
+    except da_api.DAApiError as e:
+        return None, f"Не получилось найти работу: {e}"
+    if not work:
+        return None, f"Не готовлю: {why}."
+    body = _offer_text(text, names)
+    # @ник, вписанный прямо в её текст, — тоже получатель: проверяем по тем же правилам.
+    names = names + _stray_mentions(body, names, username)
+    refused, block = offer_check(conn, cfg, names, now, deviation_ids=(work.get("item_id"), work.get("uuid")))
+    if refused:
+        return None, "Не готовлю: " + "; ".join(f"{u} — {why}" for u, why in refused) + "."
+    if block:
+        return None, f"Не готовлю: {block}."
+    if len(body) > COMMENT_MAX:
+        return None, f"Комментарий длиннее {COMMENT_MAX} символов — пусть сократит."
+    payload = {"title": f"предложение: {work.get('title') or work.get('url')}",
+               "deviation_id": work.get("item_id") or work["uuid"], "deviation_uuid": work["uuid"],
+               "deviation_url": work.get("url"), "users": names, "text": body}
+    preview = "\n".join([
+        f"Комментарий под её работой: {work.get('title') or ''} {work.get('url') or ''}".rstrip(),
+        f"Кому (@ники, {len(names)}): {', '.join(names)}",
+        "Текст (её, без изменений):",
+        body,
+        OFFER_RULE,
+        "Как отправится: через API DeviantArt после её «го», один раз."])
+    return drafts.create(conn, "da_offer", payload, preview, now), preview
+
+
+def _send_offer(conn, cfg: Config, payload: dict, draft_id: str, now: float | None) -> tuple[str, str]:
+    from . import da_api
+
+    users = list(payload.get("users") or [])
+    refused, block = offer_check(conn, cfg, users, now, exclude_draft=draft_id,
+                                 deviation_ids=(payload.get("deviation_id"), payload.get("deviation_uuid")))
+    if refused:
+        # Её одобренный текст не правлю: если кому-то уже нельзя, не пишу совсем.
+        return "failed", "не написала: " + "; ".join(f"{u} — {why}" for u, why in refused)
+    if block:
+        return "failed", f"не написала: {block}"
+    try:
+        client, username = _comment_ctx(cfg)
+    except SettingsError as e:
+        return "failed", f"не написала: {e}"
+    except da_api.NeedsReconnect:
+        return "pending", f"ничего не написала: {da_api.RECONNECT} Её «го» в силе."
+    except da_api.NotConnected as e:
+        return "pending", f"ничего не написала: {e}. Её «го» в силе."
+    strays = _stray_mentions(payload.get("text") or "", users, username)
+    if strays:
+        return "failed", (f"не написала: в тексте @{', @'.join(strays)} — их нет среди получателей, а каждый @ — "
+                          "уведомление человеку. Пусть подготовит предложение заново (их тоже проверю).")
+    try:
+        uuid = payload.get("deviation_uuid") or client.deviation_uuid_from_url(
+            payload.get("deviation_url") or "", max_pages=GALLERY_LOOKUP_PAGES)
+        author = (client.deviations_brief([uuid]).get(uuid) or {}).get("author") if uuid else ""
+    except (da_api.RateLimited, da_api.NotConnected) as e:
+        return "pending", f"ничего не написала: {e}. Её «го» в силе."
+    except da_api.DAApiError as e:
+        return "pending", f"ничего не написала: не смогла проверить работу ({e}). Её «го» в силе."
+    if not uuid or not author or str(author).casefold() != username.casefold():
+        return "failed", "не написала: это не её работа (или DeviantArt не назвал автора) — под чужими не пишу"
+    rids = [drafts.reserve(conn, "da_offer", u.casefold(), payload.get("deviation_id"), now) for u in users]
+
+    def release_all() -> None:
+        for rid in rids:
+            _quietly(drafts.release, conn, rid)
+
+    try:
+        state, note = comment_once(conn, client, username, uuid, payload["text"], now)
+    except da_api.UncertainPublish as e:
+        for rid in rids:
+            _quietly(drafts.settle, conn, rid, "unknown")
+        return "unknown", f"{drafts.UNKNOWN_RESULT}: DeviantArt не ответил ({e})"
+    except (da_api.RateLimited, da_api.NotConnected) as e:
+        release_all()
+        return "pending", f"ничего не написала: {e}. Её «го» в силе."
+    except da_api.DAApiError as e:
+        release_all()
+        return "failed", f"DeviantArt не принял комментарий: {e}"
+    if state != "posted":
+        release_all()
+        return ("pending" if state == "unchecked" else "failed"), note
+    for rid in rids:
+        _quietly(drafts.settle, conn, rid, "ok")
+    return "sent", f"предложение написано под работой {payload.get('deviation_url') or ''}: {', '.join(users)}".rstrip()

@@ -40,6 +40,9 @@ STALE_OPTIONS = evidence.heuristic("снизить цену, перевести 
                                    "предложить в подходящих LF-тредах Toyhouse", "практика продавцов адоптов")
 LOW_START = evidence.heuristic("невысокий старт на аукционе помогает получить первую ставку",
                                "практика продавцов адоптов")
+BOOSTY_NO_HINT = ("Boosty указан, но не сказано, как платить иностранцам: метод оплаты «не для карт РФ» и обязательный "
+                  "3-D Secure (FAQ Boosty, обновлено 12.2025); валюту пересчитывает их банк. "
+                  "Готовую строку даст чек-лист поста.")
 EXCLUSIVES = ("DA Exclusives — официальный способ DeviantArt продавать адопты: фикс-цена или приём предложений, "
               "нужна подписка Core, лот попадает в Shop, комиссия «от 2.5%», можно включить 10% роялти с перепродаж "
               f"({evidence.DA_SELL}). Данных, что так продаётся лучше, у меня нет — это просто ещё один формат.")
@@ -313,10 +316,13 @@ def _rule_unpaid(conn, now: float) -> list[Advice]:
     lines = [f"{r['title']} — {sales.money(r['amount'], r['currency']) if r['currency'] else 'сумма без валюты'}"
              + (f", {r['buyer']}" if r["buyer"] else "")
              + f", {int((now - r['created_ts']) // DAY)} дн" for r in rows[:5]]
+    trusted = [r for r in rows if r["status"] == "transferred" and not r["paid_ts"]]
+    transfer = (f"\nПерс уже передан без оплаты: {len(trusted)}. Лучше передавать после оплаты — "
+                f"{sales.CHARGEBACK_NOTE}." if trusted else "")
     return [Advice("unpaid", f"Ждут оплаты: {len(rows)}",
                    "Можно мягко напомнить покупателям. " + evidence.heuristic(
                        "если покупатель молчит неделю, лот часто переходит следующему по ставке", evidence.GUIDE_2021)
-                   + "\n" + "\n".join(lines),
+                   + transfer + "\n" + "\n".join(lines),
                    evidence=f"{len(rows)} её продаж не оплачены дольше 3 дней", confidence="высокая",
                    impact=90)]
 
@@ -1106,7 +1112,7 @@ def launch_plan(conn, cfg: Config, *, species: str | None = None, style: str | N
               f"• если за {stale_days:g} дн не ушло — посмотри варианты в advice:unsold ({stale_why})."]
     if chosen in ("auction", "bta") and plan_ok and plan:
         conf = plan.confidence
-        lines.append(forecast._basis_line(plan.pool_n, plan.cutoff_ts, now))
+        lines.append(forecast._basis_line(plan.pool_n, plan.cutoff_ts, now, plan.backfilled))
     elif chosen in ("flatsale", "adopt") and fix and fix.ev is not None:
         conf = evidence.level(fix.ev)
     else:
@@ -1200,7 +1206,9 @@ def listing_review(item_row, conn, cfg: Config, now: float | None = None, tz: st
     if not facts["tos"]:
         out.append("Не видно TOS (условий): ссылка на правила снимает вопросы покупателя.")
     if not pays_any(facts):
-        out.append("Не видно способа оплаты (PayPal, Ko-fi, поинты…).")
+        out.append("Не видно способа оплаты: напиши, как платить (Boosty, поинты…) или «payment info in my profile».")
+    elif facts.get("pay_boosty") and not facts.get("foreign_pay_hint"):
+        out.append(BOOSTY_NO_HINT)
     if lot_type in AUCTION_TYPES + FIXED_TYPES + ("ota",) and not buyer_gets(facts):
         out.append(evidence.heuristic("напиши, что получает покупатель: файл без водяного знака, png/полный размер, "
                                       "права, перенос на Toyhouse", evidence.GUIDE_2021))

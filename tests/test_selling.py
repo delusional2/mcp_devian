@@ -314,7 +314,7 @@ def test_payment_reminders_flow(conn):
     r = selling.payment_reminders(conn, now + 3 * DAY)
     assert old not in [x["sale_id"] for x in r["due"]]
     assert any(s["sale_id"] == old and "напоминание было" in s["reason"] for s in r["skipped"])
-    assert old in due(now + 4 * DAY + 3)                # через 3 дня — снова
+    assert old not in due(now + 4 * DAY + 3)            # одно напоминание на продажу — дальше решает она
 
 
 def test_paid_sale_not_reminded(conn):
@@ -424,7 +424,7 @@ def test_reminder_block_at_send_time(conn):
     assert selling.reminder_block(conn, sid, now) == ""
     selling.mark_reminded(conn, sid, "sent", now)
     assert "было" in selling.reminder_block(conn, sid, now + DAY)
-    assert selling.reminder_block(conn, sid, now + 4 * DAY) == ""
+    assert selling.reminder_block(conn, sid, now + 4 * DAY) == selling.TOO_MANY_REMINDERS
     sales.set_status(conn, sid, "paid", now + 4 * DAY)
     assert "не ждёт" in selling.reminder_block(conn, sid, now + 5 * DAY)
     assert selling.reminder_block(conn, "nope", now) == "продажи нет в журнале"
@@ -447,3 +447,113 @@ def test_market_sample_like_forecast(conn):
     conn.commit()
     got = [r["id"] for r in selling._market(conn, "ota", taxonomy.tag_text("Dragon OTA"), now)]
     assert got == [folder]
+
+
+# --- 0.5: шаблоны оплаты и продвижения, срок оплаты 48 ч ---
+
+def test_new_template_kinds(conn):
+    for kind, text in (("payment_info", "Pay {amount} at {boosty_url} within {window_hours}h"),
+                       # Слоты — как в модулях, которые эти шаблоны заполняют (outreach/leads, xpost, raffle).
+                       ("offer", "Hi {name}! {title} might suit you ({why}): {link}"),
+                       ("x_post", "{title} {price} {url} {species}"),
+                       ("raffle", "{prize} until {ends}. {rules} {commitment}"),
+                       ("raffle_winner", "{winner} won {title}! seed {seed}, {count} entries, {list_hash}"),
+                       ("status", "New: {title} {price} {url}")):
+        selling.set_template(conn, kind, text)
+        assert selling.get_template(conn, kind) == text
+    with pytest.raises(selling.SellingError):
+        selling.set_template(conn, "x_post", "{title} {mentions}")
+
+
+def test_default_payment_info_mentions_paypal_only_as_unavailable(conn):
+    info = selling.payment_info(conn, buyer="bob", title="Moth", amount="$40", boosty_url="https://boosty.to/moth",
+                                window_hours=48)
+    text = info["text"]
+    assert info["default"] and "https://boosty.to/moth" in text and "$40" in text and "48h" in text
+    low = text.lower()
+    for fact in ("outside russia", "converted automatically", "3-d secure", "don't retry", "da/th name"):
+        assert fact in low, fact
+    # FAQ Boosty (12.2025): валюту доната не выбрать, конвертация автоматическая — «switch to USD/EUR» нет.
+    assert "usd" not in low and "eur" not in low and "switch" not in low
+    assert "points" not in low  # поинтов нет в её способах — и строки про них нет
+    paypal = [line for line in text.splitlines() if "paypal" in line.lower()]
+    assert paypal == ["- PayPal is not available on Boosty, sorry!"]
+    for banned in ("ko-fi", "kofi", "stripe", "donation"):
+        assert banned not in low
+    assert "{" not in text
+    no_link = selling.payment_info(conn, buyer="bob")["text"]
+    assert "link in my profile" in no_link and "  " not in no_link
+    selling.set_template(conn, "payment_info", "My way: {boosty_url}")
+    assert selling.payment_info(conn, boosty_url="https://boosty.to/m") == {"text": "My way: https://boosty.to/m",
+                                                                           "default": False}
+
+
+def test_reminders_after_48h_once_per_buyer(conn):
+    now = PUB + 10 * DAY
+    early = _won(conn, 1.5, now)
+    due_sale = _won(conn, 2.1, now, uuid="UUID-2")
+    res = selling.payment_reminders(conn, now, boosty_url="https://boosty.to/moth")
+    ids = [d["sale_id"] for d in res["due"]]
+    assert due_sale in ids and early not in ids
+    d = next(x for x in res["due"] if x["sale_id"] == due_sale)
+    # Текст по умолчанию — только предложение: в payment_info (то, что можно класть в черновик) его нет.
+    assert d["payment_info"] is None and d["payment_info_default"]
+    assert "https://boosty.to/moth" in d["payment_info_suggestion"]
+    assert "Предложение (не отправляю" in selling.render_reminders(res)
+    assert early in [d["sale_id"] for d in selling.payment_reminders(conn, now, payment_window_hours=24)["due"]]
+    selling.mark_reminded(conn, due_sale, "sent", now)
+    later = selling.payment_reminders(conn, now + 30 * DAY)
+    assert due_sale not in [d["sale_id"] for d in later["due"]]
+    assert any(s["sale_id"] == due_sale and s["reason"] == selling.TOO_MANY_REMINDERS for s in later["skipped"])
+
+
+def test_default_payment_info_respects_currency_and_methods(conn):
+    pts = selling.payment_info(conn, buyer="bob", amount="500 pts", currency="points", methods=["boosty", "points"])
+    assert pts["text"] is None  # продажа за поинты: Boosty тут ни при чём
+    rub = selling.payment_info(conn, buyer="bob", amount=sales.money(1500, "rub"), currency="rub",
+                               boosty_url="https://boosty.to/m")["text"]
+    assert "1,500 ₽" in rub and "usd" not in rub.lower() and "rub" not in rub.lower().replace("russia", "")
+    both = selling.payment_info(conn, buyer="bob", amount="$40", currency="usd", methods=["boosty", "points"])["text"]
+    assert "DA Points are an option too" in both and "{" not in both
+    only_boosty = selling.payment_info(conn, buyer="bob", amount="$40", currency="usd", methods=["boosty"])["text"]
+    assert "Points" not in only_boosty
+
+
+def test_her_payment_info_goes_to_due_items(conn):
+    now = PUB + 10 * DAY
+    sid = _won(conn, 3, now)
+    selling.set_template(conn, "payment_info", "Pay {amount} here: {boosty_url}")
+    d = next(x for x in selling.payment_reminders(conn, now, boosty_url="https://boosty.to/m")["due"]
+             if x["sale_id"] == sid)
+    assert d["payment_info"] == "Pay $40 here: https://boosty.to/m"
+    assert not d["payment_info_default"] and d["payment_info_suggestion"] is None
+
+
+def test_points_sale_reminder_has_no_boosty_text(conn):
+    now = PUB + 10 * DAY
+    iid = lot(conn, "Moth pts", usd=None, points=500, own=True, n_bids=2, top=900.0, ended=1, status="closed",
+              uuid="UUID-P")
+    sid = sales.add_sale(conn, title="Moth pts", amount=900, currency="points", platform="deviantart",
+                         format="auction", buyer="bob", item_id=iid, now=now - 3 * DAY)
+    d = next(x for x in selling.payment_reminders(conn, now, boosty_url="https://boosty.to/m",
+                                                  payment_methods=["boosty", "points"])["due"] if x["sale_id"] == sid)
+    assert d["payment_info"] is None and d["payment_info_suggestion"] is None and not d["payment_info_default"]
+
+
+def test_default_payment_text_never_becomes_a_draft(conn):
+    """Платформенная безопасность: публичный комментарий — только её слова. Есть лишь текст по умолчанию
+    (её шаблонов нет) — черновика нет; есть её напоминание — в черновике только оно, без текста по умолчанию."""
+    from mcp_devian import posting
+    from mcp_devian.config import Config
+
+    now = PUB + 10 * DAY
+    sid = _won(conn, 3, now)
+    assert selling.template_or_default(conn, "payment_info")[1]
+    draft_id, why = posting.prepare_payment_reminder(conn, Config(), sid, now)
+    assert draft_id is None and "шаблона" in why
+    assert conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 0
+    res = selling.payment_reminders(conn, now, older_than_days=0, boosty_url="https://boosty.to/m")
+    selling.set_template(conn, "payment_reminder", "Hi {buyer}, reminder about {title}")
+    res = selling.payment_reminders(conn, now, older_than_days=0, boosty_url="https://boosty.to/m")
+    d = next(x for x in res["due"] if x["sale_id"] == sid)
+    assert d["text"] == "Hi bob, reminder about Moth dragon" and d["payment_info"] is None

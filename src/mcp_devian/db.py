@@ -98,15 +98,18 @@ CREATE TABLE IF NOT EXISTS sales (
     title TEXT NOT NULL,
     character_url TEXT,
     buyer TEXT,
-    amount REAL,
-    currency TEXT,                 -- usd | points | eur | gbp
+    amount REAL,                   -- сколько заплатил покупатель (gross)
+    currency TEXT,                 -- usd | points | eur | gbp | rub
     format TEXT,                   -- auction | flatsale | ota | bta | raffle | other
     status TEXT NOT NULL,          -- won | paid | transferred | done | cancelled
     created_ts REAL NOT NULL,
     paid_ts REAL,
     done_ts REAL,
     source TEXT,                   -- auto (из ставок) | manual
-    note TEXT
+    note TEXT,
+    net_amount REAL,               -- сколько дошло до неё (её цифра, например ₽ после Boosty)
+    net_currency TEXT,             -- обычно rub
+    pay_method TEXT                -- boosty | points | other
 );
 CREATE INDEX IF NOT EXISTS sales_status ON sales(status, created_ts);
 
@@ -206,6 +209,9 @@ MIGRATIONS = [
     ("da_feeds", "deep_ts", "REAL"),
     ("da_feeds", "api_miss_ts", "REAL"),
     ("da_feeds", "order_miss_ts", "REAL"),
+    ("sales", "net_amount", "REAL"),
+    ("sales", "net_currency", "TEXT"),
+    ("sales", "pay_method", "TEXT"),
 ]
 
 

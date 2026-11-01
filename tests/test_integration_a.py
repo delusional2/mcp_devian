@@ -448,12 +448,12 @@ def test_get_settings_mentions_update_and_never_fails(server, monkeypatch):
 
 def test_new_tool_annotations():
     tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
-    read_only = ("get_settings", "findings", "market", "forecast", "advice")
+    read_only = ("get_settings", "findings", "market", "forecast")
     # th_character и th_auctions открывают её Chrome или окно бота — спрашивать каждый раз.
     external = ("th_auctions", "th_character", "th_thread", "check", "accounts", "set_background_checks")
     safe = ("sales", "pinglist", "set_template", "images", "characters", "drafts", "feedback", "da_groups",
             "prepare_gallery", "prepare_toyhouse_reply", "prepare_deviantart_publish", "update_settings", "dismiss",
-            "da_auctions")
+            "da_auctions", "advice")  # advice:translate запоминает перевод — пишет
     for name in read_only:
         assert tools[name].annotations.read_only_hint is True, name
     for name in external + safe:

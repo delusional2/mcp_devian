@@ -26,6 +26,7 @@ from .config import (
     DAGroup,
     SettingsError,
     apply_changes,
+    describe_keys,
     editing,
     load_config,
     load_dotenv,
@@ -54,7 +55,12 @@ SETUP_QUESTIONS = """\
      Автоматизация → Claude → Google Chrome.
 5. Включить ли фоновую проверку раз в 15 минут с уведомлениями на маке (set_background_checks):
    новые треды, где ищут персов, и (если подключит DeviantArt) новые ставки на её аукционах.
-В конце update_settings(..., finish_setup=True), коротко и по-доброму перескажи, что настроено,
+6. Как ей платят: ссылка на её Boosty (boosty_url) и способы (payment_methods: boosty, points, other);
+   её ник в X (x_handle), если бывает там, — для черновиков постов, «Post» жмёт она сама.
+7. По желанию, оба выключены, пока она не скажет «да»: уведомлять о новых LF-тредах Toyhouse под её персов
+   в фоне (toyhouse_background_lf) и ранний доступ для пинглиста — за сколько часов до всех (pinglist_early_access_hours).
+Сохраняй update_settings(changes={…}). В конце update_settings(finish_setup=True), коротко и по-доброму
+перескажи, что настроено,
 и предложи настроить публикацию (промпт posting_setup) — когда ей будет удобно."""
 
 POSTING_RULE = ("Публикует только по её явному «го» на конкретный черновик: сначала prepare_* (или action, "
@@ -92,18 +98,48 @@ TEXT_RULE = (
     "слово в слово; не сочиняй, не переписывай и не «улучшай» (на Toyhouse тексты от ИИ запрещены). "
     "Публичный текст = её шаблон или её слова.")
 HOW_TO = (
-    "Подсказки в ответах вида «tool:action» значат: вызови tool с action=… "
-    "Настройки (update_settings): toyhouse_mode bot (свой Chrome бота, по расписанию) или chrome (её Chrome, по "
-    "просьбе в чате); toyhouse_boards — номер или «id.slug» (13 Adoption Center, 5866 Design Marketplace, 71 Art "
-    "Marketplace); max_pages_per_board — страниц доски за проверку (6); *_poll_minutes ≥ 15; lot_types: auction, "
-    "ota, bta, flatsale, raffle, adopt, ych, commission; watermark_* — подпись латиницей (пусто — её ник DA), PNG-"
-    "логотип, положение (tiled, center, bottom-right…), непрозрачность %; da_comments_per_day / da_pings_per_day "
-    "только уменьшить (не больше 20 и 10); th_auto_submit — отправлять отклик по «го» (True) или только вставлять "
-    "текст, «Post» жмёт она (False); timezone — её пояс (Europe/Moscow); notify_market_lots — чужие лоты "
-    "(продавцу обычно не нужно); da_client_id — число из её приложения DeviantArt (секрет не нужен). "
-    "Время для send_at: «завтра 19:00», «03.11 19:00», «19:00» — в её поясе. Проверка (check:run) ждёт до ~45 с, "
-    "дальше — check:status; Toyhouse не чаще раза в 10 минут. Если Toyhouse просит «я человек», вкладка остаётся "
-    "открытой: она нажмёт, потом спроси ещё раз. Отзыв (feedback:report) показывай целиком.")
+    "Подсказки в ответах вида «tool:action» значат: вызови tool с action=… Настройки: "
+    "update_settings(changes={ключ: значение}); toyhouse_mode bot (свой Chrome бота, по расписанию) или chrome "
+    "(её Chrome, по просьбе в чате); toyhouse_boards — номер или «id.slug» (13 Adoption Center, 5866 Design "
+    "Marketplace, 71 Art Marketplace); max_pages_per_board — страниц доски за проверку (6); *_poll_minutes ≥ 15; "
+    "lot_types: auction, ota, bta, flatsale, raffle, adopt, ych, commission; watermark_* — подпись латиницей "
+    "(пусто — её ник DA), PNG-логотип, положение (tiled, center, bottom-right…), непрозрачность %; "
+    "da_comments_per_day / da_pings_per_day только уменьшить (не больше 20 и 10); th_auto_submit — отправлять "
+    "отклик по «го» (True) или только вставлять текст, «Post» жмёт она (False); timezone — её пояс "
+    "(Europe/Moscow); notify_market_lots — чужие лоты (продавцу обычно не нужно); da_client_id — число из её "
+    "приложения DeviantArt (секрет не нужен). Время для send_at: «завтра 19:00», «03.11 19:00», «19:00» — в её "
+    "поясе. Проверка (check:run) ждёт до ~45 с, дальше — check:status; Toyhouse не чаще раза в 10 минут. Если "
+    "Toyhouse просит «я человек», вкладка остаётся открытой: она нажмёт, потом спроси ещё раз. Отзыв "
+    "(feedback:report) показывай целиком.")
+MONEY_RULE = (
+    "Деньги, YCH, защита, перевод. sales:hours — amount часы, что рисовала: sale_id | url | title (или comm:<слот>); "
+    "status=overhead + format — общая работа формата (база YCH); amount=0 — убрать последнюю запись (title — id "
+    "записи или название работы); sale_id + title без amount — привязать прежние часы; повтор за 2 мин не пишется. "
+    "sales:hourly — ₽/ч за days; goal amount=30000 — цель месяца, без amount — прогресс; plan amount=3 — сколько "
+    "адоптов в неделю она успевает, и план недели; report date=2026-10 — HTML-отчёт за месяц в её Загрузках. "
+    "YCH/коммишены: ych — предложения, очередь, напоминания; ych_offer — format ych|commission, title, amount цена, "
+    "currency, slots, hours на слот, days срок выполнения, deposit_pct, platform (sale_id + status close|open — "
+    "закрыть/открыть); ych_claim — buyer клиент, sale_id предложения или amount, title что рисовать, date срок "
+    "(2027-02-01, 01.02 или +10), hours; status=force — взять, даже если по часам не успевает (скажи ей прямо); "
+    "ych_paid — sale_id слота, status deposit|final, net ₽ ей; ych_slot — sale_id, status шаг (in_progress, wip_sent, "
+    "delivered) | cancel | refund, date (нет — снять срок), hours осталось; ych_load — загрузка и напоминания; "
+    "ych_stats; ych_announce — только факты, текст анонса — её. Клиентам помощник ничего не пишет. "
+    "Защита: buyers:check перед передачей (users — ник, text — deviantart|toyhouse|x); blacklist, mark (text "
+    "«no_pay: заметка»; kind paid|no_pay|disputed|refunded|chargeback), scam_lists — её списки. Публичные списки "
+    "мошенников и поиск копий (images:theft) помощник не читает — даёт ссылки, смотрит она; images:theft_report — "
+    "шаги и факты для жалобы, отправляет она. images:sheet — картинка для поста: prices {\"sb\": 15, \"ab\": 60} или "
+    "{\"price\": 25}. Перевод (advice:translate) — только её текст и только для DeviantArt или X: переведи по "
+    "инструкции из ответа, затем translate с text и translation — покажи ей оба текста и жди её «ок» "
+    "(translate_ok). На Toyhouse перевод не идёт никогда (правило 4.8): помощник его там блокирует.")
+SETTING_KEYS_TEXT = "Ключи настроек и пределы: " + describe_keys() + "."
+GROWTH_RULE = (
+    "Покупатели и продвижение (buyers, promo): личные предложения — только тем, кто у неё покупал, ставил на ЕЁ "
+    "лоты или сам вступил в пинглист (кто только фавнул — нет); ответ на публичный LF-пост — можно; не больше "
+    "outreach_per_day в сутки, одному — раз в "
+    "outreach_cooldown_days, «stop» помнится навсегда, младшим 18 не пишем. Чужим под их работами не пишем; "
+    "личку и X она отправляет сама (X — ссылка intent, «Post» жмёт она), потом buyers:contacted / promo:x_posted. "
+    "Платного продвижения, накруток, перезаливов ради подъёма нет. Если ответ просит переподключить DA ради новых "
+    "прав (статусы, журналы) — спроси её один раз; на «да» добавь право в da_extra_scopes и accounts:da_connect.")
 
 INSTRUCTIONS = """\
 Помощник художницы, которая продаёт адоптов на DeviantArt и Toyhouse. В начале разговора вызови get_settings:
@@ -158,6 +194,9 @@ mcp = _Server("mcp_devian", instructions=INSTRUCTIONS)
 # Claude Desktop по этим пометкам предлагает «Разрешать всегда» для безопасных инструментов.
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
 SAFE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
+# Пишет только в её базу, но повтор вызова добавит ещё одну запись (продажа, часы, слот).
+SAFE_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
+                             open_world_hint=False)
 # Пишет её настройки и при этом читает DeviantArt.
 SAFE_WEB = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 # Открывают браузер, ставят фоновую задачу, ходят на сайты: спрашивать каждый раз.
@@ -237,7 +276,7 @@ ASK_FEEDBACK = ("Давно не спрашивали, как ей помощн�
                 "Если не хочет отвечать — feedback:declined и не настаивай.")
 NOT_CONFIGURED = "Настройка ещё не пройдена: сначала вызови get_settings и задай ей вопросы оттуда."
 BROKEN_SETTINGS = ("Файл настроек повреждён, его копия сохранена рядом. Поверх ничего не записываю: "
-                   "мягко предложи ей пройти настройку заново (update_settings(..., finish_setup=True)).")
+                   "мягко предложи ей пройти настройку заново (update_settings(changes={…}, finish_setup=True)).")
 
 
 def _since(days: float) -> float:
@@ -266,6 +305,7 @@ def describe_settings(cfg: Config) -> str:
         f"отклики {'отправляются по «го»' if cfg.posting.th_auto_submit else 'вставляются, «Post» жмёт она'}",
         f"Фоновая проверка: {'включена' if background.is_enabled() else 'выключена'}; "
         f"уведомления macOS {'да' if cfg.notify.macos else 'нет'}, Telegram {'да' if cfg.notify.telegram else 'нет'}",
+        *growth_lines(cfg),
         *[f"! {w}" for w in cfg.warnings],
     ]
     if not cfg.configured:
@@ -273,9 +313,36 @@ def describe_settings(cfg: Config) -> str:
     return "\n".join(lines)
 
 
+def growth_lines(cfg: Config) -> list[str]:
+    """Строки 0.5: оплата, X, покупатели, история рынка, фон Toyhouse, YCH и цель."""
+    p, d = cfg.posting, cfg.deviantart
+
+    def yes(flag: bool) -> str:
+        return "да" if flag else "нет"
+
+    return [
+        f"Оплата: Boosty {p.boosty_url or 'не указан'}; способы {', '.join(p.payment_methods) or 'не указаны'}; "
+        f"ждать оплату {p.payment_window_hours} ч; частями {yes(p.payment_plans)}",
+        f"X: {'@' + p.x_handle if p.x_handle else 'ник не указан'}; хэштеги "
+        f"{' '.join('#' + t for t in p.x_hashtags) or '—'}; RT-аккаунтов {len(p.x_rt_accounts)}",
+        f"Покупатели: предложений до {p.outreach_per_day} в сутки, одному — раз в {p.outreach_cooldown_days} дн; "
+        f"ранний доступ пинглиста {str(p.pinglist_early_access_hours) + ' ч' if p.pinglist_early_access_hours else 'выкл'}",
+        f"История рынка: {d.backfill_days} дн, групп до {d.backfill_groups}, запросов за проход {d.backfill_api_per_run}; "
+        f"похожие продавцы {yes(d.similar_watch)}; палитры превью {d.palette_downloads_per_hour}/ч",
+        f"Toyhouse LF в фоне (уведомления о покупателях): {yes(cfg.toyhouse.background_lf)}",
+        (f"YCH и коммишены: {p.commission_weekly_hours:g} ч рисования в неделю; предоплата "
+         if p.commission_weekly_hours else "YCH и коммишены: часы рисования в неделю не указаны; предоплата ")
+        + f"{p.commission_deposit_pct}%; напоминать: предоплата через {p.commission_deposit_days} дн, срок за "
+        f"{p.commission_deadline_warn_days} дн, остаток через {p.commission_final_days} дн после WIP, отдать через "
+        f"{p.commission_deliver_days} дн; напоминания в фоне {yes(p.commission_reminders)}; "
+        f"цель месяца раз в неделю {yes(p.goal_nudges)}",
+    ]
+
+
 def guide(cfg: Config) -> str:
     """Правила и подсказки: один раз за разговор, в ответе get_settings."""
-    lines = [TONE, POSTING_RULE, TEXT_RULE, NUMBERS_RULE, GALLERY_CAN, HOW_TO]
+    lines = [TONE, POSTING_RULE, TEXT_RULE, NUMBERS_RULE, GALLERY_CAN, HOW_TO, GROWTH_RULE, MONEY_RULE,
+             SETTING_KEYS_TEXT]
     if cfg.configured and feedback.should_ask(configured_since=cfg.configured_at):
         lines.append(ASK_FEEDBACK)
     return "\n\n".join(lines)
@@ -285,8 +352,8 @@ def guide(cfg: Config) -> str:
 
 @tool(READ_ONLY, whole=True)
 def get_settings() -> str:
-    """Вызывай первым в каждом разговоре: её настройки, правила общения и подсказки к инструментам.
-    Если настройка не пройдена — там вопросы: задай по одному, потом update_settings(..., finish_setup=True)."""
+    """Вызывай первым в разговоре: её настройки, правила и подсказки к инструментам;
+    не пройдена настройка — там вопросы."""
     cfg = load_config()
     text = describe_settings(cfg) + "\n\n" + guide(cfg)
     try:
@@ -298,44 +365,16 @@ def get_settings() -> str:
     return f"{text}\n\n{note}" if note else text
 
 
-@tool(SAFE)
-def update_settings(
-    my_da_username: str | None = None,
-    buy_keywords: list[str] | None = None,
-    exclude: list[str] | None = None,
-    lot_types: list[str] | None = None,
-    max_usd: float | None = None,
-    max_points: float | None = None,
-    lf_keywords: list[str] | None = None,
-    artists: list[str] | None = None,
-    toyhouse_mode: str | None = None,
-    toyhouse_boards: list[int | str] | None = None,
-    active_days: int | None = None,
-    max_pages_per_board: int | None = None,
-    notify_macos: bool | None = None,
-    notify_telegram: bool | None = None,
-    deviantart_poll_minutes: int | None = None,
-    toyhouse_poll_minutes: int | None = None,
-    da_client_id: str | None = None,
-    th_username: str | None = None,
-    th_auto_submit: bool | None = None,
-    default_is_mature: bool | None = None,
-    default_noai: bool | None = None,
-    default_gallery_folders: list[str] | None = None,
-    timezone: str | None = None,
-    weekly_report: bool | None = None,
-    notify_market_lots: bool | None = None,
-    watermark_text: str | None = None,
-    watermark_logo: str | None = None,
-    watermark_position: str | None = None,
-    watermark_opacity: float | None = None,
-    da_comments_per_day: int | None = None,
-    da_pings_per_day: int | None = None,
-    finish_setup: bool = False,
-) -> str:
-    """Поменять настройки: только то, что меняется (списки заменяются целиком; пояснения — в get_settings).
-    finish_setup=True — первая настройка пройдена."""
-    changes = {k: v for k, v in locals().items() if k != "finish_setup"}
+def update_settings(changes: dict | str | None = None, finish_setup: bool = False, **fields) -> str:
+    """Поменять настройки: changes={ключ: значение} (из Python можно и ключами: update_settings(timezone=…))."""
+    if isinstance(changes, str):
+        try:
+            changes = json.loads(changes) if changes.strip() else {}
+        except json.JSONDecodeError:
+            return 'Не сохранила: changes — словарь вида {"timezone": "Europe/Moscow"}.'
+    if changes is not None and not isinstance(changes, dict):
+        return 'Не сохранила: changes — словарь вида {"timezone": "Europe/Moscow"}.'
+    changes = {**(changes or {}), **fields}
     with editing() as cfg:
         if cfg.unreadable and not finish_setup:
             return BROKEN_SETTINGS
@@ -351,6 +390,13 @@ def update_settings(
             with db.session() as conn:
                 db.relabel_own(conn, cfg.deviantart.my_username)
     return "Сохранено: " + (", ".join(done) or "ничего не менялось") + "\n\n" + describe_settings(cfg)
+
+
+@tool(SAFE, name="update_settings")
+def update_settings_tool(changes: dict | None = None, finish_setup: bool = False) -> str:
+    """changes={ключ: значение} — только то, что меняется (ключи — в get_settings);
+    finish_setup=True — настройка пройдена."""
+    return update_settings(changes, finish_setup)
 
 
 def da_group_folders(group: str) -> str:
@@ -412,8 +458,8 @@ def remove_da_folders(folders: list[str]) -> str:
 
 @tool(EXTERNAL)
 def set_background_checks(enabled: bool, minutes: int = 15) -> str:
-    """Фоновая проверка с уведомлениями на маке (launchd), minutes ≥ 15; Toyhouse — только в режиме bot.
-    Перед удалением помощника её нужно выключить."""
+    """Фоновая проверка с уведомлениями, minutes ≥ 15 (Toyhouse — только режим bot).
+    Выключи перед удалением помощника."""
     if not enabled:
         return background.disable()
     try:
@@ -633,6 +679,56 @@ def market_buyers(days: int = 60) -> str:
     return f"Ники — {UNTRUSTED}.\n" + da_market.render_buyers(rows, days=d)
 
 
+def market_backfill() -> str:
+    """История рынка: один проход дочитывания закрытых аукционов (её галерея и группы ниши), только чтение."""
+    from . import backfill
+
+    cfg = load_config()
+    now = time.time()
+    try:
+        client = posting.da_client(cfg)
+        connected = client.is_connected()
+    except Exception:  # noqa: BLE001 — нет client_id, битый токен
+        connected = False
+    with db.session() as conn:
+        if not connected:
+            line = backfill.progress(conn, now)
+            return "\n".join(filter(None, ["История рынка читается через API: нужен подключённый DeviantArt "
+                                           "(accounts:da_connect).", line]))
+        # В чате — короткий проход (пауза 1,5 с на запрос): полный бюджет прохода идёт фоном.
+        lines = backfill.step(conn, client, now, days=cfg.deviantart.backfill_days,
+                              max_api=min(cfg.deviantart.backfill_api_per_run, backfill.CHAT_MAX_API), cfg=cfg)
+        return "\n".join(lines) or backfill.progress(conn, now) or "Очередь истории рынка пуста."
+
+
+def market_similar(days: int = 30) -> str:
+    """Похожие продавцы против неё: темп, цена, доля со ставкой (только наблюдения, пороги evidence)."""
+    from . import similar
+
+    cfg = load_config()
+    with db.session() as conn:
+        return similar.report(conn, time.time(), days=max(7, int(days)), manual=cfg.deviantart.similar_artists,
+                              cfg=cfg)
+
+
+def market_th_prices(days: int = 30) -> str:
+    """Заявленные цены Toyhouse из первых постов тредов продаж + спрос LF."""
+    from . import th_market as thm
+    from . import th_prices
+
+    cfg = load_config()
+    now = time.time()
+    d = max(1, int(days))
+    with db.session() as conn:
+        th_prices.extract(conn, now, d)
+        text = thm.render_market(thm.demand_supply(conn, d, now, cfg.posting.th_username))
+        missing = th_prices.missing(conn, limit=10, now=now, days=d)
+    if missing:
+        text += (f"\nНет первого поста: {len(missing)} тредов — могу прочитать в Chrome (th_thread read), "
+                 "если она попросит.")
+    return text
+
+
 def explain_lot(title: str, text: str = "") -> str:
     """Как помощник понял лот: тип, статус, цена ($ и поинты), стартовая ли ставка, пачка ли это,
     вид/стиль/тема. Для проверки, если цифры кажутся странными."""
@@ -773,7 +869,7 @@ DA_APP_STEPS = """\
 4. Если спрашивают тип (OAuth2 Grant Type / Client Type) — Authorization Code; Public, если есть такой выбор.
 5. Согласиться с условиями API и сохранить.
 6. На странице приложения будет client_id — это число. Пусть пришлёт его тебе (client_secret НЕ нужен, не проси его).
-7. Сохрани: update_settings(da_client_id="число"), потом снова вызови accounts:da_connect — откроется страница,
+7. Сохрани: update_settings(changes={"da_client_id": "число"}), потом снова вызови accounts:da_connect — откроется страница,
    она нажмёт «Разрешить».
 Без этого всё остальное работает: мониторинг, Toyhouse, прогноз, ставки через её Chrome (da_auctions:status)."""
 
@@ -840,18 +936,20 @@ def da_status() -> str:
     return "\n".join(lines)
 
 
-def add_group_to_preset(preset: str, group: str, folder_name: str) -> str:
+def add_group_to_preset(preset: str, group: str, folder_name: str, limit: str = "") -> str:
     """Добавить группу DeviantArt (и папку в ней) в её набор, например «аукционы».
     Она должна быть участницей группы; правила и лимиты группы API не показывает."""
     with editing() as cfg:
         if cfg.unreadable:
             return BROKEN_SETTINGS
         try:
-            entry = posting.add_group_to_preset(cfg, preset.strip() or "основной", group, folder_name)
+            entry = posting.add_group_to_preset(cfg, preset.strip() or "основной", group, folder_name, limit=limit)
         except Exception as e:  # noqa: BLE001
             return f"Не добавила: {e}"
         save_config(cfg)
-    return f"В набор «{preset}» добавлено: {entry['group']} → {entry['folder_name']}."
+    rule = entry.get("limit")
+    note = f" (правило группы: не больше {rule['count']} за {rule['days']} дн)" if rule else ""
+    return f"В набор «{preset}» добавлено: {entry['group']} → {entry['folder_name']}{note}."
 
 
 def remove_group_from_preset(preset: str, group: str) -> str:
@@ -903,8 +1001,8 @@ def prepare_deviantart_publish(file_path: str = "", title: str = "", description
                                tags: list[str] | None = None, preset: str = "", is_mature: bool | None = None,
                                gallery_folders: list[str] | None = None, send_at: str = "",
                                watermark: bool = False, works: list[dict] | None = None) -> str:
-    """Черновик публикации на DA (ничего не публикует): работа или партия до 10 (works — те же поля на работу).
-    preset — её набор групп; gallery_folders — папки галереи; send_at — когда, пусто — сразу; watermark — превью.
+    """Черновик публикации на DA, ничего не публикует: работа или партия до 10 (works — те же поля).
+    preset — набор групп; gallery_folders; send_at — когда (пусто — сразу); watermark — превью.
     Название и описание — её слова, не сочиняй."""
     if not posting.SENDING_ENABLED:
         return posting.NOT_YET
@@ -924,7 +1022,38 @@ def prepare_deviantart_publish(file_path: str = "", title: str = "", description
     if not draft_id:
         return head + text
     how = SCHEDULE_RULE if send_at else GO_RULE
-    return f"{head}Черновик {draft_id}:\n{text}\n\n{how}"
+    notes = _publish_notes(cfg, title, description, send_at)
+    return f"{head}Черновик {draft_id}:\n{text}\n\n{how}" + (f"\n\n{notes}" if notes else "")
+
+
+def _publish_notes(cfg: Config, title: str, description: str, send_at: str = "") -> str:
+    """Не мешает публикации: чего нет в описании (чек-лист продавца) и план раннего доступа пинглиста."""
+    from datetime import datetime
+
+    from . import checklist, pinglist
+    from .classify import classify_lot
+
+    lines: list[str] = []
+    tr = _translation_note(f"{title}\n{description}", "deviantart")
+    if tr:
+        lines.append(f"Перевод: {tr}")
+    with contextlib.suppress(Exception):
+        lot_type = classify_lot(title or "", description or "").lot_type
+        if lot_type in checklist.SELL_TYPES:
+            missing = [i.what for i in checklist.check(description or "", lot_type, cfg.posting) if not i.ok]
+            if missing:
+                lines.append("Заметки (не мешают публикации): в описании нет — " + "; ".join(missing)
+                             + ". Дописать — её словами (готовые строки — promo:checklist).")
+    hours = cfg.posting.pinglist_early_access_hours
+    if hours > 0:
+        with contextlib.suppress(Exception):
+            ts = posting.parse_when(send_at, cfg.posting.timezone) if send_at else time.time()
+            plan = pinglist.early_access_plan(ts, hours)
+            zone = posting.her_zone(cfg.posting.timezone)
+            lines.append(f"Ранний доступ пинглиста ({hours:g} ч): " + "; ".join(
+                f"{datetime.fromtimestamp(st['at'], zone):%d.%m %H:%M} — {st['what']}" for st in plan["steps"])
+                + (f". {plan['note']}" if plan.get("note") else ""))
+    return "\n".join(lines)
 
 
 def prepare_deviantart_batch(works: list[dict], send_at: str = "", watermark: bool = False) -> str:
@@ -951,13 +1080,16 @@ def prepare_deviantart_batch(works: list[dict], send_at: str = "", watermark: bo
     if not ids:
         return head + text
     how = SCHEDULE_RULE if send_at else GO_RULE
-    return f"{head}{text}\n\n{how} Для всей партии используй её номер (начинается с p)."
+    tr = [f"Работа {n}, перевод: {note}" for n, w in enumerate(items, 1)
+          if (note := _translation_note(f"{w.get('title') or ''}\n{w.get('description') or ''}", "deviantart"))]
+    tail = ("\n\n" + "\n".join(tr)) if tr else ""
+    return f"{head}{text}\n\n{how} Для всей партии используй её номер (начинается с p).{tail}"
 
 
 @tool(PUBLISH)
 def schedule_draft(draft_id: str, send_at: str = "") -> str:
     """ТОЛЬКО после её явного «го» на этот черновик: черновик/партия DA уйдёт сам в send_at
-    (её пояс; пусто — время из черновика). Отклики Toyhouse — только submit_draft."""
+    (пусто — время из черновика). Toyhouse — только submit_draft."""
     if not posting.SENDING_ENABLED:
         return posting.NOT_YET
     cfg = load_config()
@@ -1065,6 +1197,9 @@ def set_reply_template(name: str, text: str) -> str:
     """Сохранить её шаблон отклика для Toyhouse. Текст — ТОЛЬКО её словами, слово в слово:
     не сочиняй, не переписывай и не «улучшай» (правило Toyhouse запрещает тексты от ИИ).
     Слоты: {name} {url} {price} {note}."""
+    why = _toyhouse_text_block(text)
+    if why:
+        return f"Не сохранила: {why}"
     with editing() as cfg:
         if cfg.unreadable:
             return BROKEN_SETTINGS
@@ -1122,7 +1257,7 @@ def suggest_replies(days: float = 5, limit: int = 5, show_blocked: bool = False)
 
 @tool(SAFE, whole=True)
 def prepare_toyhouse_reply(thread_id: str, character: str, template: str = "", note: str = "") -> str:
-    """Черновик отклика в тред Toyhouse (th:123): её шаблон + её перс (+ note её словами). Ничего не отправляет."""
+    """Черновик отклика в тред Toyhouse (th:123): её шаблон + её перс (+ note её словами)."""
     if not posting.SENDING_ENABLED:
         return posting.NOT_YET
     cfg = load_config()
@@ -1153,8 +1288,8 @@ def inspect_reply_form(thread: str) -> str:
 
 @tool(PUBLISH, whole=True)  # итог по каждой работе — целиком: «исход неизвестен» нельзя срезать
 def submit_draft(draft_id: str) -> str:
-    """Отправить черновик или партию (p…) на сайт. ТОЛЬКО после её явного «го» на этот черновик.
-    Идёт в фоне; если за ~45 с не закончилось — drafts:status."""
+    """Отправить черновик или партию (p…). ТОЛЬКО после её явного «го» на этот черновик.
+    Идёт в фоне; дольше ~45 с — drafts:status."""
     if not posting.SENDING_ENABLED:
         return posting.NOT_YET
     draft_id = draft_id.strip()
@@ -1306,14 +1441,25 @@ def review_my_post(url: str) -> str:
         if not item:
             return "Этого поста нет в базе. Проверь ник на DA в настройках и запусти check:run source=deviantart."
         fixes = advisor.listing_review(item, conn, cfg, tz=cfg.posting.timezone)
+        fixes += _funnel_notes(conn, cfg, item["id"])
     if not fixes:
         return "Всё на месте — поправить нечего."
     return "\n".join(f"- {f}" for f in fixes)
 
 
+def _funnel_notes(conn, cfg: Config, item_id: str) -> list[str]:
+    """Воронка лота (просмотры → фавы → ставки) против её лотов и ниши; «вывода нет» — как есть."""
+    from . import da_market, funnel
+
+    try:
+        return funnel.diagnose(conn, item_id, tz=cfg.posting.timezone, niche=da_market.niche_terms(conn, cfg))
+    except Exception:  # noqa: BLE001 — воронка — дополнение к разбору, не ломает его
+        return []
+
+
 def record_sale(title: str, amount: float, currency: str = "usd", platform: str = "",
                 format: str = "other", buyer: str = "", character_url: str = "", note: str = "",
-                url: str = "", lot: str = "") -> str:
+                url: str = "", lot: str = "", net: float | None = None, net_currency: str = "rub") -> str:
     """Записать продажу вручную (например, с Toyhouse или в личке). Победителей её аукционов на DA
     и Toyhouse помощник записывает сам. currency: usd, points, eur, gbp.
     url — ссылка на её лот на DeviantArt или тред-аукцион Toyhouse (lot — номер лота, если их в треде
@@ -1321,35 +1467,60 @@ def record_sale(title: str, amount: float, currency: str = "usd", platform: str 
     уточнит сумму и покупателя."""
     from . import sales
 
+    cfg = load_config()
+    points = (currency or "").strip().lower() == "points"
+    pay_method = "boosty" if not points and "boosty" in cfg.posting.payment_methods else None
+    warn: list[str] = []
     with db.session() as conn:
         try:
             sale_id, outcome = sales.record(conn, url=url, title=title, amount=amount, currency=currency,
                                             platform=platform, format=format, buyer=buyer or None,
-                                            character_url=character_url or None, note=note, lot=lot)
+                                            character_url=character_url or None, note=note, lot=lot,
+                                            net_amount=net, net_currency=net_currency if net is not None else None,
+                                            pay_method=pay_method)
         except sales.SaleError as e:
             return f"Не записала: {e}"
         row = sales.get(conn, sale_id)
+        if points:
+            warn = sales.points_warnings(conn, buyer or None, amount, exclude_sale_id=sale_id)
+    tail = "".join(f"\n! {w}" for w in warn)
     if outcome == "exists":
         return (f"Эта продажа уже записана, вторую не завожу: {sales.describe(row)}. "
-                f"Статус меняется через sales:status sale_id={sale_id}.")
+                f"Статус и «сколько дошло» — sales:status sale_id={sale_id} (status, net).")
     if outcome == "merged":
         return (f"Эту продажу я уже записала сама по ставкам — уточнила её твоими данными, дубля нет: "
-                f"{sales.describe(row)}")
-    return f"Записала продажу [{sale_id}]. Когда оплатят — sales:status sale_id={sale_id} status=paid."
+                f"{sales.describe(row)}" + tail)
+    return f"Записала продажу [{sale_id}]. Когда оплатят — sales:status sale_id={sale_id} status=paid." + tail
 
 
-def set_sale_status(sale_id: str, status: str) -> str:
+def set_sale_status(sale_id: str, status: str, note: str = "", net: float | None = None) -> str:
     """Отметить, как идёт продажа: paid (оплачено), transferred (перс передан; это ещё не оплата —
-    в доход продажа попадает после paid или done), done, cancelled."""
-    from . import sales
+    в доход продажа попадает после paid или done), done, cancelled. refunded | chargeback | disputed | no_pay —
+    ещё и её отметка о покупателе (protection): предупрежу, если он придёт снова.
+    net — сколько дошло до неё в ₽ по уже записанной продаже (статус тогда можно не менять)."""
+    from . import protection, sales
 
+    word = (status or "").strip().lower()
+    journal, kind = protection.split_status(word) if word else (None, None)
+    extra = None
     with db.session() as conn:
         try:
-            sales.set_status(conn, sale_id, status)
-        except sales.SaleError as e:
+            if net is not None:
+                row = sales.get(conn, sale_id)
+                if row is None:
+                    return "Не получилось: такой продажи нет."
+                boosty = row["currency"] != "points" and "boosty" in load_config().posting.payment_methods
+                sales.set_net(conn, sale_id, net, "rub", "boosty" if boosty else None)
+            if journal:
+                sales.set_status(conn, sale_id, journal)
+            elif sales.get(conn, sale_id) is None:
+                return "Не получилось: такой продажи нет."
+            if kind:
+                extra = protection.on_sale_status(conn, sale_id, word, note)
+        except (sales.SaleError, ValueError) as e:
             return f"Не получилось: {e}"
         row = sales.get(conn, sale_id)
-    return sales.describe(row)
+    return sales.describe(row) + (f"\n{extra}" if extra else "")
 
 
 def my_sales(status: str = "", days: int = 60) -> str:
@@ -1373,26 +1544,7 @@ def income(days: int = 30) -> str:
     with db.session() as conn:
         sales.sync_from_auctions(conn)
         _sync_th_sales(conn)
-        data = sales.income(conn, since=_since(days))
-        unknown = sales.without_amount(conn, since=_since(days))
-        no_currency = sales.without_currency(conn, _since(days))
-    # Продажи без суммы или валюты в доход не входят: говорим об этом, а не молча занижаем.
-    tail = "\n".join(filter(None, [
-        (f"Ещё продаж без суммы: {unknown} — в доход не вошли. Назови сумму и ссылку на лот — уточню "
-         "(sales:record с url)." if unknown else ""),
-        f"Ещё {no_currency} продаж без валюты — в суммы не входят." if no_currency else ""]))
-    if not data:
-        return "\n".join(filter(None, [f"За {days} дн оплаченных продаж нет.", tail]))
-    lines = [f"Доход за {days} дн:"]
-    for cur, d in data.items():
-        lines.append(f"- {sales.money(d['total'], cur)} за {d['count']} продаж(и), в среднем {sales.money(d['avg'], cur)}")
-        if d.get("by_format"):
-            lines.append("  по форматам: " + ", ".join(f"{k} {sales.money(v, cur)}" for k, v in d["by_format"].items()))
-        if d.get("by_platform"):
-            lines.append("  по площадкам: " + ", ".join(f"{k} {sales.money(v, cur)}" for k, v in d["by_platform"].items()))
-    if tail:
-        lines.append(tail)
-    return "\n".join(lines)
+        return sales.render_income(conn, max(1, days))
 
 
 def best_time_to_post() -> str:
@@ -1475,10 +1627,27 @@ def data_health() -> str:
     какая доля выборки дочитана после окончания, сколько лотов из поиска, точность прогноза, продажи по валютам.
     Вызывай, если она спрашивает «можно ли этому верить», и перед price_plan/niche_forecast, если там
     уверенность низкая."""
-    from . import evidence
+    from . import backfill, evidence
 
     with db.session() as conn:
-        return evidence.render_health(conn)
+        text = evidence.render_health(conn)
+        try:
+            line = backfill.progress(conn, time.time())
+        except Exception:  # noqa: BLE001 — строка о истории рынка необязательна
+            line = ""
+    return f"{text}\n{line}" if line else text
+
+
+def palette_report(file_path: str = "") -> str:
+    """Палитры её ниши против ставок и фавов; file_path — её картинка (локальный файл, никуда не уходит)."""
+    from . import da_market, palette
+
+    cfg = load_config()
+    with db.session() as conn:
+        niche = da_market.niche_terms(conn, cfg)
+        if file_path.strip():
+            return palette.of_file(conn, file_path.strip(), niche=niche)
+        return palette.report(conn, niche=niche)
 
 
 def listing_norms(lot_type: str = "auction", days: int = 60) -> str:
@@ -1645,6 +1814,9 @@ def th_character_prepare(name: str, images: list[str], folder: str = "", world: 
 
     if not posting.SENDING_ENABLED:
         return posting.NOT_YET
+    why = _toyhouse_text_block(name, profile)
+    if why:
+        return f"Черновик не готовлю: {why}"
     cfg = load_config()
     checked = tc.check_character({"name": name, "images": images, "folder": folder, "world": world, "tags": tags,
                                   "price": price, "currency": currency, "status": status, "profile": profile,
@@ -1710,12 +1882,15 @@ def auction_deadlines() -> str:
         return selling.render_ends(selling.auction_ends(conn, tz=tz), tz)
 
 
-def unpaid_sales(older_than_days: int = 3) -> str:
-    """Кто не оплатил дольше N дней. Напоминание — её шаблон, черновиком (prepare_payment_reminder)."""
+def unpaid_sales(older_than_days: int | None = None) -> str:
+    """Кто не оплатил дольше N дней (без N — дольше её срока оплаты). Напоминание — её шаблон, черновиком."""
     from . import selling
 
+    p = load_config().posting
     with db.session() as conn:
-        return selling.render_reminders(selling.payment_reminders(conn, older_than_days=max(0, older_than_days)))
+        return selling.render_reminders(selling.payment_reminders(
+            conn, older_than_days=None if older_than_days is None else max(0, older_than_days),
+            payment_window_hours=p.payment_window_hours, boosty_url=p.boosty_url, payment_methods=p.payment_methods))
 
 
 def prepare_payment_reminder(sale_id: str) -> str:
@@ -1728,16 +1903,23 @@ def prepare_payment_reminder(sale_id: str) -> str:
 
 
 def set_selling_template(kind: str, text: str) -> str:
-    """Её шаблон слово в слово: payment_reminder ({buyer} {amount} {title} {days} {url})
-    или pinglist ({title} {url} {mentions}). Не сочиняй за неё."""
+    """Её шаблон слово в слово (kind из selling.TEMPLATE_SLOTS, слоты — там же). Не сочиняй за неё."""
     from . import selling
+    from . import translate_guard as tg
 
+    kind = kind.strip()
+    th_note = ""
     with db.session() as conn:
         try:
-            selling.set_template(conn, kind.strip(), text)
+            selling.set_template(conn, kind, text)
         except selling.SellingError as e:
             return f"Не сохранила: {e}"
-    return f"Шаблон {kind.strip()} сохранён."
+        if kind == "offer" and tg.check_toyhouse(conn, text):
+            # Для DA можно, для Toyhouse — нет: личные тексты Toyhouse по этому шаблону не готовлю.
+            th_note = (" Это перевод от ИИ: для DeviantArt подойдёт, а личные тексты для Toyhouse по нему не "
+                       "готовлю (правило 4.8 — там только её слова).")
+    slots = " ".join("{" + s + "}" for s in selling.TEMPLATE_SLOTS.get(kind, ()))
+    return f"Шаблон {kind} сохранён." + (f" Поля, которые подставлю: {slots}." if slots else "") + th_note
 
 
 def manage_pinglist(action: str = "show", users: list[str] | None = None) -> str:
@@ -1804,6 +1986,279 @@ def prepare_preview(file_path: str, text: str = "", logo_path: str = "", positio
         return str(e)
 
 
+# --- 0.5: заработок в час и цель, YCH и коммишены, защита, превью-лист, перевод, отчёт за месяц ---
+
+def money_action(action: str, title: str = "", sale_id: str = "", url: str = "", amount: float | None = None,
+                 format: str = "", status: str = "", note: str = "", days: int | None = None) -> str:
+    """sales:hours|hourly|goal|plan — её часы, ₽ в час, цель месяца, план недели (earnings)."""
+    from . import earnings
+
+    cfg = load_config()
+    return _with_conn(lambda c: earnings.sales_action(c, cfg, action, title=title, sale_id=sale_id, url=url,
+                                                      amount=amount, format=format, status=status, note=note,
+                                                      days=days))
+
+
+def month_report(month: str = "") -> str:
+    """sales:report — красивый отчёт за месяц, HTML в Загрузках; никуда не отправляется."""
+    from . import report
+
+    cfg = load_config()
+    tz = cfg.posting.timezone or report.DEFAULT_TZ
+    label = month.strip() or report.previous_month(tz)
+    note = "" if month.strip() else (f"\n(Без даты беру прошлый месяц; за текущий — date={report.month_bounds(None, tz)[2]}.)")
+    with db.session() as conn:
+        try:
+            return report.build(conn, label, tz=tz)["summary"] + note
+        except ValueError as e:  # report.ReportError
+            return f"Отчёт не собрала: {e}"
+
+
+YCH_ACTIONS = ("ych", "ych_offer", "ych_claim", "ych_paid", "ych_slot", "ych_load", "ych_stats", "ych_announce")
+YCH_PART = {"deposit": "deposit", "предоплата": "deposit", "final": "final", "остаток": "final", "all": "final",
+            "всё": "final", "full": "final"}
+
+
+def ych_action(action: str, *, sale_id: str = "", title: str = "", amount: float | None = None,
+               currency: str = "", platform: str = "", format: str = "", buyer: str = "", status: str = "",
+               net: float | None = None, days: int | None = None, slots: int | None = None,
+               hours: float | None = None, date: str = "", deposit_pct: float | None = None) -> str:
+    """YCH и коммишены под параметры sales: sale_id — номер предложения или слота, buyer — клиент,
+    title — что рисовать (claim) или название предложения, amount — цена, date — срок, days — срок
+    выполнения предложения в днях, status — часть оплаты (deposit|final), шаг слота, close|open, force."""
+    from . import commissions as cm
+
+    cfg = load_config()
+    st = cm.settings_from(cfg)
+    kind = format if format in cm.KINDS else ""
+    sid, word = sale_id.strip(), status.strip().lower()
+    with db.session() as conn:
+        def h(act: str, **kw) -> str:
+            return cm.handle(conn, act, settings=st, **kw)
+
+        def overview() -> str:
+            parts = [h("offers"), h("queue")]
+            rem = cm.reminders(conn, time.time(), deposit_days=st.deposit_days,
+                               deadline_warn_days=st.deadline_warn_days, final_days=st.final_days,
+                               deliver_days=st.deliver_days, tz=st.tz)
+            if rem:
+                parts.append(cm.render_reminders(rem))
+            return "\n\n".join(parts)
+
+        def offer() -> str:
+            if sid and word in ("close", "open"):
+                return h(word, id=sid)
+            if not kind:
+                return "Нужно: format — ych или commission."
+            return h("offer", kind=kind, title=title, price=amount, currency=currency, slots=slots, hours=hours,
+                     platform=platform, deposit_pct=deposit_pct,
+                     turnaround_days=float(days) if days is not None else None)
+
+        def claim() -> str:
+            return h("claim", client=buyer, what=title, id=sid, kind=kind, price=amount,
+                     currency=currency if amount is not None else "", deadline=date, hours=hours, platform=platform,
+                     deposit_pct=deposit_pct, force=word == "force")
+
+        def paid() -> str:
+            part = YCH_PART.get(word, "")
+            if not sid or not part:
+                return _need(sale_id=sid, status=part) + " status — deposit (предоплата) или final (остаток)."
+            boosty = "boosty" if "boosty" in cfg.posting.payment_methods else ""
+            return h("paid", id=sid, part=part, net=net, pay_method=boosty)
+
+        def slot() -> str:
+            if not sid:
+                return _need(sale_id=sid)
+            out: list[str] = []
+            if word in ("cancel", "cancelled", "refund", "отмена", "возврат"):
+                return h("cancel", id=sid, refund=word in ("refund", "возврат"))
+            if word:
+                out.append(h("status", id=sid, status=word))
+            if date:
+                out.append(h("deadline", id=sid, deadline=date))
+            if hours is not None:
+                out.append(h("hours", id=sid, hours=hours))
+            return "\n".join(out) or ("Что поменять: status — шаг (in_progress, wip_sent, delivered…), cancel или "
+                                      "refund; date — срок (нет — снять); hours — сколько часов осталось.")
+
+        def load() -> str:
+            return h("capacity") + "\n\n" + h("remind")
+
+        routes = {"ych": overview, "ych_offer": offer, "ych_claim": claim, "ych_paid": paid, "ych_slot": slot,
+                  "ych_load": load, "ych_stats": lambda: h("stats"),
+                  "ych_announce": lambda: _need(sale_id=sid) or h("announce", id=sid, platform=platform)}
+        return _pick(action, routes)
+
+
+def _latest_sale_id(conn, buyer: str) -> str:
+    row = conn.execute("SELECT id FROM sales WHERE lower(buyer) = lower(?) AND status != 'cancelled' "
+                       "ORDER BY created_ts DESC LIMIT 1", (buyer.strip().lstrip("@"),)).fetchone()
+    return row["id"] if row else ""
+
+
+def buyers_check(user: str, platform: str = "", ref: str = "") -> str:
+    """buyers:check — проверить покупателя перед передачей: её списки, журнал, профиль DA (если подключён)."""
+    from . import protection as pr
+
+    cfg = load_config()
+    character_url = ref if "toyhou.se/" in ref else ""
+    with db.session() as conn:
+        fetch = None
+        if pr.norm_platform(platform) in ("deviantart", ""):
+            with contextlib.suppress(Exception):
+                fetch = pr.da_fetcher(posting.da_client(cfg))
+        def run(fetch_fn):
+            return pr.check_buyer(conn, user, platform=platform, character_url=character_url,
+                                  sale_id=_latest_sale_id(conn, user), fetch=fetch_fn)
+
+        try:
+            with da_access.session(conn):
+                res = run(fetch)
+        except pr.ProtectionError as e:  # кривой ник
+            return f"Не проверила: {e}."
+        except Exception:  # noqa: BLE001 — сбой DeviantArt не мешает проверить её списки и журнал
+            res = run(None)
+    return f"Ники и ссылки — {UNTRUSTED}.\n" + pr.render_check(res)
+
+
+def buyers_blacklist(users: list[str], text: str = "") -> str:
+    """buyers:blacklist — её чёрный список: users + text причина; text=remove — убрать; без users — показать."""
+    from . import protection as pr
+
+    with db.session() as conn:
+        if not users:
+            rows = pr.blacklist(conn)
+            if not rows:
+                return "Чёрный список пуст."
+            return "Её чёрный список:\n" + "\n".join(f"- {r['display']}: {r['reason']}" for r in rows)
+        try:
+            if text.strip().lower() in ("remove", "убрать", "удалить"):
+                gone = [u for u in users if pr.blacklist_remove(conn, u)]
+                return f"Убрала из чёрного списка: {', '.join(gone) or 'никого (их там не было)'}."
+            added = [pr.blacklist_add(conn, u, text)["display"] for u in users]
+        except ValueError as e:
+            return f"Не записала: {e}."
+    return f"В чёрном списке: {', '.join(added)}. Перед передачей и в buyers:check предупрежу."
+
+
+def buyers_mark(users: list[str], ref: str = "", text: str = "") -> str:
+    """buyers:mark — её отметка по сделке: text «kind: заметка» (paid|no_pay|disputed|refunded|chargeback)."""
+    from . import protection as pr
+
+    kind, _, note = text.partition(":")
+    kind = kind.strip().lower()
+    with db.session() as conn:
+        try:
+            pr.mark(conn, users[0] if users else "", kind, sale_id=ref, note=note.strip())
+        except ValueError as e:
+            return f"Не отметила: {e}."
+    return f"Отметила: {pr.MARKS[kind]}" + (f" (продажа {ref.strip()})" if ref.strip() else "") + "."
+
+
+def buyers_scam_lists(ref: str = "", text: str = "") -> str:
+    """buyers:scam_lists — страницы для её ручной проверки: ref=url + text название; text=remove — убрать."""
+    from . import protection as pr
+
+    with db.session() as conn:
+        try:
+            if ref and text.strip().lower() in ("remove", "убрать", "удалить"):
+                return "Убрала." if pr.scam_list_remove(conn, ref) else "Такой страницы в списке нет."
+            if ref:
+                pr.scam_list_add(conn, ref, text)
+        except ValueError as e:
+            return f"Не записала: {e}."
+        rows = pr.scam_lists(conn)
+    head = "Добавила. " if ref else ""
+    return head + "Страницы для ручной проверки (их читает она, не я):\n" + "\n".join(
+        f"- {r['title']}: {r['url']}" for r in rows)
+
+
+def theft_search(ref: str, image_url: str = "") -> str:
+    """images:theft — ссылки на поиск копий её картинки; результаты смотрит она."""
+    from . import protection as pr
+
+    with db.session() as conn:
+        try:
+            return pr.render_theft_search(pr.theft_search(conn, ref, image_url))
+        except ValueError as e:
+            return f"Не получилось: {e}."
+
+
+def theft_report(original: str, copy_url: str) -> str:
+    """images:theft_report — набор для жалобы: факты из базы, шаги, форма площадки."""
+    from . import protection as pr
+
+    with db.session() as conn:
+        try:
+            return pr.render_report_kit(pr.report_kit(conn, original, copy_url))
+        except ValueError as e:
+            return f"Не получилось: {e}."
+
+
+def adopt_sheet(file_path: str, title: str = "", prices: dict | None = None, currency: str = "usd",
+                status: str = "", layout: str = "", theme: str = "") -> str:
+    """images:sheet — картинка для поста: рисунок + SB/MI/AB или цена, ник, OPEN/SOLD, водяной знак."""
+    from . import sheet
+
+    cfg = load_config()
+    p = cfg.posting
+    prices = dict(prices or {})
+    price = prices.pop("price", None) if set(prices) <= {"price"} else None
+    try:
+        return sheet.make_sheet(
+            file_path, nick=cfg.deviantart.my_username or p.watermark_text, watermark_text=p.watermark_text,
+            logo=p.watermark_logo or None, position=p.watermark_position or "tiled",
+            opacity=p.watermark_opacity or 35, prices=prices or None, price=price, currency=currency or "usd",
+            status=status, title=title, layout=layout or "bottom", theme=theme or "dark")["summary"]
+    except ImportError:
+        return "Для картинки нужен Pillow — обнови расширение."
+    except ValueError as e:  # sheet.SheetError
+        return str(e)
+
+
+def translate(action: str, text: str = "", translation: str = "", target: str = "") -> str:
+    """advice:translate* — английский для DA/X её текста. Toyhouse — никогда (правило 4.8)."""
+    from . import translate_guard as tg
+
+    with db.session() as conn:
+        try:
+            if action == "translate":
+                if translation.strip():
+                    return tg.save(conn, text, translation, target or "da")["text"]
+                return tg.instruction(text, target or "da")
+            if action == "translate_ok":
+                return tg.approve(conn, text)
+            return ("Пометку «перевод» сняла: этот английский — её." if tg.forget(conn, text)
+                    else "Такого перевода нет.")
+        except ValueError as e:  # TranslateError
+            return str(e)
+
+
+def _toyhouse_text_block(*texts: str) -> str | None:
+    """Перевод от ИИ на Toyhouse не пускаем (правило 4.8): причина или None."""
+    from . import translate_guard as tg
+
+    with db.session() as conn:
+        for t in texts:
+            why = tg.check_toyhouse(conn, t or "") if (t or "").strip() else None
+            if why:
+                return why
+    return None
+
+
+def _translation_note(text: str, target: str) -> str:
+    """DA/X: напомнить, если в тексте непроверенный ею перевод. Не мешает черновику."""
+    from . import translate_guard as tg
+
+    if not (text or "").strip():
+        return ""
+    try:
+        with db.session() as conn:
+            return tg.check_for_target(conn, text, target) or ""
+    except Exception:  # noqa: BLE001 — подсказка, а не проверка
+        return ""
+
+
 # --- Инструменты для Claude: связанные действия собраны в один инструмент с action ---
 # Claude Desktop шлёт имена, описания и схемы всех инструментов с каждым её сообщением, поэтому
 # инструментов мало, описания короткие, а длинные правила — в get_settings. Функции выше — их начинка.
@@ -1815,8 +2270,8 @@ def _need(**values) -> str:
 
 @tool(EXTERNAL)
 def accounts(action: Literal["bot_login", "da_connect", "da_disconnect", "da_status"]) -> str:
-    """Входы: bot_login — окно бота, она сама входит в Toyhouse (пароль только на сайте);
-    da_connect / da_disconnect / da_status — её DeviantArt (публикация и ставки через API)."""
+    """bot_login — окно бота, в Toyhouse она входит сама (пароль только на сайте);
+    da_connect / da_disconnect / da_status — её DeviantArt (API)."""
     return _pick(action, {"bot_login": bot_login, "da_connect": da_connect, "da_disconnect": da_disconnect,
                           "da_status": da_status})
 
@@ -1824,15 +2279,15 @@ def accounts(action: Literal["bot_login", "da_connect", "da_disconnect", "da_sta
 @tool(EXTERNAL)
 def check(action: Literal["run", "status"] = "run",
           source: Literal["all", "deviantart", "toyhouse"] = "all") -> str:
-    """run — проверить источники сейчас (заодно её аукционы-треды Toyhouse); status — итог последней проверки."""
+    """run — проверить источники сейчас; status — итог последней проверки."""
     return _pick(action, {"run": lambda: check_now(source), "status": check_status})
 
 
 @tool(READ_ONLY)
 def findings(action: Literal["replies", "lf", "adopts", "sale", "digest", "sources"], days: float | None = None,
              limit: int = 5, include_unmatched: bool = False, show_blocked: bool = False) -> str:
-    """Находки: replies — LF-треды Toyhouse под её персов по шансу продажи (show_blocked — и скрытые);
-    lf — все LF-треды; adopts — лоты DA; sale — треды с продажей; digest — новое; sources — когда проверялось."""
+    """replies — LF-треды Toyhouse под её персов (show_blocked — и скрытые); lf; adopts — лоты DA;
+    sale; digest — новое; sources."""
     lim = max(1, min(int(limit), 30))
     return _pick(action, {
         "replies": lambda: suggest_replies(days or 5, lim, show_blocked),
@@ -1846,21 +2301,21 @@ def findings(action: Literal["replies", "lf", "adopts", "sale", "digest", "sourc
 
 @tool(EXTERNAL)
 def th_thread(thread: str, action: Literal["read", "reply_form"] = "read") -> str:
-    """Тред Toyhouse (th:123 или ссылка): read — первый пост; reply_form — осмотреть форму ответа в её
-    Chrome (один раз перед первыми откликами). Ничего не отправляет."""
+    """Тред Toyhouse (th:123 или ссылка): read — первый пост; reply_form — разово осмотреть форму
+    ответа в её Chrome. Ничего не отправляет."""
     return _pick(action, {"read": lambda: read_thread(thread), "reply_form": lambda: inspect_reply_form(thread)})
 
 
 @tool(READ_ONLY, name="market")
 def market_tool(action: Literal["forecast", "search", "groups", "buyers", "what_sells", "norms", "my_works",
-                                "th", "th_mine"],
+                                "th", "th_mine", "th_prices", "similar", "backfill"],
                 keywords: list[str] | None = None, lot_type: str = "", my_price_usd: float | None = None,
                 my_price_points: float | None = None, deviation: str = "", query: str = "", pages: int = 1,
                 groups: list[str] | None = None, days: int | None = None, limit: int = 10,
                 by: Literal["species", "styles", "themes", "all"] = "species") -> str:
-    """Рынок: forecast — цены похожих лотов (keywords, lot_type, my_price_*, deviation — её работа DA);
-    search — чужие лоты DA (query); groups — живы ли группы; buyers — кто ставит; what_sells — что продаётся;
-    norms — как оформляют лоты; my_works — её работы; th — спрос Toyhouse (by); th_mine — её персы и бюджеты LF."""
+    """forecast — цены похожих (keywords, lot_type, my_price_*, deviation); search (query); groups;
+    buyers — кто ставит; what_sells; norms; my_works; th — спрос TH (by); th_mine; th_prices;
+    similar — похожие продавцы; backfill — история рынка."""
     return _pick(action, {
         "forecast": lambda: market_forecast(keywords, lot_type or None, my_price_usd, my_price_points,
                                             deviation or None),
@@ -1872,16 +2327,19 @@ def market_tool(action: Literal["forecast", "search", "groups", "buyers", "what_
         "my_works": lambda: my_works_overview(days or 90),
         "th": lambda: th_market(days or 30, by),
         "th_mine": lambda: th_demand_for_my_characters(days or 30),
+        "th_prices": lambda: market_th_prices(days or 30),
+        "similar": lambda: market_similar(days or 30),
+        "backfill": market_backfill,
     })
 
 
 @tool(READ_ONLY, name="forecast")
-def forecast_tool(action: Literal["niches", "price", "accuracy", "best_time", "health", "explain"],
+def forecast_tool(action: Literal["niches", "price", "accuracy", "best_time", "health", "explain", "palette"],
                   species: str = "", style: str = "", theme: str = "",
-                  currency: Literal["usd", "points"] = "usd", limit: int = 8, title: str = "", text: str = "") -> str:
-    """Прогноз: niches — что рисовать; price — какой старт аукциона (species, style, theme, currency);
-    accuracy — сбываются ли прогнозы; best_time — когда выкладывать; health — можно ли верить данным;
-    explain — как понят лот (title, text)."""
+                  currency: Literal["usd", "points"] = "usd", limit: int = 8, title: str = "", text: str = "",
+                  file_path: str = "") -> str:
+    """niches — что рисовать; price — старт аукциона (species, style, theme, currency); accuracy;
+    best_time; health — можно ли верить данным; explain (title, text); palette — цвета и ставки (file_path)."""
     return _pick(action, {
         "niches": lambda: niche_forecast(limit),
         "price": lambda: price_plan(species, style, theme, currency),
@@ -1889,28 +2347,33 @@ def forecast_tool(action: Literal["niches", "price", "accuracy", "best_time", "h
         "best_time": best_time_to_post,
         "health": data_health,
         "explain": lambda: _need(title=title) or explain_lot(title, text),
+        "palette": lambda: palette_report(file_path),
     })
 
 
-@tool(READ_ONLY)
-def advice(action: Literal["tips", "week", "plan", "review", "unsold"], species: str = "", style: str = "",
-           format: str = "", keywords: list[str] | None = None, url: str = "", limit: int = 5) -> str:
-    """Советы: tips — как заработать больше; week — разбор недели; plan — план нового адопта
-    (species, style, format); review — правки к её посту DA (url); unsold — что делать с непроданным."""
+@tool(SAFE)  # translate запоминает перевод (чтобы не пустить его на Toyhouse) — пишет, значит не READ_ONLY
+def advice(action: Literal["tips", "week", "plan", "review", "unsold", "translate", "translate_ok", "translate_forget"],
+           species: str = "", style: str = "", format: str = "", keywords: list[str] | None = None, url: str = "",
+           limit: int = 5, text: str = "", translation: str = "", target: str = "") -> str:
+    """Советы: tips; week; plan — адопт (species, style, format); review (url поста DA); unsold;
+    translate — английский её текста для DA/X, НЕ Toyhouse (text, target da|x; translation — показать);
+    translate_ok / translate_forget (text id)."""
     return _pick(action, {
         "tips": lambda: sales_advice(limit),
         "week": weekly_sales_report,
         "plan": lambda: plan_new_adopt(species, style, format, keywords),
         "review": lambda: _need(url=url) or review_my_post(url),
         "unsold": lambda: unsold_lots(limit),
+        **{a: (lambda a=a: _need(text=text) or translate(a, text, translation, target))
+           for a in ("translate", "translate_ok", "translate_forget")},
     })
 
 
 @tool(SAFE, name="feedback", whole=True)
 def feedback_tool(action: Literal["save", "declined", "report", "sent"], text: str = "", topic: str = "общее",
                   rating: int | None = None) -> str:
-    """Её отзыв о помощнике: save — её словами (topic; rating 1–5, если назвала); declined — не захотела
-    отвечать; report — все отзывы текстом для отправки; sent — она их отправила."""
+    """Её отзыв о помощнике: save — её словами (topic, rating 1–5); declined — не захотела;
+    report — текстом для отправки; sent — отправила."""
     return _pick(action, {
         "save": lambda: leave_feedback(text, topic, rating),
         "declined": lambda: leave_feedback(declined=True),
@@ -1921,8 +2384,7 @@ def feedback_tool(action: Literal["save", "declined", "report", "sent"], text: s
 
 @tool(SAFE_WEB)  # status пополняет её пинглист из «ping me» — пишет, значит не READ_ONLY
 def da_auctions(action: Literal["mine", "open", "status", "deadlines"], url: str = "", refresh: bool = True) -> str:
-    """Её аукционы DA: mine — ставки (refresh — обновить через API); open — открытые, чтобы закрыть;
-    status — ставки одного аукциона (url); deadlines — когда кончаются."""
+    """Её аукционы DA: mine — ставки (refresh); open — открытые; status — один (url); deadlines."""
     return _pick(action, {
         "mine": lambda: my_auctions(refresh),
         "open": list_my_open_auctions,
@@ -1934,31 +2396,36 @@ def da_auctions(action: Literal["mine", "open", "status", "deadlines"], url: str
 @tool(SAFE_WEB)
 def da_groups(action: Literal["folders", "track", "untrack", "preset_add", "preset_remove", "my_folders"],
               group: str = "", urls: list[str] | None = None, for_market_only: bool = False, preset: str = "",
-              folder_name: str = "") -> str:
-    """Группы DA: folders — папки группы (group); track / untrack — следить за папками (urls; for_market_only —
-    только для цен); preset_add / preset_remove — её набор групп для публикации (preset, group, folder_name);
-    my_folders — папки её галереи."""
+              folder_name: str = "", limit: str = "") -> str:
+    """folders — папки группы (group); track / untrack (urls; for_market_only — только для цен);
+    preset_add / preset_remove — её набор (preset, group, folder_name; limit «1/week»); my_folders."""
     return _pick(action, {
         "folders": lambda: _need(group=group) or da_group_folders(group),
         "track": lambda: _need(urls=urls) or add_da_folders(list(urls or []), for_market_only),
         "untrack": lambda: _need(urls=urls) or remove_da_folders(list(urls or [])),
         "preset_add": lambda: _need(group=group, folder_name=folder_name) or add_group_to_preset(
-            preset, group, folder_name),
+            preset, group, folder_name, limit),
         "preset_remove": lambda: _need(group=group) or remove_group_from_preset(preset, group),
         "my_folders": my_gallery_folders,
     })
 
 
 @tool(SAFE)
-def images(action: Literal["recent", "preview"], file_path: str = "", text: str = "", logo_path: str = "",
-           position: str = "", opacity: float = 0, max_side: int = 1200, keep_exif: bool = False,
-           limit: int = 10) -> str:
-    """Картинки: recent — последние из Загрузок, Рабочего стола, Изображений; preview — защищённое превью
-    (водяной знак латиницей или PNG-логотип, без EXIF), оригинал не трогаю."""
+def images(action: Literal["recent", "preview", "sheet", "theft", "theft_report"], file_path: str = "", text: str = "",
+           logo_path: str = "", position: str = "", opacity: float = 0, max_side: int = 1200, keep_exif: bool = False,
+           limit: int = 10, prices: dict | None = None, currency: str = "usd", status: str = "",
+           theme: str = "") -> str:
+    """Картинки (оригинал не трогаю): recent; preview — знак, без EXIF; sheet — для поста (text название,
+    prices sb/mi/ab|price, currency, status open|sold, position bottom|side, theme); theft — поиск копий
+    (file_path, text адрес картинки); theft_report (file_path оригинал, text копия)."""
     return _pick(action, {
         "recent": lambda: recent_images(limit),
         "preview": lambda: _need(file_path=file_path) or prepare_preview(
             file_path, text, logo_path, position, opacity, max_side, keep_exif),
+        "sheet": lambda: _need(file_path=file_path) or adopt_sheet(file_path, text, prices, currency, status,
+                                                                 position, theme),
+        "theft": lambda: _need(file_path=file_path) or theft_search(file_path, text),
+        "theft_report": lambda: _need(file_path=file_path, text=text) or theft_report(file_path, text),
     })
 
 
@@ -1968,10 +2435,9 @@ def prepare_gallery(action: Literal["close", "folders", "rename"], works: list[s
                     record_sales: bool = True, create: list[str] | None = None,
                     rename: dict[str, str] | None = None, move: dict[str, list[str]] | None = None,
                     renames: dict[str, str] | None = None) -> str:
-    """Черновик правок её галереи DA через API, без браузера; до её «го» ничего не меняет. close — закрыть
-    аукционы (works — ссылки, da:123 или названия, пусто — все; word CLOSED|SOLD; folder; from_folder;
-    comment её слова, {winner} {amount});
-    folders — create, rename {старое: новое}, move {папка: [работы]}; rename — renames {работа: название}."""
+    """Черновик правок её галереи DA через API, без браузера; до «го» ничего не меняет: close — закрыть аукционы (works, пусто —
+    все; word CLOSED|SOLD; folder; from_folder; comment её слова, {winner} {amount}); folders — create,
+    rename, move; rename — renames {работа: название}."""
     return _pick(action, {
         "close": lambda: prepare_close_auctions(works, word, folder, comment, record_sales, from_folder),
         "folders": lambda: prepare_gallery_folders(create, rename, move, from_folder),
@@ -1981,7 +2447,7 @@ def prepare_gallery(action: Literal["close", "folders", "rename"], works: list[s
 
 @tool(SAFE, name="drafts", whole=True)  # status — итог по каждой работе, не режем
 def drafts_tool(action: Literal["list", "status", "cancel"] = "list", draft_id: str = "") -> str:
-    """Черновики: list — ждут «го», запланированы или идут; status — как идёт отправка; cancel — отменить."""
+    """Черновики: list — ждут «го», запланированы или идут; status — как идёт отправка; cancel."""
     return _pick(action, {
         "list": list_drafts,
         "status": lambda: _need(draft_id=draft_id) or draft_status(draft_id),
@@ -1990,9 +2456,10 @@ def drafts_tool(action: Literal["list", "status", "cancel"] = "list", draft_id: 
 
 
 @tool(SAFE)
-def set_template(kind: Literal["reply", "payment_reminder", "pinglist"], text: str, name: str = "") -> str:
-    """Её шаблон слово в слово: reply — отклик Toyhouse (name; {name} {url} {price} {note});
-    payment_reminder ({buyer} {amount} {title} {days} {url}); pinglist ({title} {url} {mentions})."""
+def set_template(kind: Literal["reply", "payment_reminder", "pinglist", "payment_info", "offer", "x_post", "raffle",
+                              "raffle_winner", "status"], text: str, name: str = "") -> str:
+    """Её шаблон слово в слово (слоты — в ответе): reply — отклик Toyhouse (name); payment_info;
+    offer — предложение покупателю; остальные — по названию."""
     if kind == "reply":
         return set_reply_template(name, text)
     return set_selling_template(kind, text)
@@ -2001,8 +2468,8 @@ def set_template(kind: Literal["reply", "payment_reminder", "pinglist"], text: s
 @tool(SAFE)
 def characters(action: Literal["add", "remove"], name: str = "", url: str = "", price: str = "",
                tags: list[str] | None = None) -> str:
-    """Её персы на продажу, уже есть на Toyhouse (создать — th_character:new): add — имя, ссылка, цена,
-    теги (вид, стиль) для подбора LF-тредов; remove — по имени или ссылке."""
+    """Её персы на продажу с Toyhouse (новый — th_character:new): add — имя, ссылка, цена, теги
+    для LF-тредов; remove — по имени или ссылке."""
     return _pick(action, {
         "add": lambda: _need(name=name, url=url) or add_character(name, url, price, tags),
         "remove": lambda: _need(name=name or url) or remove_character(name or url),
@@ -2012,8 +2479,7 @@ def characters(action: Literal["add", "remove"], name: str = "", url: str = "", 
 @tool(EXTERNAL)
 def th_auctions(action: Literal["status", "watch", "mine"], url: str = "", lot: str = "", full: bool = False,
                 mine: bool | None = None, limit: int = 10) -> str:
-    """Аукционы-треды Toyhouse: status — прочитать ставки (lot; full — весь тред; mine — её ли);
-    watch — следить за тредом; mine — её аукционы из последнего чтения."""
+    """Аукционы-треды Toyhouse: status — ставки (lot; full; mine — её ли); watch — следить; mine — её."""
     return _pick(action, {
         "status": lambda: th_auction_status(url, lot, full, mine),
         "watch": lambda: th_watch_auction(url, lot, True if mine is None else mine),
@@ -2027,9 +2493,9 @@ def th_character(action: Literal["inspect", "folders", "new", "transfer", "listi
                  images: list[str] | None = None, folder: str = "", world: str = "", tags: list[str] | None = None,
                  price: float | None = None, currency: str = "", status: str = "", profile: str = "",
                  buyer: str = "", urls: list[str] | None = None) -> str:
-    """Её персы Toyhouse (форма в её Chrome, кнопку жмёт она): inspect — разово осмотреть форму (form, url);
-    folders — её папки; new — черновик перса (name, images…); transfer — передать (url, buyer);
-    listing — статус продажи (url, status, price); move — urls в folder. Имя и profile — её слова, не сочиняй."""
+    """Её персы Toyhouse (форма в её Chrome, кнопку жмёт она): inspect — форма (form, url); folders;
+    new — черновик (name, images…); transfer (url, buyer); listing (url, status, price); move — urls
+    в folder. Имя и profile — её слова, не сочиняй."""
     return _pick(action, {
         "inspect": lambda: th_character_inspect(form, url),
         "folders": th_character_folders,
@@ -2041,40 +2507,479 @@ def th_character(action: Literal["inspect", "folders", "new", "transfer", "listi
     })
 
 
-@tool(SAFE, name="sales")
-def sales_tool(action: Literal["record", "status", "list", "income", "unpaid", "remind", "export"],
+@tool(SAFE_WRITE, name="sales")
+def sales_tool(action: Literal["record", "status", "list", "income", "unpaid", "remind", "export", "hours", "hourly",
+                               "goal", "plan", "report", "ych", "ych_offer", "ych_claim", "ych_paid", "ych_slot",
+                               "ych_load", "ych_stats", "ych_announce"],
                sale_id: str = "", status: str = "", title: str = "", amount: float | None = None,
-               currency: str = "usd", platform: str = "", format: str = "other", buyer: str = "",
+               currency: str = "", platform: str = "", format: str = "other", buyer: str = "",
                url: str = "", lot: str = "", character_url: str = "", note: str = "", days: int | None = None,
-               include_lots: bool = False) -> str:
-    """Её продажи: record — вручную (title, amount, currency usd|points|eur|gbp, platform deviantart|toyhouse|other,
-    url её лота/треда, lot);
-    status — sale_id + status paid|transferred|done|cancelled; list; income; unpaid — дольше days;
-    remind — черновик напоминания (sale_id); export — CSV."""
+               include_lots: bool = False, net: float | None = None, slots: int | None = None,
+               hours: float | None = None, date: str = "", deposit_pct: float | None = None) -> str:
+    """Её деньги: record (title, amount, currency, platform deviantart|toyhouse|other, url, net — ₽ ей);
+    status (sale_id; status и/или net; refunded|chargeback|disputed|no_pay — отметка); list; income; unpaid;
+    remind; export; hours (ч), hourly, goal (₽), plan (адоптов/нед); report (date 2026-10); ych* — YCH и коммишены."""
     def record() -> str:
         if not title or amount is None:
             return _need(title=title, amount=amount)
-        return record_sale(title, amount, currency, platform, format, buyer, character_url, note, url, lot)
+        cur = currency or "usd"
+        if net is None:
+            return record_sale(title, amount, cur, platform, format, buyer, character_url, note, url, lot)
+        return record_sale(title, amount, cur, platform, format, buyer, character_url, note, url, lot, net=net)
+
+    def money(a: str):
+        # hours: часы можно дать и в amount, и в hours
+        n = hours if a == "hours" and amount is None else amount
+        return lambda: money_action(a, title, sale_id, url, n, format, status, note, days)
+
+    def ych(a: str):
+        return lambda: ych_action(a, sale_id=sale_id, title=title, amount=amount, currency=currency,
+                                  platform=platform, format=format, buyer=buyer, status=status, net=net, days=days,
+                                  slots=slots, hours=hours, date=date, deposit_pct=deposit_pct)
 
     return _pick(action, {
         "record": record,
-        "status": lambda: _need(sale_id=sale_id, status=status) or set_sale_status(sale_id, status),
+        "status": lambda: _need(sale_id=sale_id, status=status if net is None else net) or set_sale_status(
+            sale_id, status, note, net),
         "list": lambda: my_sales(status, days or 60),
         "income": lambda: income(days or 30),
-        "unpaid": lambda: unpaid_sales(3 if days is None else days),
+        "unpaid": lambda: unpaid_sales(days),
         "remind": lambda: _need(sale_id=sale_id) or prepare_payment_reminder(sale_id),
         "export": lambda: export_sales(include_lots, days or 0),
+        **{a: money(a) for a in ("hours", "hourly", "goal", "plan")},
+        "report": lambda: month_report(date),
+        **{a: ych(a) for a in YCH_ACTIONS},
     })
 
 
 @tool(SAFE, name="pinglist")
 def pinglist_tool(action: Literal["show", "add", "remove", "ping"] = "show", users: list[str] | None = None,
                   url: str = "") -> str:
-    """Её пинглист DA (сам пополняется из «ping me»): show, add / remove (users);
-    ping — черновик пингов её шаблоном под её работой (url)."""
+    """Её пинглист DA: show, add / remove (users); ping — черновик пингов её шаблоном (url её работы)."""
     if action == "ping":
         return _need(url=url) or prepare_ping(url)
     return manage_pinglist(action, users)
+
+
+# --- Покупатели: тёплые контакты, лиды LF, предложения (всё черновиком; личку и X она шлёт сама) ---
+
+def _outreach_limits(cfg: Config) -> tuple[int, int, int]:
+    p = cfg.posting
+    return p.outreach_per_day, p.outreach_cooldown_days, p.outreach_window_days
+
+
+def _sync_buyers(conn, cfg: Config, now: float) -> None:
+    from . import buyers
+
+    with contextlib.suppress(Exception):
+        buyers.sync(conn, now, cfg.deviantart.my_username, cfg.posting.th_username)
+
+
+def buyers_crm() -> str:
+    from . import buyers
+
+    cfg = load_config()
+    now = time.time()
+    _, cooldown, window = _outreach_limits(cfg)
+    with db.session() as conn:
+        _sync_buyers(conn, cfg, now)
+        return f"Ники — {UNTRUSTED}.\n" + buyers.render_crm(conn, now, window_days=window, cooldown_days=cooldown)
+
+
+def buyers_for_adopt(ref: str) -> str:
+    from . import outreach
+
+    cfg = load_config()
+    now = time.time()
+    per_day, cooldown, window = _outreach_limits(cfg)
+    with db.session() as conn:
+        item = outreach.resolve_item(conn, ref)
+        if item is None:
+            return _for_adopt_without_item(conn, cfg, ref, now, cooldown, window)
+        if not posting.SENDING_ENABLED:
+            return posting.NOT_YET
+        _sync_buyers(conn, cfg, now)
+        ranked = outreach.rank_for_adopt(conn, ref, now, 10, window, cooldown)
+        res = outreach.drafts_for_adopt(conn, item, ranked, None, now, per_day, cooldown)
+    text = f"Ники — {UNTRUSTED}.\n" + outreach.render_for_adopt(ranked, res, cooldown)
+    return text + (f"\n\n{GO_RULE}" if res.get("mention_draft_id") else "")
+
+
+def _for_adopt_without_item(conn, cfg: Config, ref: str, now: float, cooldown: int, window: int) -> str:
+    """Не её работа DA: Toyhouse — куда смотреть; слова («дракон») — кому могут понравиться, без черновиков."""
+    from . import outreach, xpost
+
+    why = xpost.not_da_reason(ref)
+    if why and "toyhou.se" not in ref.lower():
+        _sync_buyers(conn, cfg, now)
+        ranked = outreach.rank_for_adopt(conn, ref.split(), now, 10, window, cooldown)
+        if ranked and not ranked[0].get("tags_unknown"):
+            text = outreach.render_for_adopt(ranked, {}, cooldown)
+            return (f"Ники — {UNTRUSTED}.\n{text}\nЧерновики предложений — только под её работой: пришли ссылку "
+                    "на работу DeviantArt или da:123.")
+        if outreach.adopt_tags(conn, ref.split())[0]:
+            return outreach.render_for_adopt([], {}, cooldown)
+        return ("По словам «" + ref.strip()[:40] + "» не узнала ни вида, ни стиля — назови их проще («дракон», "
+                "«moth», «chibi») или пришли ссылку на её работу DeviantArt / da:123.")
+    return why or ("Этой работы нет в базе — обнови её работы (check:run source=deviantart) и пришли ссылку "
+                   "или da:123.")
+
+
+def buyers_leads() -> str:
+    from . import leads
+
+    cfg = load_config()
+    with db.session() as conn:
+        return leads.render(conn, time.time(), cfg=cfg)
+
+
+def buyers_lead_add(url: str, text: str = "") -> str:
+    from . import leads
+
+    cfg = load_config()
+    with db.session() as conn:
+        try:
+            lead_id = leads.add_manual(conn, url, text, time.time(), cfg.posting.characters)
+        except leads.LeadError as e:
+            return f"Не добавила: {e}"
+    return f"Лид {lead_id} записан. Черновик ответа её шаблоном — buyers:offer ref={lead_id}."
+
+
+def buyers_offer(lead_id: str) -> str:
+    from . import leads, xintent
+
+    cfg = load_config()
+    per_day, cooldown, _ = _outreach_limits(cfg)
+    with db.session() as conn:
+        res = leads.reply_draft(conn, lead_id.strip().removeprefix("lead:"), None, xintent.tweet_intent,
+                                time.time(), per_day, cooldown)
+        lead = leads.get(conn, res["lead_id"]) if res.get("lead_id") else None
+    if not res.get("ok"):
+        old = f"\nСтарый черновик (не отправлять): {res['text']}" if res.get("already") and res.get("text") else ""
+        return f"Не готовлю: {res.get('reason') or 'не получилось'}.{old}"
+    who = (lead["author"] if lead else "") or "автор"
+    lines = [("Ответ уже готовили — тот же текст:" if res.get("already") else "Черновик ответа (её шаблон offer):"),
+             res["text"]]
+    if res.get("intent_url"):
+        lines.append(f"Открыть ответ в X (текст уже вписан, «Post» жмёт она): {res['intent_url']}")
+    elif lead is not None:
+        lines.append(f"Ответить на странице поста: {lead['url']}")
+    lines += [f"! {w}" for w in res.get("warnings") or []]
+    lines.append(f"Отправила — buyers:contacted users=[{who}] ref=lead:{res['lead_id']}: пауза для человека начнётся.")
+    return "\n".join(lines)
+
+
+def buyers_contacted(users: list[str], ref: str = "") -> str:
+    from . import leads, outreach
+
+    ref = ref.strip()
+    channel, lead_ref = (ref or "da_message_manual"), ""
+    with db.session() as conn:
+        if ref.startswith("lead:"):
+            lead_ref = ref
+            lead = leads.get(conn, ref.split(":", 1)[1])
+            channel = "x_reply" if lead is not None and lead["source"] == "x_manual" else "da_lf_reply"
+        elif channel not in outreach.MANUAL_CHANNELS:
+            return f"ref: lead:<id> или канал ({', '.join(outreach.MANUAL_CHANNELS)})."
+        done = outreach.mark_contacted(conn, users, channel, lead_ref, time.time())
+    cooldown = load_config().posting.outreach_cooldown_days
+    return (f"Отметила: {', '.join(done)} — снова предложу не раньше чем через {cooldown} дн."
+            if done else "Никого не отметила: нужны ники.")
+
+
+def buyers_optout(users: list[str], text: str = "") -> str:
+    from . import buyers
+
+    with db.session() as conn:
+        if text.strip().lower() == "in":
+            got = buyers.opt_in(conn, users, time.time())
+            return f"Вернула в предложения: {', '.join(got) or 'никого'}."
+        got = buyers.opt_out(conn, users, text.strip() or "her_choice", time.time())
+    return f"Больше ничего не предлагаю: {', '.join(got) or 'никого'}."
+
+
+def buyers_x_search() -> str:
+    from . import da_market, leads, xintent
+
+    cfg = load_config()
+    with db.session() as conn:
+        niche = sorted(da_market.niche_terms(conn, cfg))
+    urls = [xintent.search_url(q) for q in leads.x_queries(niche, time.time())]
+    return "\n".join(["Поиск LF-постов в X — открывает она сама (помощник X не читает):",
+                      *(f"- {u}" for u in urls),
+                      "Нашла пост, где ищут похожего перса, — пришли ссылку: buyers:lead_add ref=<ссылка>."])
+
+
+@tool(SAFE_WEB)
+def buyers(action: Literal["crm", "for_adopt", "leads", "lead_add", "offer", "contacted", "optout", "x_search", "check",
+                           "blacklist", "mark", "scam_lists"],
+           ref: str = "", users: list[str] | None = None, text: str = "") -> str:
+    """Покупатели: crm; for_adopt (ref её работа); leads; lead_add (ref, text); offer (ref); contacted (users,
+    ref); optout (text in — вернуть); x_search; check — перед передачей (users, text площадка);
+    blacklist (users, text причина|remove); mark (users|ref, text kind: заметка); scam_lists."""
+    names = [users] if isinstance(users, str) else list(users or [])
+    return _pick(action, {
+        "crm": buyers_crm,
+        "for_adopt": lambda: _need(ref=ref) or buyers_for_adopt(ref),
+        "leads": buyers_leads,
+        "lead_add": lambda: _need(ref=ref) or buyers_lead_add(ref, text),
+        "offer": lambda: _need(ref=ref) or buyers_offer(ref),
+        "contacted": lambda: _need(users=names) or buyers_contacted(names, ref),
+        "optout": lambda: _need(users=names) or buyers_optout(names, text),
+        "x_search": buyers_x_search,
+        "check": lambda: _need(users=names) or buyers_check(names[0], text, ref),
+        "blacklist": lambda: buyers_blacklist(names, text),
+        "mark": lambda: _need(text=text) or buyers_mark(names, ref, text),
+        "scam_lists": lambda: buyers_scam_lists(ref, text),
+    })
+
+
+# --- Продвижение: X, повторный заход, статус и журнал, раффл, воронка, эксперименты, оформление ---
+
+def _draft_reply(draft_id: str | None, text: str) -> str:
+    return f"Черновик {draft_id}:\n{text}\n\n{GO_RULE} Со временем — schedule_draft." if draft_id else text
+
+
+def promo_x_post(ref: str, variant: str = "", image: str = "") -> str:
+    from . import xpost
+
+    cfg = load_config()
+    with db.session() as conn:
+        res = xpost.build_for(conn, cfg, ref, variant, image)
+    if res.get("ok"):
+        tr = _translation_note(res.get("text") or "", "x")
+        if tr:
+            res.setdefault("warnings", []).append(tr)
+    return xpost.render(res)
+
+
+def promo_x_posted(ref: str, url: str) -> str:
+    from . import xpost
+
+    with db.session() as conn:
+        return xpost.confirm_posted(conn, ref, url)["text"]
+
+
+def promo_repromote() -> str:
+    from . import repromote
+
+    cfg = load_config()
+    with db.session() as conn:
+        return repromote.plan(conn, cfg)["text"]
+
+
+def promo_group_done(ref: str, group: str) -> str:
+    from . import repromote
+
+    cfg = load_config()
+    with db.session() as conn:
+        return repromote.log_manual_group(conn, ref, group, cfg=cfg)
+
+
+def _with_translation_note(reply: str, text: str) -> str:
+    note = _translation_note(text, "deviantart")
+    return f"{reply}\n\nПеревод: {note}" if note else reply
+
+
+def promo_status(text: str, ref: str = "") -> str:
+    if not posting.SENDING_ENABLED:
+        return posting.NOT_YET
+    cfg = load_config()
+    return _with_translation_note(_draft_reply(*_with_conn(lambda c: posting.prepare_status(c, cfg, text, ref))), text)
+
+
+def promo_journal(title: str, text: str, tags: list[str] | None = None) -> str:
+    if not posting.SENDING_ENABLED:
+        return posting.NOT_YET
+    cfg = load_config()
+    title = title.strip() or text.strip().split("\n", 1)[0]
+    return _with_translation_note(
+        _draft_reply(*_with_conn(lambda c: posting.prepare_journal(c, cfg, title, text, tags))), f"{title}\n{text}")
+
+
+def promo_raffle(prize: str, ends: str, method: str = "", title: str = "") -> str:
+    from . import raffle
+
+    cfg = load_config()
+    with db.session() as conn:
+        res = raffle.create(conn, prize, prize, ends, method or "fave", tz=cfg.posting.timezone)
+        if not res.get("ok"):
+            return res.get("reason") or "Не получилось."
+        head = [f"Раффл {res['id']}: конец {res['ends_text']}, commitment {res['commitment']}.",
+                *(f"! {f}" for f in res.get("flags") or [])]
+        if not posting.SENDING_ENABLED:
+            return "\n".join([*head, "Текст правил (её шаблон raffle):", res["text"], posting.NOT_YET])
+        her_title = " ".join(title.split())
+        draft_id, preview = posting.prepare_journal(
+            conn, cfg, her_title or ("Raffle: " + prize)[:50], res["text"], ["raffle"], raffle_id=res["id"],
+            helper_note=posting.RAFFLE_HELPER_NOTE + ("" if her_title else ", название «Raffle: …»"))
+    if not draft_id:
+        return "\n".join([*head, f"Журнал не готовлю: {preview}", "Текст правил (её шаблон raffle):", res["text"]])
+    return "\n".join(head) + "\n\n" + _draft_reply(draft_id, preview)
+
+
+def promo_raffle_draw(ref: str, title: str = "") -> str:
+    from . import raffle
+
+    cfg = load_config()
+    with db.session() as conn:
+        try:
+            client = posting.da_client(cfg)
+        except Exception as e:  # noqa: BLE001 — нет client_id
+            return f"DeviantArt не подключён: {e}"
+        with da_access.session(conn), da_access.task("раффл"):
+            # «Не предлагай мне» — не выход из раффла: участвуют все, кто вошёл по правилам.
+            out = raffle.collect(conn, ref.strip(), client, owner=cfg.deviantart.my_username)
+        if not out.get("complete"):
+            return f"Ники — {UNTRUSTED}.\n" + (out.get("text") or "Участники собраны не полностью.")
+        drawn = raffle.draw(conn, ref.strip())
+        if not drawn.get("ok"):
+            return drawn.get("text") or "Не получилось."
+        if not posting.SENDING_ENABLED:
+            return f"Победитель: {drawn['winner']}. {posting.NOT_YET}"
+        draft_id, text = raffle.prepare_announcement(conn, cfg, ref.strip(), title=title)
+        if not draft_id and "журнал" in (text or ""):
+            draft_id, text = raffle.prepare_announcement(conn, cfg, ref.strip(), kind="status")
+    head = f"Ники — {UNTRUSTED}.\n{out.get('text') or ''}\nПобедитель: {drawn['winner']} (из {len(drawn['entrants'])})."
+    return head + "\n\n" + _draft_reply(draft_id, text)
+
+
+def promo_funnel(ref: str = "") -> str:
+    from . import da_market, funnel
+
+    cfg = load_config()
+    with db.session() as conn:
+        return funnel.render(conn, ref=ref or None, tz=cfg.posting.timezone, niche=da_market.niche_terms(conn, cfg))
+
+
+def promo_groups() -> str:
+    from . import da_market, funnel
+
+    cfg = load_config()
+    with db.session() as conn:
+        rows = funnel.group_targets(conn, niche=da_market.niche_terms(conn, cfg),
+                                    my_username=cfg.deviantart.my_username)
+    return funnel.render_group_targets(rows)
+
+
+def promo_experiment(ref: str = "", text: str = "", items: list[str] | None = None, variant: str = "") -> str:
+    from . import experiments, xpost
+
+    cfg = load_config()
+    with db.session() as conn:
+        try:
+            out = experiments.handle(conn, ref=ref, text=text, items=items or (), variant=variant,
+                                     tz=cfg.posting.timezone)
+        except experiments.ExperimentError as e:
+            return f"Не получилось: {e}"
+        if not (ref or text or items or variant):
+            with contextlib.suppress(Exception):
+                out += "\n\n" + xpost.variant_report(conn)["text"]
+    return out
+
+
+def _stored_description(url: str) -> tuple[str | None, str]:
+    """Ссылка на её работу → (полное описание из базы, название) или (None, почему нет)."""
+    from . import auctions, da_feeds
+
+    with db.session() as conn:
+        item = auctions.item_for_url(conn, url)
+        if item is None:
+            return None, "этой работы нет в базе — вставь текст описания или проверь пост через advice:review url=…"
+        extra = da_feeds._old_extra(item)
+        if not (extra.get("desc_ts") and (extra.get("desc") or item["snippet"])):
+            return None, ("полного описания этой работы в базе нет — вставь текст описания или проверь через "
+                          "advice:review url=…")
+        return str(extra.get("desc") or item["snippet"]), str(item["title"] or "")
+
+
+def promo_checklist(text: str, lot_type: str = "") -> str:
+    from . import checklist
+    from .classify import classify_lot
+
+    cfg = load_config()
+    if text.strip().startswith("http") and len(text.split()) == 1:
+        # Ссылка, а не описание: проверяем описание из базы, иначе «0 из 4» было бы про саму ссылку.
+        desc, title = _stored_description(text.strip())
+        if desc is None:
+            return f"Не проверяю: {title}."
+        text = f"{title}\n{desc}"
+    kind = lot_type.strip().lower() or classify_lot("", text).lot_type
+    return checklist.render(checklist.check(text, kind, cfg.posting)) + (
+        "\nГотовые строки — подсказка: в пост она вставляет их сама, если согласна.")
+
+
+def promo_facts() -> str:
+    from . import checklist
+
+    return checklist.facts_text()
+
+
+def promo_bundle() -> str:
+    from . import offers
+
+    with db.session() as conn:
+        return offers.render_bundles(offers.bundle_suggestions(conn))
+
+
+_NUM = r"\d+(?:[.,]\d+)?"
+_PRICE_NEAR = re.compile(rf"(?:[$€₽]|\b(?:usd|eur|rub|руб|pts|points?|поинт\w*|sb|ab|mi)\b)\s*:?\s*({_NUM})"
+                         rf"|({_NUM})\s*(?:[$€₽]|\b(?:usd|eur|rub|руб\w*|pts|points?|поинт\w*)\b)", re.I)
+
+
+def _price(text: str) -> float | None:
+    """Цена из её текста: сначала число рядом с $/€/₽/pts/AB/SB, иначе первое число вне ссылок."""
+    clean = re.sub(r"\S*(?:https?://|www\.)\S*", " ", text or "")
+    m = _PRICE_NEAR.search(clean)
+    if m:
+        return float((m.group(1) or m.group(2)).replace(",", "."))
+    m = re.search(_NUM, clean)
+    return float(m.group(0).replace(",", ".")) if m else None
+
+
+def promo_plan(price: float | None, unit: str = "") -> str:
+    from . import offers
+
+    cfg = load_config()
+    unit = "points" if unit.strip().lower() in ("points", "pts") else "usd"
+    if price is None:
+        return "Нужно: цена числом (text)."
+    with db.session() as conn:
+        median, ev = offers.her_median(conn, unit)
+    plan = offers.payment_plan_suggestion(price, median, cfg.posting.payment_plans, unit,
+                                          holds_policy=cfg.posting.holds_policy)
+    if plan is None:
+        return "Оплата частями не предлагается (выключена в настройках или цена не выше её медианы)."
+    return "\n".join([f"Можно предложить оплату частями: {plan['text']}", f"Почему: {plan['note']}",
+                      "Это подсказка: в пост — её словами."])
+
+
+@tool(SAFE_WEB)
+def promo(action: Literal["x_post", "x_posted", "repromote", "group_done", "status", "journal", "raffle",
+                          "raffle_draw", "funnel", "groups", "experiment", "checklist", "bundle", "facts", "plan"],
+          ref: str = "", text: str = "", items: list[str] | None = None, variant: str = "") -> str:
+    """Промо, черновики: x_post твит (ref лот, items файл, variant a|b); x_posted (ref x…|лот, text url);
+    repromote — 2-й заход; group_done (ref, text группа); status (text, ref лот); journal (text, ref заголовок);
+    raffle (text приз, ref конец, variant plus); raffle_draw; funnel — почему не берут; groups — куда;
+    experiment; checklist (text|ссылка); bundle; facts — Boosty; plan — частями (text цена)."""
+    items = [items] if isinstance(items, str) else list(items or [])
+    return _pick(action, {
+        "x_post": lambda: _need(ref=ref) or promo_x_post(ref, variant, (items or [""])[0]),
+        "x_posted": lambda: _need(ref=ref, text=text) or promo_x_posted(ref, text),
+        "repromote": promo_repromote,
+        "group_done": lambda: _need(ref=ref, text=text) or promo_group_done(ref, text),
+        "status": lambda: _need(text=text) or promo_status(text, ref),
+        "journal": lambda: _need(text=text) or promo_journal(ref, text, items),
+        "raffle": lambda: _need(text=text, ref=ref) or promo_raffle(text, ref, variant, (items or [""])[0]),
+        "raffle_draw": lambda: _need(ref=ref) or promo_raffle_draw(ref, text),
+        "funnel": lambda: promo_funnel(ref),
+        "groups": promo_groups,
+        "experiment": lambda: promo_experiment(ref, text, items, variant),
+        "checklist": lambda: _need(text=text) or promo_checklist(text, variant),
+        "bundle": promo_bundle,
+        "facts": promo_facts,
+        "plan": lambda: _need(text=text) or promo_plan(_price(text), variant),
+    })
 
 
 # --- Промпты (в Claude Desktop — в меню «+») ---
@@ -2102,7 +3007,7 @@ def posting_setup_prompt() -> str:
             "ставки можно смотреть через мой Chrome (da_auctions:status). "
             "2) Если DeviantArt подключён — наборы групп (da_groups:preset_add), я назову группы и папки. "
             "Потом папки моей галереи для новых работ: покажи da_groups:my_folders, сохрани "
-            "update_settings(default_gallery_folders=…). И мой часовой пояс (timezone), если не Москва. "
+            "update_settings(changes={\"default_gallery_folders\": […]}). И мой часовой пояс (timezone), если не Москва. "
             "3) Мой ник на Toyhouse и режим chrome для Toyhouse. "
             "4) Как отправлять отклики: сразу по моему «го» или только вставлять текст, а «Post» жму я (th_auto_submit). "
             "Честно скажи, что второе на старте безопаснее. "
@@ -2138,6 +3043,61 @@ def new_adopt_plan() -> str:
     """План продажи нового адопта."""
     return ("Хочу продать нового адопта. Спроси, кто на нём (вид, стиль) и как хочу продавать, "
             "потом вызови advice:plan и расскажи план по шагам.")
+
+
+@mcp.prompt(name="find_buyers")
+def find_buyers() -> str:
+    """Найти, кому предложить мой адопт."""
+    return ("Помоги найти покупателей для моего адопта. Спроси ссылку на работу, потом buyers:for_adopt и buyers:leads; "
+            "предложи buyers:x_search, если я в X. Лично — только тем, кто у меня покупал, ставил на мои лоты или в пинглисте; "
+            "ещё можно ответить на LF-пост, "
+            "тексты — мои шаблоны (set_template offer), черновик — после моего «го».")
+
+
+@mcp.prompt(name="promote_post")
+def promote_post() -> str:
+    """Продвинуть мою работу: X, группы, статус, второй заход."""
+    return ("Помоги продвинуть мою работу: спроси ссылку, потом advice:review url=<ссылка> (проверка описания), promo:groups, "
+            "promo:x_post и, если лот висит, promo:repromote. Всё черновиками, публикую только по моему «го»; "
+            "в X пост выкладываю я сама.")
+
+
+@mcp.prompt(name="money_goal")
+def money_goal() -> str:
+    """Сколько я зарабатываю в час и цель на месяц."""
+    return ("Вызови sales:hourly и sales:goal и расскажи бережно, с цифрами, n и уверенностью; где «вывода нет» — так "
+            "и скажи. Спроси, хочу ли поставить цель на месяц (sales:goal amount=…) и сколько адоптов в неделю я "
+            "успеваю (sales:plan amount=…). Часы я записываю сама: sales:hours.")
+
+
+@mcp.prompt(name="ych")
+def ych_prompt() -> str:
+    """Открыть YCH или коммишены и вести слоты."""
+    return ("Помоги с YCH или коммишенами: спроси, что предлагаю (YCH или коммишен), цену, сколько слотов, сколько "
+            "часов на слот и срок. Сохрани sales:ych_offer и покажи sales:ych. Анонс пишу я сама — sales:ych_announce "
+            "даст только факты. Клиентам ты ничего не пишешь.")
+
+
+@mcp.prompt(name="before_transfer")
+def before_transfer() -> str:
+    """Проверить покупателя перед передачей перса."""
+    return ("Спроси ник покупателя и площадку, вызови buyers:check и честно расскажи, что нашлось и что не "
+            "проверялось. Публичные списки и профили открываю я сама по ссылкам.")
+
+
+@mcp.prompt(name="translate_post")
+def translate_post() -> str:
+    """Перевести мой текст на английский для DeviantArt или X."""
+    return ("Спроси мой текст и куда он пойдёт: DeviantArt или X (Toyhouse — нельзя, там перевод от ИИ запрещён, "
+            "скажи мягко). Вызови advice:translate, переведи только мой смысл, потом advice:translate с translation "
+            "и покажи мне оба текста — в пост он идёт только после моего «ок».")
+
+
+@mcp.prompt(name="month_report")
+def month_report_prompt() -> str:
+    """Красивый отчёт за месяц."""
+    return ("Собери sales:report (date — прошлый месяц, если я не сказала другой) и коротко перескажи главное: "
+            "сколько дошло, что продавалось лучше, где «вывода нет».")
 
 
 def main() -> None:

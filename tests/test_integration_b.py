@@ -713,8 +713,12 @@ def test_new_tools_registered_and_in_manifest():
     assert {t["name"] for t in manifest["tools"]} == set(tools)
     for name, actions in NEW_ACTIONS.items():
         assert actions <= set(tools[name].input_schema["properties"]["action"]["enum"]), name
-    props = tools["update_settings"].input_schema["properties"]
-    assert {"max_pages_per_board", "watermark_text", "da_comments_per_day", "da_pings_per_day"} <= set(props)
+    # 0.5: настройки — один параметр changes={ключ: значение}; ключи и пределы — в get_settings.
+    from mcp_devian import config
+
+    assert set(tools["update_settings"].input_schema["properties"]) == {"changes", "finish_setup"}
+    assert {"max_pages_per_board", "watermark_text", "da_comments_per_day", "da_pings_per_day"} <= set(
+        config.SETTING_KEYS)
     assert "lot" in tools["sales"].input_schema["properties"]
     assert "show_blocked" in tools["findings"].input_schema["properties"]
     assert "окончательный" not in (tools["forecast"].description or "")
