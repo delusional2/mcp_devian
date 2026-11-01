@@ -8,7 +8,8 @@ storage_state*.json
 browser-profile/
 .auth/
 
-# local data
+# local config and data
+config.toml
 data/
 *.sqlite
 *.sqlite3
@@ -22,6 +23,8 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.coverage
+.mypy_cache/
 .ruff_cache/
 *.egg-info/
 

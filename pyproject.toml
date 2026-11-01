@@ -1,0 +1,43 @@
+[project]
+name = "mcp-devian"
+version = "0.1.0"
+description = "Мониторинг адоптов и аукционов на DeviantArt и Toyhouse с MCP-сервером для Claude"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "defusedxml>=0.7",
+    "httpx>=0.27",
+    "mcp>=2.3,<3",
+    "playwright>=1.48",
+]
+
+[project.scripts]
+mcp-devian = "mcp_devian.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_devian"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "PLW1510"]
+# SIM103: цепочка if/return в фильтрах читается проще одного большого выражения.
+ignore = ["SIM103"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/fixtures.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mcp_devian"]

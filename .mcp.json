@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp_devian": {
+      "command": "uv",
+      "args": ["run", "mcp-devian", "serve"]
+    }
+  }
+}
