@@ -1,6 +1,6 @@
 [project]
 name = "mcp-devian"
-version = "0.2.0"
+version = "0.2.1"
 description = "Мониторинг адоптов и аукционов на DeviantArt и Toyhouse с MCP-сервером для Claude"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"

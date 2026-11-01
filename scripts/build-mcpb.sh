@@ -33,4 +33,6 @@ cp uv.lock "$STAGE/"
 
 $MCPB validate "$STAGE/manifest.json"
 $MCPB pack "$STAGE" "dist/mcp-devian-$VERSION.mcpb"
-echo "Готово: dist/mcp-devian-$VERSION.mcpb"
+# Постоянное имя для релиза: ссылка …/releases/latest/download/mcp-devian.mcpb всегда ведёт на свежую версию.
+cp "dist/mcp-devian-$VERSION.mcpb" dist/mcp-devian.mcpb
+echo "Готово: dist/mcp-devian-$VERSION.mcpb и dist/mcp-devian.mcpb"

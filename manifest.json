@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "mcp-devian",
   "display_name": "Адопты: DeviantArt и Toyhouse",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Следит за группами DeviantArt и форумами Toyhouse, находит адоптов и LF-треды, подсказывает цены по рынку.",
   "long_description": "После установки просто напиши Claude «давай настроим помощника по адоптам» — он сам задаст вопросы. Ничего не публикует.",
   "author": {
@@ -105,6 +105,18 @@
     {
       "name": "my_works_overview",
       "description": "Её работы и как они продаются"
+    },
+    {
+      "name": "leave_feedback",
+      "description": "Сохранить её отзыв"
+    },
+    {
+      "name": "feedback_report",
+      "description": "Отзывы одним текстом для отправки"
+    },
+    {
+      "name": "feedback_sent",
+      "description": "Отметить отзывы отправленными"
     }
   ],
   "tools_generated": true,

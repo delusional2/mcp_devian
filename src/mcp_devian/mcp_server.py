@@ -12,7 +12,7 @@ import time
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from . import background, db, digest, jobs, market, monitor
+from . import background, db, digest, feedback, jobs, market, monitor
 from . import deviantart as da
 from . import toyhouse as th
 from .config import (
@@ -98,6 +98,9 @@ def _fmt(rows, empty: str) -> str:
     return "\n\n".join(out)
 
 
+ASK_FEEDBACK = ("Давно не спрашивали, как ей помощник. В конце разговора, если к месту, мягко спроси одним "
+                "вопросом, что было неудобно или чего не хватает, и сохрани ответ через leave_feedback. "
+                "Если не хочет отвечать — leave_feedback(declined=True) и не настаивай.")
 NOT_CONFIGURED = "Настройка ещё не пройдена: сначала вызови get_settings и задай ей вопросы оттуда."
 BROKEN_SETTINGS = ("Файл настроек повреждён, его копия сохранена рядом. Поверх ничего не записываю: "
                    "мягко предложи ей пройти настройку заново (update_settings(..., finish_setup=True)).")
@@ -129,6 +132,8 @@ def describe_settings(cfg: Config) -> str:
         "",
         TONE,
     ]
+    if cfg.configured and feedback.should_ask(configured_since=cfg.configured_at):
+        lines += ["", ASK_FEEDBACK]
     if not cfg.configured:
         lines += ["", SETUP_QUESTIONS]
     return "\n".join(lines)
@@ -176,6 +181,7 @@ def update_settings(
             return f"Не сохранила: {e}"
         if finish_setup:
             cfg.configured = True
+            cfg.configured_at = cfg.configured_at or time.time()
         save_config(cfg, force=finish_setup)
         if "my_da_username" in done:
             with db.session() as conn:
@@ -436,6 +442,43 @@ def my_works_overview(days: int = 90) -> str:
         return market.my_works(conn, days)
 
 
+# --- Отзывы ---
+
+@mcp.tool(annotations=SAFE)
+def leave_feedback(text: str = "", topic: str = "общее", rating: int | None = None, declined: bool = False) -> str:
+    """Сохранить её отзыв о помощнике: что неудобно, что нашлось не то, чего хочется.
+    Записывай её словами, ничего не приукрашивая. topic — коротко о чём (настройка, прогноз,
+    Toyhouse, DeviantArt, уведомления…); rating — 1..5, если она сама назвала оценку.
+    declined=True — спросили, а она не захотела отвечать (тогда долго не спрашивать снова).
+    Отзывы лежат только у неё на маке; отправить их — feedback_report."""
+    if declined:
+        feedback.mark_asked()
+        return "Хорошо, не буду спрашивать какое-то время."
+    if not text.strip():
+        return "Пустой отзыв не сохраняю."
+    if rating is not None and not 1 <= int(rating) <= 5:
+        rating = None
+    n = feedback.add(text, topic, rating)
+    return f"Сохранила, спасибо ей. Отзывов всего: {n}. Отправить их можно через feedback_report."
+
+
+@mcp.tool(annotations=READ_ONLY)
+def feedback_report() -> str:
+    """Все её отзывы одним текстом — чтобы она скопировала и отправила тому, кто делал помощника.
+    Покажи текст целиком в ответе. Когда она скажет, что отправила, вызови feedback_sent."""
+    cfg = load_config()
+    context = (f"Режим Toyhouse: {cfg.toyhouse.mode}; папок DA: {len(cfg.deviantart.groups)}; "
+               f"фоновая проверка: {'включена' if background.is_enabled() else 'выключена'}.")
+    return feedback.report(context)
+
+
+@mcp.tool(annotations=SAFE)
+def feedback_sent() -> str:
+    """Она отправила отзывы: убрать их из списка (копия остаётся у неё в папке данных)."""
+    n = feedback.clear_reported()
+    return f"Готово, отправленных отзывов: {n}."
+
+
 # --- Промпты (в Claude Desktop — в меню «+») ---
 
 @mcp.prompt()
@@ -449,6 +492,13 @@ def whats_new() -> str:
     """Что нового на DeviantArt и Toyhouse."""
     return ("Проверь, что нового: check_now, потом покажи свежие лоты DA и живые LF-треды Toyhouse. "
             "Коротко, списком.")
+
+
+@mcp.prompt(name="feedback")
+def feedback_prompt() -> str:
+    """Оставить отзыв о помощнике."""
+    return ("Хочу рассказать, как мне помощник: что неудобно и чего не хватает. Выслушай, уточни, если надо, "
+            "и сохрани через leave_feedback.")
 
 
 @mcp.prompt()

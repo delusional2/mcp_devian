@@ -72,6 +72,7 @@ class Config:
     toyhouse: Toyhouse = field(default_factory=Toyhouse)
     notify: Notify = field(default_factory=Notify)
     configured: bool = False
+    configured_at: float = 0
     path: Path | None = None
     warnings: list[str] = field(default_factory=list)
     unreadable: bool = False
@@ -131,6 +132,7 @@ def load_config(path: Path | None = None) -> Config:
         toyhouse=_pick(Toyhouse, _section(raw, "toyhouse", warnings), "toyhouse", warnings),
         notify=_pick(Notify, _section(raw, "notify", warnings), "notify", warnings),
         configured=bool(raw.get("configured")),
+        configured_at=float(raw.get("configured_at") or 0),
         path=path,
         warnings=warnings,
     )
@@ -147,6 +149,7 @@ def save_config(cfg: Config, path: Path | None = None, force: bool = False) -> P
     path = path or cfg.path or settings_path()
     data: dict[str, object] = {name: asdict(getattr(cfg, name)) for name in SECTIONS}
     data["configured"] = cfg.configured
+    data["configured_at"] = cfg.configured_at
     path.parent.mkdir(parents=True, exist_ok=True)
     # Уникальный временный файл: параллельные записи не воруют его друг у друга.
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".settings-", suffix=".tmp")
