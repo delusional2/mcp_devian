@@ -1,0 +1,32 @@
+# secrets and logins: never commit
+.env
+.env.*
+!.env.example
+secrets/
+*.cookies.json
+storage_state*.json
+browser-profile/
+.auth/
+
+# local data
+data/
+*.sqlite
+*.sqlite3
+*.db
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# node
+node_modules/
+
+# macOS
+.DS_Store
