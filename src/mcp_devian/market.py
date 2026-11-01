@@ -14,6 +14,7 @@ import statistics
 import time
 from dataclasses import dataclass, field
 
+from . import evidence
 from .bids import money
 from .classify import TAG_TYPES, keyword_hits
 
@@ -34,16 +35,11 @@ FIXED_TYPES = GROUPS[1][2]
 
 MIN_SIMILAR = 5            # меньше похожих — показываем их поштучно и берём весь рынок типа
 HORIZON_DAYS = 3           # «закрылся в первые N дней» — только для прослеженных N дней
+SELLER_CAP = 3             # в ценах один продавец — не больше стольких своих самых свежих лотов
 UNITS = ("usd", "points")
 
-GENTLE = (
-    "Как говорить с ней: тепло и бережно, но честно. Не меняй и не округляй цифры, обязательно назови "
-    "уверенность и скажи, если выборка расширена или данных мало. Хвали только то, что она сама рассказала "
-    "о работе — картинку ты не видишь. Давай диапазоны, а не приговоры, без слов «плохо» и «не продастся». "
-    "Если её цена заметно выше диапазона или похожие лоты редко закрываются, скажи это прямо, но мягко, и "
-    "предложи варианты (чуть ниже SB, автобай, другой формат). Напомни, что это ориентир по похожим лотам, "
-    "а не оценка её как художницы."
-)
+# Полные правила пересказа — в get_settings (один раз за разговор); здесь короткая пометка.
+GENTLE = "Цифры и уверенность — как есть, бережно; это ориентир по похожим лотам, не оценка её как художницы."
 
 # Теги, которые есть почти у каждого адопта и ничего не говорят о самой работе.
 GENERIC_WORDS = {
@@ -97,6 +93,11 @@ class PriceStats:
     median: float | None = None
     high: float | None = None     # 75-й перцентиль
     values: list[float] = field(default_factory=list, repr=False)
+    sellers: int | None = None    # сколько разных продавцов за этими ценами (None — неизвестно)
+    search: int = 0               # из них найдено только поиском
+    capped: int = 0               # сколько лотов отброшено ограничением «≤3 на продавца»
+    multi: int = 0                # сколько постов-пачек не вошло (у них цена — минимум из нескольких лотов)
+    ev: evidence.Evidence | None = field(default=None, repr=False)
 
     def position(self, price: float) -> float | None:
         """Доля лотов этой группы, которые дешевле её цены (0..1)."""
@@ -113,6 +114,52 @@ def price_stats(values: list[float | None]) -> PriceStats:
         return PriceStats(1, vals[0], vals[0], vals[0], vals)
     q = statistics.quantiles(vals, n=4, method="inclusive")
     return PriceStats(len(vals), q[0], statistics.median(vals), q[2], vals)
+
+
+def _extra(row) -> dict:
+    try:
+        v = json.loads(row["extra"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def _is_search(row) -> bool:
+    from .forecast import is_search
+
+    return is_search(row["place"])
+
+
+def row_price_stats(rows, unit: str, *, population: str = "", now: float | None = None) -> PriceStats:
+    """Цены лотов «по одному на лот»: без постов-пачек (extra.multi), не больше SELLER_CAP самых свежих лотов
+    одного продавца. С числом продавцов и меткой evidence."""
+    col = f"price_{unit}"
+    priced = [r for r in rows if r[col] is not None and r[col] > 0]
+    multi = [r for r in priced if _extra(r).get("multi")]
+    single = [r for r in priced if not _extra(r).get("multi")]
+    by_seller: dict[str, list] = {}
+    keep = []
+    for r in single:
+        who = (r["author"] or "").lower()
+        if who:
+            by_seller.setdefault(who, []).append(r)
+        else:
+            keep.append(r)
+    for items in by_seller.values():
+        keep += sorted(items, key=lambda r: (_start(r), r["id"]), reverse=True)[:SELLER_CAP]
+    s = price_stats([r[col] for r in keep])
+    s.multi = len(multi)
+    s.capped = len(single) - len(keep)
+    s.search = sum(1 for r in keep if _is_search(r))
+    s.sellers = len({(r["author"] or "").lower() for r in keep if r["author"]}) or None
+    if keep:
+        try:
+            ci = evidence.median_ci(s.values)
+        except ValueError:
+            ci = None
+        s.ev = evidence.span([_start(r) for r in keep], "market_da", population, unit, "observed", n=s.n,
+                             interval=ci, measure="price", value=s.median)
+    return s
 
 
 @dataclass
@@ -132,6 +179,7 @@ class BidStats:
     ratio_n: dict[str, int] = field(default_factory=dict)
     current: dict[str, PriceStats] = field(default_factory=dict)    # unit -> текущие ставки открытых
     no_bids_closed: int = 0                                          # закрылись без единой ставки
+    stale_closed: int = 0                                            # закрыты, но ставки читались до закрытия
 
     @property
     def n(self) -> int:
@@ -221,6 +269,19 @@ def _auction_rows(conn, rows) -> dict[str, dict]:
     return out
 
 
+def _read_after_close(a: dict, r) -> bool:
+    """Ставки этого закрытого лота прочитаны уже после закрытия (или в комментариях видно, что он закрыт)?
+    Иначе максимум — это ставка, какой она была, пока лот был открыт, а не финальная цена."""
+    if a.get("ended"):
+        return True
+    try:
+        seen = json.loads(a.get("extra") or "{}").get("seen_status")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        seen = None
+    closed_ts = r["closed_ts"] if "closed_ts" in r.keys() else None  # noqa: SIM118 — у sqlite3.Row `in` ищет по значениям
+    return seen == "closed" or (closed_ts is not None and (a.get("updated_ts") or 0) >= closed_ts)
+
+
 def bid_stats(conn, rows) -> BidStats:
     auctions = _auction_rows(conn, rows)
     result = BidStats()
@@ -231,20 +292,33 @@ def bid_stats(conn, rows) -> BidStats:
     sbs: dict[str, list[float]] = {u: [] for u in UNITS}
     ratios: dict[str, list[float]] = {u: [] for u in UNITS}
     current: dict[str, list[float]] = {u: [] for u in UNITS}
+    from .forecast import outcome_known
+
     for dev_id, a in auctions.items():
         r = by_id.get(dev_id)
         unit = a.get("currency")
         if r is None or unit not in UNITS:
             continue
-        ended = bool(a.get("ended")) or r["status"] == "closed"
+        try:
+            a_extra = json.loads(a.get("extra") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            a_extra = {}
+        closed = bool(a.get("ended")) or r["status"] == "closed"
+        # Итог — по тому же правилу, что и в прогнозе (forecast.outcome_known).
+        final = outcome_known(ended=a.get("ended"), status=r["status"], closed_ts=r["closed_ts"],
+                              a_extra=a_extra if isinstance(a_extra, dict) else {}, a_updated=a.get("updated_ts"),
+                              published=_start(r), item_updated=r["updated_ts"])
+        if closed and not final:
+            result.stale_closed += 1
+            continue
         if not a.get("n_bids") or not a.get("top_amount"):
-            result.no_bids_closed += ended
+            result.no_bids_closed += final
             continue
         top = float(a["top_amount"])
-        if ended:
+        if final:
             finals[unit].append(top)
             sb = r[f"price_{unit}"]
-            if sb:
+            if sb and not a.get("ab_hit"):   # взятый автобай — это AB/SB, а не рост цены от торга
                 sbs[unit].append(sb)
                 ratios[unit].append(top / sb)
         else:
@@ -259,13 +333,18 @@ def bid_stats(conn, rows) -> BidStats:
 
 
 def _confidence(n: int) -> str:
-    return "низкая" if n < 5 else "средняя" if n < 15 else "нормальная"
+    """Та же шкала, что везде (evidence.level): <8 — нет вывода, <15 — низкая, <40 — средняя."""
+    from .forecast import confidence
+
+    return confidence(n)
 
 
-def _bucket_size(stats: dict, lot_type: str | None, unit: str) -> int:
+def _level(stats: dict, lot_type: str | None, unit: str) -> str:
     if lot_type and GROUP_OF.get(lot_type):
-        return stats[GROUP_OF[lot_type]][unit].n
-    return max((s[unit].n for s in stats.values()), default=0)
+        s = stats[GROUP_OF[lot_type]][unit]
+    else:
+        s = max((g[unit] for g in stats.values()), key=lambda x: x.n, default=PriceStats())
+    return evidence.level(s.ev) if s.ev is not None else "нет вывода"
 
 
 def forecast(conn, keywords: list[str], lot_type: str | None = None, my_usd: float | None = None,
@@ -279,8 +358,9 @@ def forecast(conn, keywords: list[str], lot_type: str | None = None, my_usd: flo
     if given and not useful:
         widened = True
 
-    stats = {key: {u: price_stats([r[f"price_{u}"] for r in rows if GROUP_OF.get(r["lot_type"]) == key])
-                   for u in UNITS} for key, _, _ in GROUPS}
+    stats = {key: {u: row_price_stats([r for r in rows if GROUP_OF.get(r["lot_type"]) == key], u,
+                                      population=f"{label}, {'$' if u == 'usd' else 'поинты'}, чужие лоты", now=now)
+                   for u in UNITS} for key, label, _ in GROUPS}
 
     # Закрылись ли: только лоты с понятным статусом. «Открытый» лот считаем,
     # только если видели его в ленте и после 3-го дня — иначе он просто выпал из RSS.
@@ -316,9 +396,9 @@ def forecast(conn, keywords: list[str], lot_type: str | None = None, my_usd: flo
                 positions.append(Position(g, unit, share, s.n))
 
     unit = "points" if my_points and not my_usd else "usd"
-    level = _confidence(min(len(rows), _bucket_size(stats, lot_type, unit) or len(rows)))
+    level = _level(stats, lot_type, unit)
     if widened:
-        level = "низкая"
+        level = evidence.cap(level, "низкая")
 
     return Forecast(
         keywords=useful,
@@ -354,17 +434,33 @@ def _row_price(r) -> str:
     return " / ".join(parts) or "без цены"
 
 
+def _who(s: PriceStats, with_n: bool = True) -> str:
+    bits = [f"{s.n} лотов"] if with_n else []
+    if s.sellers:
+        bits.append(f"{s.sellers} продавцов")
+    if s.search:
+        bits.append(f"из поиска: {s.search}")
+    if s.capped:
+        bits.append(f"не больше {SELLER_CAP} лотов на продавца, отброшено {s.capped}")
+    if s.multi:
+        bits.append(f"пачек «много лотов в посте» не считала: {s.multi}")
+    return ", ".join(bits)
+
+
 def _range(s: PriceStats, unit: str) -> str | None:
     if not s.n:
         return None
+    extra = _who(s, with_n=False)
+    tag = evidence.tag(s.ev) if s.ev is not None else f"(n={s.n})"
     if s.n < 5:
         # На паре значений квартили врут: показываем сами цены.
-        return f"{', '.join(_fmt(v, unit) for v in s.values)} (всего {s.n})"
+        return f"{', '.join(_fmt(v, unit) for v in s.values)} (всего {s.n}{'; ' + extra if extra else ''}) {tag}"
     assert s.low is not None and s.high is not None and s.median is not None
-    return f"обычно {_fmt(s.low, unit)}–{_fmt(s.high, unit)}, середина {_fmt(s.median, unit)} (n={s.n})"
+    return (f"обычно {_fmt(s.low, unit)}–{_fmt(s.high, unit)}, середина {_fmt(s.median, unit)}"
+            f"{' — ' + extra if extra else ''} {tag}")
 
 
-def render(fc: Forecast, lot_type: str | None = None) -> str:
+def render(fc: Forecast, lot_type: str | None = None, now: float | None = None) -> str:
     lines = []
     if fc.ignored_keywords:
         lines.append(f"Слишком общие слова, не искала по ним: {', '.join(fc.ignored_keywords)}.")
@@ -409,8 +505,16 @@ def render(fc: Forecast, lot_type: str | None = None) -> str:
     if skipped:
         lines.append("Не учтены в «закрылись»: " + ", ".join(skipped) + ".")
     if fc.other_currency:
-        lines.append(f"{fc.other_currency} лотов с ценой в €/£ — в статистику $ не включены.")
+        lines.append(f"{fc.other_currency} лотов с ценой в другой валюте (€, £, CA$, AU$, NZ$) — в статистику $ не включены.")
     lines += _bid_lines(fc.bids)
+    newest = max((s.ev.data_as_of for g in fc.stats.values() for s in g.values() if s.ev is not None), default=None)
+    if newest:
+        old = evidence.stale(evidence.Evidence(0, None, 0, 0, newest, "market_da", "", None, "observed"), now)
+        if old:
+            # Старый самый новый лот — это про выборку по запросу, а не про ленты: узкий запрос («moth»)
+            # может давно не встречаться при свежем мониторинге. Свежесть лент — в data_health.
+            lines.append(f"Внимание: новых похожих лотов нет с {evidence._d(newest, False)} — свежесть самих "
+                         "лент DeviantArt смотри в forecast:health.")
     bids_note = ("ставки взяты из комментариев только тех лотов, которые читали, и разбор может ошибаться"
                  if fc.bids.n or any(s.n for s in fc.bids.current.values())
                  else "финальных ставок пока не видно (комментарии ещё не читали)")
@@ -433,7 +537,9 @@ def _bid_lines(b: BidStats) -> list[str]:
             if sb and sb.n and ratio:
                 assert sb.median is not None
                 line = (f"По ставкам: аукционы с SB около {_fmt(sb.median, unit)} уходят примерно за "
-                        f"{_fmt(final.median, unit)} (×{ratio:.1f}), по {final.n} {'лоту' if final.n == 1 else 'лотам'}")
+                        f"{_fmt(final.median, unit)} (×{ratio:.1f}), по {final.n} {'лоту' if final.n == 1 else 'лотам'}"
+                        + (f"; рост цены — по {b.ratio_n.get(unit, 0)}, без взятых автобаев"
+                           if b.ratio_n.get(unit, 0) != final.n else ""))
             else:
                 line = f"По ставкам: закрытые аукционы ушли примерно за {_fmt(final.median, unit)}, по {final.n} лотам"
             if final.n < 5:
@@ -446,6 +552,8 @@ def _bid_lines(b: BidStats) -> list[str]:
                          f"(по {current.n}, ещё могут вырасти)")
     if b.no_bids_closed:
         lines.append(f"Закрылись без единой ставки: {b.no_bids_closed}")
+    if b.stale_closed:
+        lines.append(f"Не перечитаны после закрытия (их ставки не считаю): {b.stale_closed}")
     return lines
 
 

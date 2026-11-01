@@ -47,9 +47,11 @@ def test_deviantart_check_saves_and_matches(conn):
 
 
 def test_deviantart_rate_limit_recorded(conn):
+    # 429 — не ошибка проверки, а общая пауза (da_access): одна понятная строка, ступень паузы в базе.
     res = monitor.check_deviantart(conn, da_cfg(), NOW, http=fake_http(429, ""))
-    assert "429" in res.error
-    assert db.last_run(conn, "deviantart")["last_error"] == res.error
+    assert res.error is None and "притормозил чтение лент до" in res.limited
+    assert conn.execute("SELECT level FROM da_cooldown WHERE kind = 'rss'").fetchone()["level"] == 1
+    assert db.last_run(conn, "deviantart") is None  # ничего не прочитали — проход не записан
 
 
 def test_deviantart_without_sources_is_skipped(conn):
@@ -191,3 +193,170 @@ def test_seller_default_market_lots_are_data_not_findings(conn):
     assert res.seen == 3 and res.new_matched == 0
     assert db.get_item(conn, "da:1404000001")["lot_type"] == "auction"  # для прогноза данные есть
     assert db.pending_digest(conn) == []
+
+
+# --- Подбор LF-тредов: закрытые, её треды, оплата из поста, профиль ---
+
+import json  # noqa: E402
+
+import fixtures_th as fth  # noqa: E402
+
+from mcp_devian.classify import classify_thread  # noqa: E402
+from mcp_devian.config import Posting  # noqa: E402
+
+
+@pytest.mark.parametrize("title", fth.CLOSED_TITLES + ["LF: dragons (found)"])
+def test_match_thread_skips_closed_on_hold_found(title):
+    kind = classify_thread(title)
+    assert monitor.match_thread(Config(), kind, title, None, NOW - 60, NOW) == (None, "закрыт")
+
+
+def test_match_thread_skips_her_own_thread():
+    cfg = Config(posting=Posting(th_username="MeArtist"))
+    kind = classify_thread("LF: dragons")
+    assert monitor.match_thread(cfg, kind, "LF: dragons", None, NOW - 60, NOW, author="meartist") == (None, "её тред")
+    assert monitor.match_thread(cfg, kind, "LF: dragons", None, NOW - 60, NOW, author="buyer")[0] == "lf"
+
+
+def test_thread_item_pays_from_snippet_and_profile_stored():
+    row = th.ThreadRow(board_id=13, thread_id="5", title="LF: dragons", url="https://toyhou.se/~forums/13.x/5.t",
+                       author="buyer", posts=2, created_ts=NOW - 3600, activity_ts=NOW - 60, last_poster="buyer")
+    item = monitor._thread_item(Config(), row, fth.LONG_FIRST_POST, NOW, snippet_ts=NOW)
+    assert item.pays == "usd"  # «paying via paypal invoice only» — только из поста
+    lf = item.extra["lf"]
+    assert lf["budget"] == [40.0, "usd"] and "anthro" in lf["negated"] and lf["pays_only"] == "paypal"
+    assert json.loads(json.dumps(lf)) == lf
+    assert item.extra["thread_key"] == "buyer|dragons" and item.extra["snippet_ts"] == NOW
+    assert "платят: usd" in item.match_reason
+
+
+def test_thread_item_snippet_found_drops_thread():
+    row = th.ThreadRow(board_id=13, thread_id="6", title="LF: dragons", url="https://toyhou.se/~forums/13.x/6.t",
+                       author="buyer", posts=2, created_ts=NOW - 3600, activity_ts=NOW - 60, last_poster="buyer")
+    item = monitor._thread_item(Config(), row, "FOUND, thank you everyone!", NOW)
+    assert item.match_kind is None and item.match_reason == "закрыт"
+
+
+# --- Листание досок ---
+
+class PagedReader:
+    def __init__(self, pages, endless=False):
+        self.pages, self.endless, self.calls = pages, endless, []
+
+    def board(self, board_id, page, now):
+        self.calls.append((board_id, page))
+        if self.endless:  # каждая страница свежая и новая
+            return [th.ThreadRow(13, f"{page}{i}", f"LF thing {page}{i}", f"https://toyhou.se/~forums/13.x/{page}{i}.t",
+                                 "a", 1, now - 60, now - 60 * page, "a") for i in range(3)]
+        html = self.pages.get(page)
+        return th.parse_board(html, th.board_id(board_id), now) if html else []
+
+
+def paging_cfg(pages=1, top=6, boards=(13,)):
+    return Config(toyhouse=Toyhouse(mode="bot", boards=list(boards), pages_per_board=pages, max_pages_per_board=top))
+
+
+def test_quiet_board_reads_one_page():
+    reader, res = PagedReader({1: fth.QUIET_PAGE, 2: fth.BOARD_PAGE2}), monitor.SourceResult("toyhouse")
+    rows = monitor._read_boards(reader, paging_cfg(), NOW, res, since_ts=NOW - 2 * 3600)
+    assert reader.calls == [(13, 1)] and len(rows) == 2
+
+
+def test_busy_board_reads_until_known_activity():
+    reader, res = PagedReader(fth.BUSY_PAGES), monitor.SourceResult("toyhouse")
+    rows = monitor._read_boards(reader, paging_cfg(), NOW, res, since_ts=NOW - 2 * 3600)
+    # страницы 1 и 2 свежее границы, на 3-й конец страницы уже старый — дальше не листаем.
+    assert [p for _, p in reader.calls] == [1, 2, 3] and len(rows) == 8
+
+
+def test_busy_board_capped_by_max_pages():
+    reader = PagedReader({}, endless=True)
+    monitor._read_boards(reader, paging_cfg(pages=2, top=4), NOW, monitor.SourceResult("toyhouse"), since_ts=NOW - 1e6)
+    assert [p for _, p in reader.calls] == [1, 2, 3, 4]
+    reader = PagedReader({}, endless=True)
+    monitor._read_boards(reader, paging_cfg(pages=2, top=4), NOW, monitor.SourceResult("toyhouse"), since_ts=None)
+    assert [p for _, p in reader.calls] == [1, 2]  # без границы — только обязательные страницы
+
+
+def test_paging_pauses_between_pages(monkeypatch):
+    pauses = []
+    monkeypatch.setattr(monitor.th, "human_pause", lambda *a, **k: pauses.append(1))
+    reader = PagedReader(fth.BUSY_PAGES)
+    monitor._read_boards(reader, paging_cfg(boards=(13, "5866.design-marketplace")), NOW,
+                         monitor.SourceResult("toyhouse"), since_ts=NOW - 2 * 3600)
+    assert len(pauses) == len(reader.calls) - 1
+    assert (("5866.design-marketplace", 1)) in reader.calls
+
+
+def test_board_since_uses_last_ok_run(conn):
+    cfg = paging_cfg()
+    assert monitor.board_since(conn, cfg, NOW) == NOW - cfg.toyhouse.active_days * 86400
+    db.record_run(conn, "toyhouse", None, NOW - 7200)
+    assert monitor.board_since(conn, cfg, NOW) == NOW - 7200 - monitor.SINCE_OVERLAP_S
+
+
+# --- Чтение первых постов ---
+
+class PostReader:
+    def __init__(self):
+        self.read = []
+
+    def first_post(self, url):
+        self.read.append(url)
+        return f"post of {url}"
+
+
+def lf_row(tid, title, posts, created_ago, activity_ago=600):
+    return th.ThreadRow(13, tid, title, f"https://toyhou.se/~forums/13.x/{tid}.t", "buyer" + tid, posts,
+                        NOW - created_ago, NOW - activity_ago, "x")
+
+
+def snippet_cfg(budget=2):
+    chars = [{"name": "Ember", "url": "https://toyhou.se/1.e", "price": "$40", "tags": ["wolf"]}]
+    return Config(toyhouse=Toyhouse(mode="bot", boards=[13], read_first_posts=budget),
+                  posting=Posting(characters=chars))
+
+
+def test_snippet_budget_goes_to_best_fit_then_fewest_posts(conn):
+    rows = [lf_row("1", "LF: cats", 1, 3600), lf_row("2", "LF: wolves", 30, 7200),
+            lf_row("3", "LF: canines", 2, 9000), lf_row("4", "LF: OCs", 1, 600)]
+    reader = PostReader()
+    got = monitor._fetch_snippets(conn, reader, snippet_cfg(budget=2), rows, NOW, monitor.SourceResult("toyhouse"))
+    # Волк подходит к «wolves» и «canines» (по 40): из них сначала тот, где меньше постов.
+    assert [u.rsplit("/", 1)[1] for u in reader.read] == ["3.t", "2.t"]
+    assert got["3"] == ("post of https://toyhou.se/~forums/13.x/3.t", NOW) and got["1"] == (None, None)
+
+
+def test_snippet_reread_after_a_day_only_for_fitting_threads(conn):
+    old = NOW - 30 * 3600
+    for tid, title in (("7", "LF: wolves"), ("8", "LF: cats")):
+        item = th.row_to_item(lf_row(tid, title, 2, 3600))
+        item.snippet, item.extra["snippet_ts"] = "old text", old
+        db.upsert_item(conn, item, old)
+    reader = PostReader()
+    got = monitor._fetch_snippets(conn, reader, snippet_cfg(budget=5),
+                                  [lf_row("7", "LF: wolves", 2, 3600), lf_row("8", "LF: cats", 2, 3600)],
+                                  NOW, monitor.SourceResult("toyhouse"))
+    assert [u.rsplit("/", 1)[1] for u in reader.read] == ["7.t"]
+    assert got["7"][1] == NOW and got["8"] == ("old text", old)
+    # Свежий (меньше суток) не перечитываем.
+    reader = PostReader()
+    monitor._fetch_snippets(conn, reader, snippet_cfg(budget=5), [lf_row("7", "LF: wolves", 2, 3600)],
+                            NOW - 29 * 3600, monitor.SourceResult("toyhouse"))
+    assert reader.read == []
+
+
+# --- DeviantArt: флаг «несколько лотов в посте» ---
+
+def test_check_deviantart_stores_multi(conn, monkeypatch):
+    real = monitor.classify_lot
+
+    def with_multi(*a, **k):
+        lot = real(*a, **k)
+        lot.multi = "batch" in a[0].lower() or "adopt" in a[0].lower()
+        return lot
+
+    monkeypatch.setattr(monitor, "classify_lot", with_multi)
+    monitor.check_deviantart(conn, da_cfg(), NOW, http=fake_http())
+    extras = [json.loads(r["extra"] or "{}") for r in conn.execute("SELECT extra FROM items WHERE source = 'deviantart'")]
+    assert extras and all("multi" in e for e in extras) and any(e["multi"] for e in extras)

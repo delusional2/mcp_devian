@@ -11,6 +11,11 @@ TEMPLATE = "Привет! Могу предложить {name} — {url}, цен
 CHAR = {"name": "Луна", "url": "https://toyhou.se/123.luna", "price": "$30", "tags": ["dragon", "moth"]}
 
 
+@pytest.fixture(autouse=True)
+def sending_on(monkeypatch):
+    monkeypatch.setattr(posting, "SENDING_ENABLED", True)
+
+
 @pytest.fixture
 def cfg():
     c = Config(toyhouse=Toyhouse(mode="chrome"))
@@ -126,7 +131,7 @@ def test_stale_draft_rejected(conn, cfg, monkeypatch):
     assert "устарел" in posting.send(conn, cfg, d, now=NOW + 2 * 86400)
 
 
-def test_crash_during_send_marks_failed(conn, cfg, monkeypatch):
+def test_crash_during_auto_send_is_unknown_and_counted(conn, cfg, monkeypatch):
     from mcp_devian import her_chrome
 
     def boom(*a, **k):
@@ -134,8 +139,10 @@ def test_crash_during_send_marks_failed(conn, cfg, monkeypatch):
 
     monkeypatch.setattr(her_chrome, "run_reply", boom)
     d, _ = posting.prepare_toyhouse_reply(conn, cfg, "th:1", "Луна", now=NOW)
-    assert "ошибка" in posting.send(conn, cfg, d, now=NOW)
-    assert drafts.get(conn, d)["status"] == "failed"
+    # Сбой после возможного клика: исход неизвестен, повторный отклик в тот же тред не пройдёт.
+    assert "неизвестно" in posting.send(conn, cfg, d, now=NOW)
+    assert drafts.get(conn, d, now=NOW)["status"] == "unknown"
+    assert posting.prepare_toyhouse_reply(conn, cfg, "th:1", "Луна", now=NOW + 3600)[0] is None
 
 
 class FakeDA:
@@ -154,8 +161,15 @@ class FakeDA:
         return {"url": "https://www.deviantart.com/me/art/x-1", "deviationid": "uuid-1"}
 
 
-def test_deviantart_publish_flow(conn, cfg, tmp_path, monkeypatch):
-    img = tmp_path / "moth.png"
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "Downloads").mkdir()
+    return tmp_path
+
+
+def test_deviantart_publish_flow(conn, cfg, home, monkeypatch):
+    img = home / "Downloads" / "moth.png"
     img.write_bytes(b"\x89PNG fake")
     cfg.posting.group_presets = {"аукционы": [
         {"group": "da-adopts", "group_id": "g-1", "folder_id": "f-1", "folder_name": "auctions"},
@@ -170,8 +184,8 @@ def test_deviantart_publish_flow(conn, cfg, tmp_path, monkeypatch):
     assert drafts.count_sent(conn, "da_group", NOW - 1, target="da-adopts") == 1
 
 
-def test_deviantart_group_daily_limit(conn, cfg, tmp_path):
-    img = tmp_path / "m.png"
+def test_deviantart_group_daily_limit(conn, cfg, home):
+    img = home / "Downloads" / "m.png"
     img.write_bytes(b"x")
     cfg.posting.group_presets = {"a": [{"group": "da-adopts", "group_id": "g", "folder_id": "f", "folder_name": "x"}]}
     for _ in range(cfg.posting.da_submissions_per_group_per_day):

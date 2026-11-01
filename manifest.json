@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "mcp-devian",
   "display_name": "Адопты: DeviantArt и Toyhouse",
-  "version": "0.3.0",
-  "description": "Следит за группами DeviantArt и форумами Toyhouse, подсказывает цены и публикует по её «го».",
-  "long_description": "После установки просто напиши Claude «давай настроим помощника по адоптам» — он сам задаст вопросы. Ничего не публикует.",
+  "version": "0.4.0",
+  "description": "Помогает продавать адоптов на DeviantArt и Toyhouse: рынок, советы, учёт продаж, публикация по её «го».",
+  "long_description": "После установки просто напиши Claude «давай настроим помощника по адоптам» — он сам задаст вопросы. Публикует только после её «го» в чате.",
   "author": {
     "name": "Andrei Bugerov"
   },
@@ -36,159 +36,111 @@
   "tools": [
     {
       "name": "get_settings",
-      "description": "Настройки и вопросы для первой настройки"
+      "description": "Настройки, правила и вопросы первой настройки"
     },
     {
       "name": "update_settings",
-      "description": "Сохранить её ответы"
-    },
-    {
-      "name": "da_group_folders",
-      "description": "Папки группы DeviantArt"
-    },
-    {
-      "name": "add_da_folders",
-      "description": "Добавить папки групп в отслеживание"
-    },
-    {
-      "name": "remove_da_folders",
-      "description": "Убрать папки групп"
+      "description": "Сохранить её ответы и настройки"
     },
     {
       "name": "set_background_checks",
-      "description": "Фоновая проверка с уведомлениями"
-    },
-    {
-      "name": "bot_login",
-      "description": "Войти в аккаунт в окне бота"
-    },
-    {
-      "name": "check_now",
-      "description": "Проверить прямо сейчас"
-    },
-    {
-      "name": "check_status",
-      "description": "Итог проверки"
-    },
-    {
-      "name": "list_new_adopts",
-      "description": "Свежие лоты DeviantArt"
-    },
-    {
-      "name": "list_lf_threads",
-      "description": "Треды Toyhouse, где ищут персов"
-    },
-    {
-      "name": "list_sale_threads",
-      "description": "Треды Toyhouse с продажей"
-    },
-    {
-      "name": "pending_digest",
-      "description": "Что нового с прошлого раза"
+      "description": "Включить или выключить фоновую проверку"
     },
     {
       "name": "dismiss",
-      "description": "Скрыть находки"
-    },
-    {
-      "name": "sources_status",
-      "description": "Когда проверялся каждый источник"
-    },
-    {
-      "name": "read_thread",
-      "description": "Первый пост треда Toyhouse"
-    },
-    {
-      "name": "market_forecast",
-      "description": "Прогноз цены по похожим лотам"
-    },
-    {
-      "name": "my_works_overview",
-      "description": "Её работы и как они продаются"
-    },
-    {
-      "name": "leave_feedback",
-      "description": "Сохранить её отзыв"
-    },
-    {
-      "name": "feedback_report",
-      "description": "Отзывы одним текстом для отправки"
-    },
-    {
-      "name": "feedback_sent",
-      "description": "Отметить отзывы отправленными"
-    },
-    {
-      "name": "da_connect",
-      "description": "Подключить DeviantArt (кнопка «Разрешить»)"
-    },
-    {
-      "name": "da_status",
-      "description": "Подключён ли DeviantArt"
-    },
-    {
-      "name": "add_group_to_preset",
-      "description": "Добавить группу в набор"
-    },
-    {
-      "name": "remove_group_from_preset",
-      "description": "Убрать группу из набора"
-    },
-    {
-      "name": "recent_images",
-      "description": "Последние картинки для публикации"
+      "description": "Скрыть находку"
     },
     {
       "name": "prepare_deviantart_publish",
-      "description": "Черновик публикации на DeviantArt"
+      "description": "Черновик публикации работы или партии на DeviantArt"
     },
     {
-      "name": "set_reply_template",
-      "description": "Её шаблон отклика"
-    },
-    {
-      "name": "add_character",
-      "description": "Добавить перса на продажу"
-    },
-    {
-      "name": "remove_character",
-      "description": "Убрать перса"
-    },
-    {
-      "name": "suggest_replies",
-      "description": "LF-треды под её персов"
+      "name": "schedule_draft",
+      "description": "Её «го» со временем: черновик уйдёт сам"
     },
     {
       "name": "prepare_toyhouse_reply",
-      "description": "Черновик отклика на Toyhouse"
-    },
-    {
-      "name": "inspect_reply_form",
-      "description": "Посмотреть форму ответа в треде"
+      "description": "Черновик отклика в тред Toyhouse"
     },
     {
       "name": "submit_draft",
       "description": "Отправить черновик после её «го»"
     },
     {
-      "name": "draft_status",
-      "description": "Статус отправки"
+      "name": "accounts",
+      "description": "Вход в Toyhouse и подключение DeviantArt"
     },
     {
-      "name": "cancel_draft",
-      "description": "Отменить черновик"
+      "name": "check",
+      "description": "Проверить DeviantArt и Toyhouse сейчас"
     },
     {
-      "name": "list_drafts",
-      "description": "Открытые черновики"
+      "name": "findings",
+      "description": "Находки: LF-треды под её персов, лоты, дайджест"
     },
     {
-      "name": "my_auctions",
-      "description": "Её аукционы: ставки и максимум"
+      "name": "th_thread",
+      "description": "Прочитать тред Toyhouse"
     },
     {
-      "name": "auction_status",
-      "description": "Ставки на аукционе по ссылке"
+      "name": "market",
+      "description": "Рынок: цены похожих лотов, поиск, группы, спрос Toyhouse"
+    },
+    {
+      "name": "forecast",
+      "description": "Прогноз: что рисовать, какой старт, когда выкладывать"
+    },
+    {
+      "name": "advice",
+      "description": "Советы: заработать больше, разбор недели, план адопта"
+    },
+    {
+      "name": "feedback",
+      "description": "Её отзыв о помощнике"
+    },
+    {
+      "name": "da_auctions",
+      "description": "Ставки и сроки её аукционов DeviantArt"
+    },
+    {
+      "name": "da_groups",
+      "description": "Группы и папки DeviantArt, её наборы групп"
+    },
+    {
+      "name": "images",
+      "description": "Последние картинки и защищённое превью"
+    },
+    {
+      "name": "prepare_gallery",
+      "description": "Черновик: закрыть аукционы, папки, переименовать работы"
+    },
+    {
+      "name": "drafts",
+      "description": "Черновики: список, статус, отмена"
+    },
+    {
+      "name": "set_template",
+      "description": "Сохранить её шаблон слово в слово"
+    },
+    {
+      "name": "characters",
+      "description": "Её персы на продажу"
+    },
+    {
+      "name": "th_auctions",
+      "description": "Ставки в аукционах-тредах Toyhouse"
+    },
+    {
+      "name": "th_character",
+      "description": "Её персы на Toyhouse: создать, передать, статус, папка"
+    },
+    {
+      "name": "sales",
+      "description": "Её продажи, доход, оплата, выгрузка"
+    },
+    {
+      "name": "pinglist",
+      "description": "Её пинглист и пинги под новой работой"
     }
   ],
   "tools_generated": true,
@@ -202,7 +154,8 @@
     "deviantart",
     "toyhouse",
     "adopts",
-    "monitoring"
+    "monitoring",
+    "sales"
   ],
   "license": "MIT"
 }

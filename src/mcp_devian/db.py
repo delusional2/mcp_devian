@@ -89,7 +89,111 @@ CREATE TABLE IF NOT EXISTS auctions (
     updated_ts REAL NOT NULL,
     extra TEXT
 );
+
+-- Её продажи: от «выиграл/купил» до «оплачено» и «перс передан». Основа для дохода и советов.
+CREATE TABLE IF NOT EXISTS sales (
+    id TEXT PRIMARY KEY,
+    item_id TEXT,                  -- da:<id> или th:<id>, если продажа связана с лотом/тредом
+    platform TEXT NOT NULL,        -- deviantart | toyhouse | other
+    title TEXT NOT NULL,
+    character_url TEXT,
+    buyer TEXT,
+    amount REAL,
+    currency TEXT,                 -- usd | points | eur | gbp
+    format TEXT,                   -- auction | flatsale | ota | bta | raffle | other
+    status TEXT NOT NULL,          -- won | paid | transferred | done | cancelled
+    created_ts REAL NOT NULL,
+    paid_ts REAL,
+    done_ts REAL,
+    source TEXT,                   -- auto (из ставок) | manual
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS sales_status ON sales(status, created_ts);
+
+-- Сигналы спроса: просмотры, фавы, комментарии (из API DeviantArt), снимки во времени.
+CREATE TABLE IF NOT EXISTS deviation_stats (
+    deviation_id TEXT NOT NULL,    -- da:<id>
+    ts REAL NOT NULL,
+    views INTEGER,
+    favourites INTEGER,
+    comments INTEGER,
+    PRIMARY KEY (deviation_id, ts)
+);
+
+-- Размер чужих продавцов по API (watchers): уровень продавца не по тому, сколько его лотов мы случайно видели.
+CREATE TABLE IF NOT EXISTS author_stats (
+    author TEXT PRIMARY KEY,       -- ник в нижнем регистре
+    watchers INTEGER,
+    deviations INTEGER,
+    ts REAL
+);
+
+-- Карточка группы DA по рынку (не по её продажам): размер папки, лотов в день, доля её ниши, цены.
+CREATE TABLE IF NOT EXISTS group_scores (
+    grp TEXT,
+    folder TEXT,
+    size INTEGER,
+    lots_per_day REAL,
+    niche_share REAL,
+    median_sb REAL,
+    unit TEXT,
+    bid_share REAL,
+    n INTEGER,                     -- лотов на странице ленты
+    ts REAL,
+    known INTEGER,                 -- из них с известным итогом: по ним доля со ставками
+    sb_n INTEGER,                  -- по скольким стартам медиана
+    PRIMARY KEY (grp, folder)
+);
+
+-- Папки групп со страницы группы: номер из ссылки → UUID для API и размер.
+CREATE TABLE IF NOT EXISTS da_folders (
+    grp TEXT NOT NULL,             -- в нижнем регистре
+    folder_id TEXT NOT NULL,       -- номер из ссылки …/gallery/26780440
+    uuid TEXT,                     -- gallectionUuid = folderid в API
+    name TEXT,
+    size INTEGER,
+    ts REAL NOT NULL,
+    PRIMARY KEY (grp, folder_id)
+);
 """
+
+# Бережный доступ к DeviantArt (da_access): отдельной строкой — da_access открывает её и без остальной схемы.
+DA_ACCESS_SCHEMA = """
+-- Бережный доступ к DeviantArt (da_access): общий бюджет запросов и общая пауза после 403/429.
+CREATE TABLE IF NOT EXISTS da_budget (
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,            -- rss (ленты и страницы сайта) | api (официальный API)
+    cost REAL NOT NULL DEFAULT 1,  -- 304 «не изменилось» дешевле
+    purpose TEXT                   -- кто потратил: ленты, ставки, рынок, …
+);
+CREATE INDEX IF NOT EXISTS da_budget_kind_ts ON da_budget(kind, ts);
+
+CREATE TABLE IF NOT EXISTS da_cooldown (
+    kind TEXT PRIMARY KEY,
+    until_ts REAL NOT NULL,        -- до какого времени этот класс адресов не трогаем
+    level INTEGER NOT NULL DEFAULT 0,  -- сколько раз подряд DeviantArt просил притормозить
+    since_ts REAL NOT NULL,        -- когда просил в последний раз
+    status INTEGER,                -- 403 | 429
+    notified_since REAL            -- про эту паузу уже сказали уведомлением
+);
+
+-- Ленты: когда читали (очередь по кругу) и ETag/Last-Modified для условного GET.
+CREATE TABLE IF NOT EXISTS da_feeds (
+    key TEXT PRIMARY KEY,          -- запрос ленты: gallery:группа/папка или gallery:ник
+    etag TEXT,
+    last_modified TEXT,
+    last_read_ts REAL,
+    via TEXT,                      -- rss | api
+    uuid TEXT,                     -- папка в API (если читали через API)
+    deep_ts REAL,                  -- когда листали глубже первой страницы (закрытия за 3 дня)
+    api_miss_ts REAL,              -- UUID папки не нашёлся в API: с тех пор читаем через RSS
+    order_miss_ts REAL             -- выдача API не «сначала новые»: с тех пор читаем через RSS
+);
+"""
+SCHEMA += DA_ACCESS_SCHEMA
+
+# Метка места для лотов, найденных только поиском (RSS или теги API), а не в папке/галерее.
+SEARCH_PLACE_PREFIX = "поиск DA"
 
 # Колонки, добавленные после первой версии схемы.
 MIGRATIONS = [
@@ -97,6 +201,11 @@ MIGRATIONS = [
     ("runs", "fail_count", "INTEGER DEFAULT 0"),
     ("items", "own", "INTEGER DEFAULT 0"),
     ("items", "closed_ts", "REAL"),
+    ("group_scores", "known", "INTEGER"),
+    ("group_scores", "sb_n", "INTEGER"),
+    ("da_feeds", "deep_ts", "REAL"),
+    ("da_feeds", "api_miss_ts", "REAL"),
+    ("da_feeds", "order_miss_ts", "REAL"),
 ]
 
 
@@ -128,7 +237,48 @@ class Item:
 
 
 ITEM_COLUMNS = [f for f in Item.__dataclass_fields__ if f != "extra"]
-KEEP_EXTRA = ("uuid",)
+# Поля extra, которые досчитали мы сами (API, поиск): повторное чтение ленты их не стирает.
+# desc_ts — когда описание дочитали метаданными API: иначе после чтения через RSS его снова запрашивали бы.
+KEEP_EXTRA = ("uuid", "api_tags", "via", "places", "desc_ts")
+# Списки, которые копятся из разных источников: при обновлении — объединение.
+UNION_EXTRA = ("via", "places", "api_tags", "folder_links")
+
+
+def _union(old, new) -> list:
+    out: list = []
+    for v in [*(old if isinstance(old, list) else []), *(new if isinstance(new, list) else [])]:
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def _merge_extra(old: dict, new: dict) -> dict:
+    """Новые данные ленты + то, что мы досчитали раньше. via/places — объединение, как множества."""
+    merged = dict(new)
+    for key in KEEP_EXTRA:
+        if key not in old:
+            continue
+        if key in ("via", "places"):
+            merged[key] = sorted(set(_union(old.get(key), new.get(key))))
+        elif key == "api_tags":
+            merged[key] = _union(old.get(key), new.get(key))
+        elif not merged.get(key):
+            merged[key] = old[key]
+    return merged
+
+
+def is_search_place(place: str | None) -> bool:
+    return bool(place) and str(place).startswith(SEARCH_PLACE_PREFIX)
+
+
+def _keep_place(old: str | None, new: str | None) -> str | None:
+    """Место лота не перескакивает на последнюю прочитанную ленту: первое остаётся.
+    Исключение — место «поиск DA»: настоящая папка/галерея важнее и заменяет его."""
+    if not old:
+        return new
+    if is_search_place(old) and new and not is_search_place(new):
+        return new
+    return old
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
@@ -142,8 +292,33 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    _unique_sale_per_item(conn)
     conn.commit()
     return conn
+
+
+def _unique_sale_per_item(conn: sqlite3.Connection) -> None:
+    """Одна продажа на лот: иначе один аукцион считался бы в доходе дважды.
+
+    В старых базах дубль уже мог появиться (две проверки записали победителя одновременно).
+    Из дублей оставляем самую продвинутую запись (не отменённая, с оплатой), при равенстве — раннюю."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'sales_item'").fetchone():
+        return
+    rows = conn.execute(
+        "SELECT rowid, item_id FROM sales WHERE item_id IN "
+        "(SELECT item_id FROM sales WHERE item_id IS NOT NULL GROUP BY item_id HAVING COUNT(*) > 1) "
+        "ORDER BY item_id, status = 'cancelled', paid_ts IS NULL, created_ts, rowid").fetchall()
+    keep: set[str] = set()
+    drop = []
+    for r in rows:
+        if r["item_id"] in keep:
+            drop.append((r["rowid"],))
+        else:
+            keep.add(r["item_id"])
+    conn.executemany("DELETE FROM sales WHERE rowid = ?", drop)
+    # Если между чисткой и индексом другой процесс успел дописать дубль — попробуем при следующем открытии.
+    with contextlib.suppress(sqlite3.IntegrityError):
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS sales_item ON sales(item_id) WHERE item_id IS NOT NULL")
 
 
 @contextmanager
@@ -163,13 +338,15 @@ def upsert_item(conn: sqlite3.Connection, item: Item, now: float | None = None) 
     data = asdict(item)
     extra = json.dumps(data.pop("extra"), ensure_ascii=False)
     closed = now if item.status == "closed" else None
-    old = conn.execute("SELECT status, closed_ts, extra FROM items WHERE id = ?", (item.id,)).fetchone()
+    old = conn.execute("SELECT status, closed_ts, extra, place FROM items WHERE id = ?", (item.id,)).fetchone()
     if old:
-        # Служебные поля, которые мы досчитали сами (UUID работы), не теряем при повторном чтении ленты.
-        with contextlib.suppress(json.JSONDecodeError, TypeError):
-            kept = {k: v for k, v in json.loads(old["extra"] or "{}").items() if k in KEEP_EXTRA}
-            if kept:
-                extra = json.dumps({**json.loads(extra), **kept}, ensure_ascii=False)
+        # Служебные поля, которые мы досчитали сами (UUID, теги API, откуда видели), не теряем
+        # при повторном чтении ленты.
+        with contextlib.suppress(json.JSONDecodeError, TypeError, AttributeError):
+            old_extra = json.loads(old["extra"] or "{}")
+            if isinstance(old_extra, dict) and old_extra:
+                extra = json.dumps(_merge_extra(old_extra, json.loads(extra)), ensure_ascii=False)
+        data["place"] = _keep_place(old["place"], data["place"])
         # Момент закрытия нужен для прогноза «как быстро уходят похожие». Если лот снова открыли
         # (ON HOLD → OPEN), сбрасываем: следующее закрытие запишется заново.
         closed = (old["closed_ts"] or now) if item.status == "closed" else None
@@ -181,6 +358,40 @@ def upsert_item(conn: sqlite3.Connection, item: Item, now: float | None = None) 
     conn.execute(f"INSERT INTO items ({', '.join(cols)}) VALUES ({', '.join(':' + c for c in cols)})",
                  {**data, "extra": extra, "closed_ts": closed, "first_seen_ts": now, "updated_ts": now})
     return True
+
+
+def merge_extra(conn: sqlite3.Connection, item_id: str, patch: dict) -> bool:
+    """Дописать в extra лота: списки из UNION_EXTRA объединяются, остальное заменяется.
+    False — такого лота нет."""
+    row = conn.execute("SELECT extra FROM items WHERE id = ?", (item_id,)).fetchone()
+    if not row:
+        return False
+    try:
+        extra = json.loads(row["extra"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    for key, value in patch.items():
+        if key in UNION_EXTRA:
+            merged = _union(extra.get(key), value)
+            extra[key] = sorted(set(merged)) if key in ("via", "places") else merged
+        else:
+            extra[key] = value
+    conn.execute("UPDATE items SET extra = ? WHERE id = ?", (json.dumps(extra, ensure_ascii=False), item_id))
+    return True
+
+
+def save_folders(conn: sqlite3.Connection, group: str, folders, now: float | None = None) -> None:
+    """Запомнить папки группы (номер → UUID и размер) со страницы группы."""
+    now = now or time.time()
+    conn.executemany(
+        "INSERT INTO da_folders (grp, folder_id, uuid, name, size, ts) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(grp, folder_id) DO UPDATE SET uuid = COALESCE(excluded.uuid, da_folders.uuid), "
+        "name = excluded.name, size = COALESCE(excluded.size, da_folders.size), ts = excluded.ts",
+        [(group.lower(), str(f.folder_id), getattr(f, "uuid", None), f.name, getattr(f, "size", None), now)
+         for f in folders])
+    conn.commit()
 
 
 def relabel_own(conn: sqlite3.Connection, my_username: str) -> None:

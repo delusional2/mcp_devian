@@ -85,3 +85,80 @@ CHALLENGE_RU = """<html><head><title>Один момент…</title></head><bod
 
 # Обычная страница тоже тянет скрипт challenge-platform — это не проверка.
 NORMAL_WITH_CF_SCRIPT = BOARD.replace("</body>", '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></body>')
+
+
+# --- Лента DeviantArt как в ноябре 2026: <media:keywords> всегда пустые, длинные описания. ---
+
+def _live_item(num, title, author, pub, description_html):
+    from html import escape
+
+    return f"""
+<item>
+  <title>{escape(title)}</title>
+  <link>https://www.deviantart.com/{author}/art/Lot-{num}</link>
+  <guid isPermaLink="true">https://www.deviantart.com/{author}/art/Lot-{num}</guid>
+  <pubDate>{pub}</pubDate>
+  <media:title type="plain">{escape(title)}</media:title>
+  <media:keywords></media:keywords>
+  <media:rating>nonadult</media:rating>
+  <media:credit role="author" scheme="urn:ebu">{author}</media:credit>
+  <media:credit role="author" scheme="urn:ebu">https://a.deviantart.net/avatars/x/{author}.jpg</media:credit>
+  <media:description type="html">{escape(description_html)}</media:description>
+</item>"""
+
+
+LONG_TOS = "<p>" + " ".join(["Please read the TOS before bidding, payment within 24h via PayPal invoice."] * 9) + "</p>"
+
+RSS_LIVE = f"""<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+<title>DeviantArt: Dragon adoptable auction</title>
+<atom:link type="application/rss+xml" rel="self" href="https://backend.deviantart.com/rss.xml?type=deviation&amp;q=dragon+adoptable+auction" />
+<atom:link rel="next" href="https://backend.deviantart.com/rss.xml?type=deviation&amp;q=dragon+adoptable+auction&amp;offset=60" />
+{_live_item(1405000001, "[OPEN] Adoptable : Vesperia, The All-Seeing Oracle", "oracle-art", "Sun, 01 Nov 2026 01:00:00 PST",
+            "<p>✦ Owner : ✧ 𝑺𝑩 : 150$ ✧ 𝑩𝑰𝑫 : 10$ auction end in 24 hours after first bid</p>")}
+{_live_item(1405000002, "[OPEN] Adopt The Fawn Waitress", "fawn-art", "Sat, 31 Oct 2026 10:00:00 PDT",
+            "<p>serve you» SB: 25 MI: 5 AB: 280 UNLOCKABLE REWARDS Tier 1 (SB) - PNG quality, no watermark "
+            "Tier 2 (55$) - Alternate version half-body</p>")}
+{_live_item(1405000003, "Dragon adoptable auction (open)", "long-tos", "Fri, 30 Oct 2026 10:00:00 PDT",
+            LONG_TOS + "<p>Starting Bid (SB): $15</p><p>Min increase: $2</p>")}
+{_live_item(1405000004, "Moth dragon adopt AUCTION [OPEN]", "linker",
+            "Thu, 29 Oct 2026 10:00:00 PDT",
+            '<p>SB: $20 MI: $2. Also posted in '
+            '<a href="https://www.deviantart.com/da-adopts/gallery/26780440/auctions">da-adopts</a> and '
+            '<a href="https://www.deviantart.com/linker/gallery/99999/my-adopts">my folder</a></p>')}
+{_live_item(1405000005, "Wolf adopt auction [CLOSED]", "old-seller", "Wed, 01 Jan 2025 10:00:00 GMT",
+            "<p>SB: $20 MI: $1 AB: $90</p>")}
+</channel>
+</rss>
+"""
+
+# Что DeviantArt отдаёт на непонятый запрос (tag:, sort:, max_age:): общая лента популярного.
+RSS_POPULAR_FALLBACK = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+<title>DeviantArt: Popular</title>
+<atom:link type="application/rss+xml" rel="self" href="https://backend.deviantart.com/rss.xml?type=deviation" />
+<item>
+  <title>Happy Halloween!!!</title>
+  <link>https://www.deviantart.com/someone/art/Happy-Halloween-1258778045</link>
+  <pubDate>Sat, 31 Oct 2026 10:00:00 PDT</pubDate>
+  <media:keywords></media:keywords>
+  <media:credit role="author" scheme="urn:ebu">someone</media:credit>
+  <media:description type="html">&lt;p&gt;spooky&lt;/p&gt;</media:description>
+</item>
+</channel>
+</rss>
+"""
+
+# Кусок встроенного JSON страницы галереи группы (кавычки экранированы, как на сайте).
+GROUP_GALLERY_PAGE = (
+    '<a href="https://www.deviantart.com/da-adopts/gallery/26780440/auctions">Auctions</a>'
+    '<a href="https://www.deviantart.com/da-adopts/gallery/75027420/points-adopts">Points</a>'
+    '<a href="https://www.deviantart.com/da-adopts/gallery/11111111/journals">Journals</a>'
+    '<script>window.__INITIAL_STATE__ = JSON.parse("{\\"galleryFolder\\":{'
+    '\\"26780440\\":{\\"folderId\\":26780440,\\"gallectionUuid\\":\\"A4A80DA9-DEA9-2A1E-26EB-EB72E5F164BC\\",'
+    '\\"name\\":\\"Auctions\\",\\"size\\":9395,\\"hasSubfolders\\":false,\\"totalItemCount\\":9395},'
+    '\\"75027420\\":{\\"folderId\\":75027420,\\"gallectionUuid\\":\\"3A4D5D7D-5453-A50F-96E6-28835E0CBB68\\",'
+    '\\"name\\":\\"Points Adopts\\",\\"totalItemCount\\":4914}}}");</script>'
+)

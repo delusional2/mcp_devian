@@ -47,7 +47,8 @@ def test_forecast_by_keywords(market_db):
     assert fc.comparables == 8 and not fc.widened
     assert fc.auction_usd.median == 15 and fc.auction_usd.n == 8
     assert fc.position_for("auction") == 0.875  # дороже 7 из 8
-    assert fc.confidence == "средняя"
+    # 8 цен от $8 до $40: n<15 и интервал медианы шире половины медианы — по единой шкале вывода нет
+    assert fc.confidence == "нет вывода"
 
 
 def test_position_without_lot_type_is_per_group(market_db):
@@ -74,7 +75,7 @@ def test_widening_keeps_real_hits_and_is_honest(conn):
 
 def test_widen_without_lot_type_says_all_types(market_db):
     fc = market.forecast(market_db, ["kitsune"], None, now=NOW)
-    assert fc.widened and fc.comparables == 13 and fc.confidence == "низкая"
+    assert fc.widened and fc.comparables == 13 and fc.confidence == "нет вывода"
     assert "всех типов" in market.render(fc)
 
 
@@ -163,7 +164,7 @@ def test_confidence_from_price_bucket(conn):
     lot(conn, 50, "Fox auction a", "auction", usd=10)
     lot(conn, 51, "Fox auction b", "auction", usd=12)
     fc = market.forecast(conn, [], "auction", my_usd=11, now=NOW)
-    assert fc.confidence == "низкая"
+    assert fc.confidence == "нет вывода"
     assert "цен очень мало" in market.render(fc, "auction")
 
 
@@ -181,20 +182,25 @@ def test_other_currencies_reported(conn):
     lot(conn, 2, "Fox auction EU", "auction", price_text="SB €30")
     fc = market.forecast(conn, [], "auction", now=NOW)
     assert fc.auction_usd.n == 1 and fc.other_currency == 1
-    assert "1 лотов с ценой в €/£" in market.render(fc, "auction")
+    assert "1 лотов с ценой в другой валюте" in market.render(fc, "auction")
 
 
 def test_render_is_gentle_and_honest(market_db):
     text = market.render(market.forecast(market_db, ["dragon"], "auction", my_usd=30, now=NOW), "auction")
-    assert "не всегда «продан»" in text and "Уверенность: средняя" in text
+    assert "не всегда «продан»" in text and "Уверенность: нет вывода" in text
+    assert "середина $15 (n=8, " in text and "рынок DA, наблюдение" in text
     assert "обычно $" in text and "выше, чем у 88% похожих" in text
 
 
 def test_gentle_text_is_honest():
     # #33: бережно, но цифры не трогать, не хвалить невиденное, про высокую цену — прямо.
-    g = market.GENTLE
+    # Полный текст — один раз за разговор в get_settings; в ответе прогноза — короткая пометка.
+    from mcp_devian import mcp_server
+
+    g = mcp_server.NUMBERS_RULE
     assert "не округляй" in g and "картинку ты не видишь" in g and "скажи это прямо" in g
     assert "рынок такое берёт" not in g
+    assert len(market.GENTLE) < 120
 
 
 def test_my_works(market_db):
@@ -283,3 +289,72 @@ def test_my_works_show_bids(conn):
     auction(conn, 2, None, n_bids=0, ended=0)
     text = market.my_works(conn, now=NOW)
     assert "ставок 3, максимум $42 у kiwi" in text and "ставок пока нет" in text
+
+
+def test_closed_lot_read_only_while_open_is_not_a_final_price(conn):
+    # Прочитан 38 дней назад, пока был открыт ($12), потом закрылся — это не финальная цена.
+    lot(conn, 1, "Moth auction", "auction", usd=10, age_days=40, seen_at=NOW - 40 * DAY)
+    conn.execute("INSERT INTO auctions (deviation_id, owner, top_amount, currency, n_bids, bidders, ended, updated_ts) "
+                 "VALUES ('da:1', 'x', 12, 'usd', 2, 2, 0, ?)", (NOW - 38 * DAY,))
+    lot(conn, 1, "Moth auction", "auction", usd=10, status="closed", age_days=40, seen_at=NOW - 30 * DAY)
+    # Второй прочитан уже после закрытия — его максимум финальный.
+    lot(conn, 2, "Moth auction 2", "auction", usd=10, status="closed", age_days=40, seen_at=NOW - 30 * DAY)
+    conn.execute("INSERT INTO auctions (deviation_id, owner, top_amount, currency, n_bids, bidders, ended, updated_ts, "
+                 "extra) VALUES ('da:2', 'x', 30, 'usd', 3, 2, 0, ?, '{\"seen_status\": \"closed\"}')",
+                 (NOW - 29 * DAY,))
+    conn.commit()
+    fc = market.forecast(conn, [], "auction", now=NOW)
+    assert fc.bids.final["usd"].values == [30] and fc.bids.stale_closed == 1
+    assert fc.bids.current["usd"].n == 0
+    assert "Не перечитаны после закрытия (их ставки не считаю): 1" in market.render(fc, "auction")
+
+
+def test_one_seller_cannot_set_the_market(conn):
+    # Один продавец выложил 47 лотов по $3 — в цены идут только его 3 самых свежих.
+    for i in range(47):
+        item = Item(id=f"da:{i}", source="deviantart", title=f"Cheap adopt {i}", url=f"u{i}", lot_type="flatsale",
+                    status="open", price_usd=3, author="flood", published_ts=NOW - (5 + i % 20) * DAY)
+        db.upsert_item(conn, item, now=NOW - 5 * DAY)
+    for i, usd in enumerate([20, 22, 25, 28, 30, 35]):
+        lot(conn, 100 + i, f"Moth flatsale {i}", "flatsale", usd=usd)
+        conn.execute("UPDATE items SET author = ? WHERE id = ?", (f"s{i}", f"da:{100 + i}"))
+    conn.commit()
+    fc = market.forecast(conn, [], "flatsale", now=NOW)
+    s = fc.fixed_usd
+    assert s.n == 9 and s.capped == 44 and s.sellers == 7
+    clean = market.price_stats([20, 22, 25, 28, 30, 35])
+    assert abs(s.median - clean.median) <= abs(market.price_stats([20, 22, 25, 28, 30, 35, 3, 3, 3]).median
+                                                - clean.median)
+    text = market.render(fc, "flatsale")
+    assert "7 продавцов" in text and "отброшено 44" in text
+
+
+def test_multi_posts_and_search_lots_labelled(conn):
+    lot(conn, 1, "Batch of 5", "flatsale", usd=5)
+    conn.execute("UPDATE items SET extra = '{\"multi\": true}' WHERE id = 'da:1'")
+    lot(conn, 2, "Found adopt", "flatsale", usd=30)
+    conn.execute("UPDATE items SET place = 'поиск DA: moth' WHERE id = 'da:2'")
+    lot(conn, 3, "Normal adopt", "flatsale", usd=20)
+    conn.commit()
+    s = market.forecast(conn, [], "flatsale", now=NOW).fixed_usd
+    assert s.values == [20, 30] and s.multi == 1 and s.search == 1
+    text = market.render(market.forecast(conn, [], "flatsale", now=NOW), "flatsale")
+    assert "из поиска: 1" in text and "пачек" in text
+
+
+def test_autobuy_hits_excluded_from_ratio(conn):
+    for i, (top, hit) in enumerate([(30, 0), (30, 0), (200, 1)]):
+        lot(conn, i, f"Moth auction {i}", "auction", usd=10, status="closed")
+        auction(conn, i, top)
+        conn.execute("UPDATE auctions SET ab_hit = ? WHERE deviation_id = ?", (hit, f"da:{i}"))
+    conn.commit()
+    b = market.forecast(conn, [], "auction", now=NOW).bids
+    assert b.ratio["usd"] == pytest.approx(3.0) and b.ratio_n["usd"] == 2 and b.final["usd"].n == 3
+
+
+def test_old_narrow_search_does_not_claim_folders_are_empty(market_db):
+    # Мотыльков давно не выкладывали, но мониторинг свежий: это не «в папках ничего нового».
+    db.record_run(market_db, "deviantart", None, NOW)
+    text = market.render(market.forecast(market_db, ["moth"], None, now=NOW + 10 * DAY), None, now=NOW + 10 * DAY)
+    assert "новых лотов в отслеживаемых папках с тех пор не было" not in text
+    assert "новых похожих лотов нет с" in text and "forecast:health" in text

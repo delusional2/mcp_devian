@@ -1,12 +1,13 @@
 import argparse
 import hashlib
+import html
 import logging
 import random
 import sys
 import time
 import traceback
 
-from . import background, db, digest, jobs, monitor
+from . import background, da_access, da_market, db, digest, jobs, monitor
 from . import deviantart as da
 from . import toyhouse as th
 from .config import DATA_DIR, load_config, load_dotenv
@@ -16,8 +17,11 @@ CRASH_STATE = DATA_DIR / "last-crash.txt"
 MAX_LOG_BYTES = 1_000_000
 
 
-def _problems(before: dict, results: list[monitor.SourceResult], mode: str = "bot") -> list[str]:
-    """Сообщаем об ошибке один раз, а не каждые 15 минут. Подсказки — словами для чата, без терминала."""
+def _problems(before: dict, results: list[monitor.SourceResult], mode: str = "bot", conn=None) -> list[str]:
+    """Сообщаем об ошибке один раз, а не каждые 15 минут. Подсказки — словами для чата, без терминала.
+
+    Пауза DeviantArt (403/429) — тоже один раз на серию (da_access.claim_notice), а не на каждой проверке
+    и не на каждой ступени паузы; свой бюджет запросов уведомлением не сообщаем вовсе."""
     out = []
     for r in results:
         if r.error and r.error != before.get(r.source):
@@ -25,6 +29,8 @@ def _problems(before: dict, results: list[monitor.SourceResult], mode: str = "bo
             if r.needs_login and mode == "bot":
                 hint = " Попроси Claude: «открой окно бота для входа»."
             out.append(f"{r.source}: {r.error}.{hint}")
+        if r.limited and conn is not None and da_access.claim_notice(conn):
+            out.append(f"{r.source}: {r.limited}.")
     return out
 
 
@@ -87,14 +93,20 @@ def _check_job(args) -> int:
     try:
         cfg = load_config()
         sources = monitor.SOURCES if args.source == "all" else (args.source,)
-        with db.session() as conn:
+        # Весь проход — один счёт запросов к DeviantArt (da_access): чистый проход сбрасывает ступень паузы.
+        with db.session() as conn, da_access.session(conn):
             results = monitor.run_check(conn, cfg, sources=sources, force=True, interactive=True,
                                         manual_cooldown=True)
             lines = monitor.format_results(results)
-            if "deviantart" in sources:
+            if any(r.source == "deviantart" and not r.skipped for r in results):
                 bid_lines, events = monitor.refresh_auctions(conn, cfg)
                 lines += bid_lines
                 digest.notify_bids(cfg, events)
+                lines += monitor.seller_pass(conn, cfg, enrich=False)
+                lines += _market_sample(conn, cfg, None)
+            if _toyhouse_read(results):
+                # Она сама попросила проверку: в режиме chrome её аукционы-треды читаются только здесь.
+                lines += _th_auctions(conn, cfg, None, interactive=True)
         jobs.finish(args.job, lines)
         return 0
     except Exception as e:
@@ -108,7 +120,7 @@ def _check(args, tick: float | None) -> int:
     for w in cfg.warnings:
         print(f"настройки: {w}", file=sys.stderr)
     sources = monitor.SOURCES if args.source == "all" else (args.source,)
-    with db.session() as conn:
+    with db.session() as conn, da_access.session(conn):
         before = {s: (db.last_run(conn, s) or {"last_error": None})["last_error"] for s in monitor.SOURCES}
         results = monitor.run_check(conn, cfg, sources=sources, force=not args.scheduled, now=tick,
                                     interactive=not args.scheduled)
@@ -118,13 +130,81 @@ def _check(args, tick: float | None) -> int:
             for line in bid_lines:
                 print(line)
             digest.notify_bids(cfg, events)
+            for line in monitor.seller_pass(conn, cfg, tick, enrich=args.scheduled):
+                print(line)
+            for line in _market_sample(conn, cfg, tick):
+                print(line)
+        if cfg.toyhouse.mode == "bot" and _toyhouse_read(results):
+            # Её Chrome (режим chrome) в фоне не трогаем — только окно бота.
+            for line in _th_auctions(conn, cfg, tick, interactive=not args.scheduled):
+                print(line)
+        if args.scheduled:
+            # Время отправки — настоящее, не время слота: отправка партии идёт минутами.
+            _send_scheduled(conn, cfg, None)
+            try:
+                report = digest.deliver_weekly(conn, cfg, tick)
+            except Exception:  # noqa: BLE001 — отчёт не должен мешать дайджесту
+                traceback.print_exc()
+                report = None
+            if report:
+                print(f"отчёт недели → {report}")
         if args.notify or args.scheduled:
-            sent = digest.deliver(conn, cfg, _problems(before, results, cfg.toyhouse.mode))
+            sent = digest.deliver(conn, cfg, _problems(before, results, cfg.toyhouse.mode, conn))
             if sent["items"]:
                 print(f"дайджест: {sent['items']} шт. → {sent['file']}")
             if sent["telegram_error"]:
                 print(f"telegram: {sent['telegram_error']}")
     return 0
+
+
+def _market_sample(conn, cfg, tick: float | None) -> list[str]:
+    """Раз в 6 часов: чужие лоты её ниши поиском DA (только данные рынка). Ошибка не мешает проверке."""
+    try:
+        return da_market.maybe_sample(conn, cfg, tick)
+    except Exception:  # noqa: BLE001 — maybe_sample и так не бросает; на всякий случай
+        traceback.print_exc()
+        return []
+
+
+def _toyhouse_read(results: list[monitor.SourceResult]) -> bool:
+    """Toyhouse только что прочитался без проверки Cloudflare и ошибок — можно дочитать аукционы."""
+    return any(r.source == "toyhouse" and not r.skipped and not r.error and not r.needs_login for r in results)
+
+
+def _th_auctions(conn, cfg, tick: float | None, interactive: bool) -> list[str]:
+    """Её аукционы-треды Toyhouse: перечитать и уведомить о новых ставках. Ошибка не мешает проверке."""
+    try:
+        lines, events = monitor.refresh_th_auctions(conn, cfg, tick, interactive=interactive)
+        digest.notify_bids(cfg, events)
+        return lines
+    except Exception:  # noqa: BLE001 — refresh_th_auctions и так не бросает; на всякий случай
+        traceback.print_exc()
+        return []
+
+
+def _send_scheduled(conn, cfg, now: float | None) -> None:
+    """Запланированные ею публикации, чьё время пришло. Итог — уведомлением."""
+    from . import posting
+
+    try:
+        results = posting.send_due(conn, cfg, now)
+    except Exception as e:  # noqa: BLE001 — отправка не должна ронять проверку
+        traceback.print_exc()
+        results = [{"draft_id": "?", "status": "failed", "result": f"{type(e).__name__}: {e}"}]
+    told = []
+    for r in results:
+        print(f"публикация {r['draft_id']}: {r['status']} — {r['result']}")
+        if r["status"] == "scheduled":
+            continue  # другая отправка была занята — повторим на следующей проверке сами, без уведомления
+        told.append(f"{r['draft_id']}: {r['result']}")
+        if cfg.notify.macos:
+            digest.notify_macos("Публикация на DeviantArt", f"{r['result']}"[:200])
+    if told and cfg.notify.telegram:
+        # Не только мак: «исход неизвестен» или отказ по расписанию она должна увидеть и в Telegram.
+        err = digest.send_telegram(["\n".join(["Публикация на DeviantArt по расписанию",
+                                                *(html.escape(t) for t in told)])])
+        if err:
+            print(f"telegram: {err}")
 
 
 def cmd_digest(args) -> int:
@@ -175,7 +255,8 @@ def cmd_da_folders(args) -> int:
         print("Папок не нашлось. Проверь имя группы.")
         return 1
     for f in folders:
-        print(f"{f.name or '—':32} {f.url}")
+        size = f" — {f.size} работ" if f.size is not None else ""
+        print(f"{f.name or '—':32} {f.url}{size}")
     print("\nДобавить папки проще всего в чате с Claude: «добавь папки auctions и points adopts».")
     return 0
 
@@ -219,7 +300,7 @@ def cmd_send_draft(args) -> int:
 
     cfg = load_config()
     with db.session() as conn:
-        print(posting.send(conn, cfg, args.draft_id))
+        print(posting.send_any(conn, cfg, args.draft_id))
     return 0
 
 
@@ -242,6 +323,8 @@ def cmd_serve(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
+    # Любой запрос к DeviantArt из этого процесса — в общем бюджете и с общей паузой (da_access).
+    da_access.enable_default()
     # Логи только в stderr: stdout у MCP-сервера занят протоколом.
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
     p = argparse.ArgumentParser(prog="mcp-devian", description="Мониторинг адоптов на DeviantArt и Toyhouse")

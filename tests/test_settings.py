@@ -121,3 +121,50 @@ def test_da_connect_without_client_id_explains_steps(monkeypatch):
     monkeypatch.setattr(posting, "SENDING_ENABLED", True)
     out = mcp_server.da_connect()
     assert "developers/register" in out and "http://localhost:8765/callback" in out and "client_secret НЕ нужен" in out
+
+
+def test_settings_carry_posting_rule_and_drafts_are_labelled():
+    assert "только по её явному «го»" in mcp_server.get_settings()
+    assert mcp_server.list_drafts() == "Открытых черновиков нет."
+
+
+def test_max_pages_per_board_parse_and_bounds():
+    cfg = Config()
+    assert cfg.toyhouse.max_pages_per_board == 6
+    apply_changes(cfg, {"max_pages_per_board": "8"})
+    assert cfg.toyhouse.max_pages_per_board == 8
+    for bad in (0, 1, 21, "много", 2.5, True):
+        with pytest.raises(SettingsError):
+            apply_changes(Config(), {"max_pages_per_board": bad})  # 1 < pages_per_board (2)
+    cfg = Config()
+    apply_changes(cfg, {"pages_per_board": 9})
+    assert cfg.toyhouse.max_pages_per_board == 9
+
+
+def test_board_as_id_slug(tmp_path):
+    cfg = Config()
+    apply_changes(cfg, {"toyhouse_boards": [13, "5866.Design-Marketplace", "777", "https://toyhou.se/~forums/12.worlds"]})
+    assert cfg.toyhouse.boards == [13, "5866.design-marketplace", 777, "12.worlds"]
+    with pytest.raises(SettingsError):
+        apply_changes(Config(), {"toyhouse_boards": ["adoption center"]})
+    path = tmp_path / "s.json"
+    save_config(cfg, path)
+    loaded = load_config(path)
+    assert loaded.toyhouse.boards == cfg.toyhouse.boards and not loaded.warnings
+
+
+def test_same_board_twice_is_read_once(tmp_path):
+    cfg = Config()
+    apply_changes(cfg, {"toyhouse_boards": [13, "13.adoption-center", 5866, "5866"]})
+    assert cfg.toyhouse.boards == ["13.adoption-center", 5866]
+    path = tmp_path / "s.json"
+    path.write_text('{"toyhouse": {"boards": ["13.adoption-center", 13]}}')
+    assert load_config(path).toyhouse.boards == ["13.adoption-center"]
+
+
+def test_broken_paging_values_fall_back(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text('{"toyhouse": {"boards": [13, "nope"], "pages_per_board": 3, "max_pages_per_board": "x"}}')
+    cfg = load_config(path)
+    assert cfg.toyhouse.boards == [13] and cfg.toyhouse.pages_per_board == 3
+    assert cfg.toyhouse.max_pages_per_board == 6 and len(cfg.warnings) == 2

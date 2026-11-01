@@ -5,7 +5,7 @@ import logging
 import os
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 
@@ -15,6 +15,8 @@ from .config import DATA_DIR, Config
 log = logging.getLogger(__name__)
 
 DIGEST_FILE = DATA_DIR / "digest-latest.md"
+WEEKLY_FILE = DATA_DIR / "weekly-report.md"
+WEEKLY_SOURCE = "weekly_report"
 
 
 def ago(ts: float | None, now: float | None = None) -> str:
@@ -128,17 +130,26 @@ def send_telegram(chunks: list[str]) -> str | None:
     return None
 
 
-def notify_bids(cfg: Config, events: list) -> None:
-    """Новые ставки на её аукционах — отдельным уведомлением, это важнее дайджеста."""
+def notify_bids(cfg: Config, events: list) -> str | None:
+    """Новые ставки на её аукционах — отдельным уведомлением, это важнее дайджеста.
+    Возвращает ошибку Telegram (или None)."""
+    from . import th_auctions as ta
     from .auctions import describe_event
 
     if not events:
-        return
-    lines = [describe_event(e) for e in events[:5]]
+        return None
+    lines = [ta.describe_event(e) if isinstance(e, ta.ThBidEvent) else describe_event(e) for e in events[:5]]
+    more = f"и ещё {len(events) - 5}" if len(events) > 5 else ""
+    title = "Новая ставка" if len(events) == 1 else f"Новых ставок: {len(events)}"
     if cfg.notify.macos:
-        notify_macos("Ставки", "; ".join(lines)[:220])
+        notify_macos(title, "; ".join(lines + ([more] if more else []))[:220])
     if cfg.notify.telegram:
-        send_telegram(["\n".join(html.escape(line) for line in lines)])
+        text = "\n".join([html.escape(title), *(html.escape(line) for line in lines), *([more] if more else [])])
+        err = send_telegram([text])
+        if err:
+            log.warning("bid notification to telegram failed: %s", err)
+        return err
+    return None
 
 
 def deliver(conn, cfg: Config, problems: list[str] | None = None) -> dict:
@@ -177,3 +188,95 @@ def deliver(conn, cfg: Config, problems: list[str] | None = None) -> dict:
         if cfg.notify.telegram and not p.startswith("telegram:"):
             send_telegram([html.escape(p)])
     return result
+
+
+# Если Mac проспал её час, отчёт уходит при первой проверке после него, но не позже чем через 3 дня:
+# разбор прошлой недели в среду уже не нужен, лучше дождаться следующего.
+WEEKLY_CATCH_UP_S = 3 * 86400
+
+
+def weekly_slot(cfg: Config, now: float) -> float | None:
+    """Последний её «день и час отчёта» (в её поясе) не позже now. None, если настройки негодные."""
+    from zoneinfo import ZoneInfo
+
+    from .config import valid_timezone
+
+    weekday, hour = cfg.notify.weekly_report_weekday, cfg.notify.weekly_report_hour
+    if not valid_timezone(cfg.posting.timezone) or not isinstance(weekday, int) or not isinstance(hour, int) \
+            or not 0 <= weekday <= 6 or not 0 <= hour <= 23:
+        log.warning("weekly report: bad timezone/weekday/hour in settings, skipping")
+        return None
+    local = datetime.fromtimestamp(now, ZoneInfo(cfg.posting.timezone))
+    slot = local.replace(hour=hour, minute=0, second=0, microsecond=0) - timedelta(days=(local.weekday() - weekday) % 7)
+    if slot > local:
+        slot -= timedelta(days=7)
+    return slot.timestamp()
+
+
+def weekly_due(conn, cfg: Config, now: float | None = None) -> bool:
+    """Пора ли отчёт недели: её день и час (в её поясе) прошли недавно, а после них ещё не отправляли."""
+    if not cfg.notify.weekly_report:
+        return False
+    now = now or time.time()
+    slot = weekly_slot(cfg, now)
+    if slot is None or now - slot > WEEKLY_CATCH_UP_S:
+        return False
+    last = db.last_run(conn, WEEKLY_SOURCE)
+    return not (last and last["last_ok_ts"] and last["last_ok_ts"] >= slot)
+
+
+TELEGRAM_LIMIT = 3900
+
+
+def _telegram_text(text: str) -> str:
+    """Режем исходный текст, а не экранированный: иначе обрубок «&am» ломает HTML-разметку."""
+    if len(html.escape(text)) <= TELEGRAM_LIMIT:
+        return html.escape(text)
+    cut = text[:TELEGRAM_LIMIT - 1]
+    while len(html.escape(cut)) > TELEGRAM_LIMIT - 1:
+        cut = cut[:-50]
+    return html.escape(cut) + "…"
+
+
+def freshness_note(conn, now: float | None = None) -> str | None:
+    """Строка «данные старые: по 12.10», если ленты DA/Toyhouse не обновлялись дольше evidence.STALE_DAYS."""
+    from . import evidence
+
+    now = now or time.time()
+    old = []
+    for source, label in (("deviantart", "DeviantArt"), ("toyhouse", "Toyhouse")):
+        row = db.last_run(conn, source)
+        if not row or not row["last_run_ts"]:
+            continue   # источник не настроен — не пугаем
+        ok = row["last_ok_ts"] or 0
+        ev = evidence.Evidence(0, None, 0, ok, ok, "market_da", label, None, "observed")
+        msg = evidence.stale(ev, now) if ok else "данных нет: удачных проверок не было"
+        if msg:
+            old.append(f"{label} — {msg}")
+    return ("Внимание: " + "; ".join(old) + ". Цифры ниже могут не учитывать последние дни.") if old else None
+
+
+def deliver_weekly(conn, cfg: Config, now: float | None = None) -> str | None:
+    """Отчёт недели в файл и уведомлением. Возвращает путь к файлу или None, если не время
+    (или отчёт не собрался — тогда ошибка в логе и попытка на следующей проверке)."""
+    from . import advisor
+
+    if not weekly_due(conn, cfg, now):
+        return None
+    try:
+        text = advisor.weekly_report(conn, cfg, now, tz=cfg.posting.timezone)  # строка «данные старые» — внутри
+        WEEKLY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WEEKLY_FILE.write_text(text, encoding="utf-8")
+    except Exception as e:  # отчёт — дополнение: его поломка не должна ронять проверку ставок и лотов
+        log.exception("weekly report failed")
+        db.record_run(conn, WEEKLY_SOURCE, f"{type(e).__name__}: {e}"[:300], now)
+        return None
+    if cfg.notify.macos:
+        notify_macos("Неделя продаж", "Отчёт готов. Спроси у Claude: «как прошла неделя?»")
+    if cfg.notify.telegram:
+        # Файл уже записан, поэтому отчёт считаем отправленным; ошибку Telegram не глотаем молча.
+        err = send_telegram([_telegram_text(text)])
+        if err:
+            log.warning("weekly report to telegram failed: %s", err)
+    db.record_run(conn, WEEKLY_SOURCE, None, now)
+    return str(WEEKLY_FILE)

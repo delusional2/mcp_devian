@@ -69,7 +69,7 @@ def test_authorize_url_params():
     q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
     assert url.startswith("https://www.deviantart.com/oauth2/authorize?")
     assert q == {"response_type": "code", "client_id": "CID", "redirect_uri": "http://localhost:8765/callback",
-                 "scope": "basic browse stash publish", "state": "ST", "code_challenge": "CH",
+                 "scope": "basic user browse stash publish gallery comment.post", "state": "ST", "code_challenge": "CH",
                  "code_challenge_method": "S256"}
 
 
@@ -120,13 +120,91 @@ def test_oauth_flow_end_to_end(store):
     assert "client_secret" not in sent and len(sent["code_verifier"][0]) >= 43
     saved = store.load()
     assert saved["refresh_token"] == "RT1" and saved["username"] == "MothArt"
+    wait_for(lambda: pages)
     assert "можно закрыть вкладку" in pages[0]
 
 
-def test_oauth_state_mismatch_rejected(store):
+def wait_for(cond, timeout=3.0):
+    """Поддельный браузер дописывает страницу в своём потоке — ждём его."""
+    deadline = time.time() + timeout
+    while not cond() and time.time() < deadline:
+        time.sleep(0.02)
+
+
+def test_oauth_wrong_state_ignored_then_real_callback_works(store):
+    """Чужой запрос со state=WRONG не обрывает вход: ждём настоящий ответ (#55)."""
     http = httpx.Client(transport=httpx.MockTransport(Router(oauth_routes([]))))
-    opener, pages = browser_that(lambda q: "code=CODE&state=WRONG")
-    with pytest.raises(DAApiError, match="state"):
+    pages = []
+
+    def opener(url):
+        q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        base = q["redirect_uri"].replace("localhost", "127.0.0.1")
+        for params in ("code=EVIL&state=WRONG", f"code=CODE&state={q['state']}"):
+            with urllib.request.urlopen(f"{base}?{params}", timeout=5) as resp:
+                pages.append(resp.read().decode())
+
+    result = da_api.run_oauth_flow("CID", store, port=free_port(), timeout_s=10, opener=opener, http=http)
+    assert result == {"username": "MothArt"} and store.load()["refresh_token"] == "RT1"
+    wait_for(lambda: len(pages) == 2)
+    assert "не тот ответ" in pages[0]
+
+
+def test_oauth_idle_connection_does_not_hang(store):
+    """Браузер открыл соединение и молчит: вход всё равно дожидается ответа и завершается (#12)."""
+    http = httpx.Client(transport=httpx.MockTransport(Router(oauth_routes([]))))
+    port = free_port()
+    idle = []
+
+    def opener(url):
+        q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        idle.append(socket.create_connection(("127.0.0.1", port)))  # молчащее «запасное» соединение
+        time.sleep(0.2)
+        base = q["redirect_uri"].replace("localhost", "127.0.0.1")
+        with urllib.request.urlopen(f"{base}?code=CODE&state={q['state']}", timeout=15):
+            pass
+
+    t0 = time.time()
+    result = da_api.run_oauth_flow("CID", store, port=port, timeout_s=20, opener=opener, http=http)
+    assert result == {"username": "MothArt"} and time.time() - t0 < 8
+    for sock in idle:
+        sock.close()
+
+
+def test_oauth_deadline_honoured_with_idle_connection(store):
+    http = httpx.Client(transport=httpx.MockTransport(Router({})))
+    port = free_port()
+    idle = []
+    opener = lambda url: idle.append(socket.create_connection(("127.0.0.1", port)))  # noqa: E731
+    t0 = time.time()
+    with pytest.raises(DAApiError, match="время вышло"):
+        da_api.run_oauth_flow("CID", store, port=port, timeout_s=1, opener=opener, http=http)
+    assert time.time() - t0 < 6  # не дольше таймаута соединения (2 с) + запас
+    for sock in idle:
+        sock.close()
+    # Порт освобождён: повторный вход (сервер тоже ставит SO_REUSEADDR) может слушать его сразу.
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen()
+
+
+def test_oauth_whoami_failure_is_not_fatal(store):
+    """whoami не ответил (не про права) — подключение всё равно сохранено, имя неизвестно (#9)."""
+    routes = oauth_routes([])
+    routes[("GET", "/api/v1/oauth2/user/whoami")] = lambda r: httpx.Response(500)
+    http = httpx.Client(transport=httpx.MockTransport(Router(routes)))
+    opener, _ = browser_that(lambda q: f"code=CODE&state={q['state']}")
+    result = da_api.run_oauth_flow("CID", store, port=free_port(), timeout_s=10, opener=opener, http=http)
+    assert result == {"username": ""} and store.load()["refresh_token"] == "RT1"
+
+
+def test_oauth_missing_scope_clears_token(store):
+    routes = oauth_routes([])
+    routes[("GET", "/api/v1/oauth2/user/whoami")] = lambda r: httpx.Response(
+        403, json={"error": "insufficient_scope", "error_description": "scope user required"})
+    http = httpx.Client(transport=httpx.MockTransport(Router(routes)))
+    opener, _ = browser_that(lambda q: f"code=CODE&state={q['state']}")
+    with pytest.raises(NotConnected, match="Разрешить"):
         da_api.run_oauth_flow("CID", store, port=free_port(), timeout_s=10, opener=opener, http=http)
     assert store.load() is None
 
@@ -223,20 +301,14 @@ def test_headers(store):
     assert "gzip" in h["Accept-Encoding"] and h["Authorization"] == "Bearer AT"
 
 
-def test_429_backoff_then_rate_limited(store):
+def test_429_raises_immediately(store):
+    """После 429 не долбим DeviantArt повторами: сразу наверх, вызывающий прекращает проход (#18)."""
     connected(store)
     sleeps = []
     c, router = client(store, {("GET", "/api/v1/oauth2/user/whoami"): lambda r: httpx.Response(429)}, sleeps=sleeps)
-    with pytest.raises(RateLimited):
+    with pytest.raises(RateLimited) as e:
         c.whoami()
-    assert sleeps == [1, 2, 4] and len(router.calls) == 4
-
-
-def test_429_then_success(store):
-    connected(store)
-    answers = iter([httpx.Response(429), httpx.Response(200, json={"username": "ok"})])
-    c, _ = client(store, {("GET", "/api/v1/oauth2/user/whoami"): lambda r: next(answers)}, sleeps=[])
-    assert c.whoami()["username"] == "ok"
+    assert sleeps == [] and len(router.calls) == 1 and e.value.status == 429
 
 
 def test_4xx_not_retried_and_parsed(store):
@@ -260,9 +332,57 @@ def test_5xx_retried_for_reads_not_for_publish(store):
     with pytest.raises(DAApiError):
         c.whoami()
     assert len(router.calls) == 4
-    with pytest.raises(DAApiError):
+    with pytest.raises(da_api.UncertainPublish, match="могла выложиться"):
         c.stash_publish(1, is_mature=False)
     assert len(router.calls) == 5  # публикация не повторяется: иначе можно выложить дважды
+
+
+def test_publish_network_errors(store):
+    """Обрыв после отправки — «не знаю, выложилось ли»; не удалось соединиться — обычная ошибка (#13)."""
+    connected(store)
+
+    def read_timeout(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    c, router = client(store, {("POST", "/api/v1/oauth2/stash/publish"): read_timeout})
+    with pytest.raises(da_api.UncertainPublish):
+        c.stash_publish(1, is_mature=False)
+    assert len(router.calls) == 1
+
+    def refused(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    c, _ = client(store, {("POST", "/api/v1/oauth2/stash/publish"): refused})
+    with pytest.raises(DAApiError) as e:
+        c.stash_publish(1, is_mature=False)
+    assert not isinstance(e.value, da_api.UncertainPublish) and e.value.code == "network_unsent"
+
+
+def test_publish_agreement_retry_on_error_0_or_1(store):
+    """Ошибки 0/1 значат «не опубликовано, нужно согласие»: повторяем один раз с согласием (#11)."""
+    connected(store)
+    seen = []
+
+    def publish(request):
+        seen.append(form(request))
+        if len(seen) == 1:
+            return httpx.Response(400, json={"error": "invalid_request", "error_description": "Must accept",
+                                             "error_code": 0})
+        return httpx.Response(200, json={"status": "success", "url": "u", "deviationid": "D"})
+
+    c, _ = client(store, {("POST", "/api/v1/oauth2/stash/publish"): publish})
+    assert c.stash_publish(1, is_mature=False)["deviationid"] == "D"
+    assert "agree_submission" not in seen[0]
+    assert seen[1]["agree_submission"] == ["true"] and seen[1]["agree_tos"] == ["true"]
+
+
+def test_publish_error_codes_translated(store):
+    connected(store)
+    c, router = client(store, {("POST", "/api/v1/oauth2/stash/publish"): lambda r: httpx.Response(
+        400, json={"error": "invalid_request", "error_description": "already", "error_code": 9})})
+    with pytest.raises(DAApiError, match="уже опубликована"):
+        c.stash_publish(1, is_mature=False)
+    assert len(router.calls) == 1
 
 
 def test_status_error_in_200_body(store):
@@ -381,19 +501,66 @@ def test_stash_publish_paired_arrays(store):
 def test_stash_publish_mature_level_only_when_mature(store):
     connected(store)
     seen = []
-    c, _ = client(store, {("POST", "/api/v1/oauth2/stash/publish"):
-                          lambda r: seen.append(form(r)) or httpx.Response(200, json={"status": "success"})})
-    c.stash_publish(1, is_mature=True, mature_level="moderate")
+    c, router = client(store, {("POST", "/api/v1/oauth2/stash/publish"):
+                               lambda r: seen.append(form(r)) or httpx.Response(200, json={"status": "success"})})
+    c.stash_publish(1, is_mature=True, mature_level="moderate", mature_classification=["gore"])
     assert seen[0]["is_mature"] == ["true"] and seen[0]["mature_level"] == ["moderate"]
-    assert "groups[]" not in seen[0]
+    assert seen[0]["mature_classification[]"] == ["gore"] and "groups[]" not in seen[0]
 
 
-def test_revoke(store):
+def test_mature_without_level_refused_before_request(store):
+    """18+ без уровня DeviantArt отвергнет — не отправляем вовсе, пусть она выберет (#8)."""
+    connected(store)
+    c, router = client(store, {})
+    with pytest.raises(DAApiError, match="strict или moderate"):
+        c.stash_publish(1, is_mature=True)
+    with pytest.raises(DAApiError, match="Неизвестная пометка"):
+        c.stash_publish(1, is_mature=True, mature_level="strict", mature_classification=["spicy"])
+    assert router.calls == []
+
+
+def test_normalize_publish_fields():
+    """Что уйдёт в DeviantArt — видно до её «го»: название не режем молча, теги объясняем (#15)."""
+    title, tags, notes = da_api.normalize_publish_fields(" Moth adopt ", ["адопт", "open adopt", "OTA!", "chibi-ych"])
+    assert title == "Moth adopt" and tags == ["open_adopt", "OTA", "chibiych"]
+    assert any("адопт" in n and "не войдёт" in n for n in notes)
+    assert any("open adopt" in n and "open_adopt" in n for n in notes)
+    with pytest.raises(DAApiError, match="длиннее 50"):
+        da_api.normalize_publish_fields("x" * 51)
+    with pytest.raises(DAApiError):
+        da_api.normalize_publish_fields("  ")
+
+
+def test_stash_submit_refuses_long_title_before_upload(store, tmp_path):
+    connected(store)
+    img = tmp_path / "a.png"
+    img.write_bytes(b"x")
+    c, router = client(store, {})
+    with pytest.raises(DAApiError, match="длиннее 50"):
+        c.stash_submit(img, "y" * 72)
+    assert router.calls == []
+
+
+def test_revoke_tristate(store):
+    """Отзыв: подтверждён DeviantArt / удалён только локально / подключения не было (#56)."""
     connected(store)
     seen = []
-    c, _ = client(store, {("POST", "/oauth2/revoke"): lambda r: seen.append(form(r)) or httpx.Response(200, json={})})
-    assert c.revoke() and seen[0]["token"] == ["RT"]
-    assert not c.is_connected() and not c.revoke()
+    c, _ = client(store, {("POST", "/oauth2/revoke"):
+                          lambda r: seen.append(form(r)) or httpx.Response(200, json={"success": True})})
+    assert c.revoke() == "revoked" and seen[0]["token"] == ["RT"]
+    assert not c.is_connected() and c.revoke() == "not_connected"
+
+    connected(store)
+    c, _ = client(store, {("POST", "/oauth2/revoke"): lambda r: httpx.Response(400, json={"error": "bad"})})
+    assert c.revoke() == "local_only" and not c.is_connected()
+
+    connected(store)
+
+    def down(request):
+        raise httpx.ConnectError("no net", request=request)
+
+    c, _ = client(store, {("POST", "/oauth2/revoke"): down})
+    assert c.revoke() == "local_only" and not c.is_connected()
 
 
 # --- Её картинки ---
@@ -407,10 +574,30 @@ def test_recent_images(tmp_path):
     for p, mtime in files.items():
         p.write_bytes(b"x")
         os.utime(p, (NOW - mtime, NOW - mtime))
+    # По умолчанию только верхний уровень: в подпапки не заходим (#19).
     out = da_api.recent_images([dl, desk, tmp_path / "missing"], limit=10, now=NOW)
-    assert [i["name"] for i in out] == ["newest.png", "mid.webp", "oldest.jpg"]
+    assert [i["name"] for i in out] == ["newest.png", "oldest.jpg"]
     assert out[0]["age_s"] == pytest.approx(100) and out[0]["size"] == 1
+    deep = da_api.recent_images([dl, desk], limit=10, now=NOW, deep=True)
+    assert [i["name"] for i in deep] == ["newest.png", "mid.webp", "oldest.jpg"]
     assert len(da_api.recent_images([dl, desk], limit=1, now=NOW)) == 1
+
+
+def test_recent_images_skips_symlinks_and_reports_denied(tmp_path):
+    dl, desk, outside = tmp_path / "Downloads", tmp_path / "Desktop", tmp_path / "ext"
+    dl.mkdir()
+    desk.mkdir()
+    outside.mkdir()
+    (outside / "far.png").write_bytes(b"x")
+    (dl / "link.png").symlink_to(outside / "far.png")
+    (dl / "ok.png").write_bytes(b"x")
+    desk.chmod(0)
+    try:
+        report = da_api.recent_images_report([dl, desk], limit=10, now=NOW)
+    finally:
+        desk.chmod(0o755)
+    assert [i["name"] for i in report["items"]] == ["ok.png"]
+    assert report["denied"] == ["Рабочий стол"]
 
 
 def test_connect_main_without_client_id(capsys):
@@ -472,8 +659,11 @@ def test_deviation_comments_respects_cap(store):
                                                     for i in range(50)]})
 
     c, router = client(connected(store), {("GET", "/api/v1/oauth2/comments/deviation/U"): comments})
-    assert len(c.deviation_comments("U", max_comments=120)) == 120
-    assert len(router.calls) == 3
+    out = c.deviation_comments("U", max_comments=120)
+    # Обрезаем, оставляя самые новые: там последние ставки (#16).
+    assert len(out) == 120 and c.comments_truncated
+    assert out[-1].posted_ts == max(x.posted_ts for x in out) and out[0].comment_id == f"C{250 - 120}"
+    assert len(router.calls) == 5
 
 
 def test_reply_with_unloaded_parent_is_still_a_reply(store):
@@ -573,3 +763,236 @@ def test_localhost_servers_ipv4_always(monkeypatch):
     finally:
         for s in servers:
             s.server_close()
+
+
+
+# --- Обновление токена из нескольких процессов (#10, #44, #57) ---
+
+def rotating_token_server(calls, delay=0.0):
+    state = {"rt": "RT", "n": 0}
+
+    def token(request):
+        calls.append(form(request)["refresh_token"][0])
+        time.sleep(delay)
+        if form(request)["refresh_token"][0] != state["rt"]:
+            return httpx.Response(400, json={"error": "invalid_grant", "error_description": "used"})
+        state["n"] += 1
+        state["rt"] = f"RT{state['n'] + 1}"
+        return httpx.Response(200, json={"access_token": f"AT{state['n'] + 1}", "refresh_token": state["rt"],
+                                         "expires_in": 3600})
+
+    return token
+
+
+def test_two_clients_refresh_once_and_keep_new_token(store):
+    import threading
+
+    connected(store, expires_at=NOW - 10)
+    calls = []
+    routes = {("POST", "/oauth2/token"): rotating_token_server(calls, delay=0.2),
+              ("GET", "/api/v1/oauth2/user/whoami"): lambda r: httpx.Response(200, json={"username": "m"})}
+    c1, _ = client(TokenStore(store.path), routes)
+    c2, _ = client(TokenStore(store.path), routes)
+    errors = []
+
+    def go(c):
+        try:
+            c.whoami()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=go, args=(c,)) for c in (c1, c2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == [] and calls == ["RT"]  # второй увидел свежий токен и не пошёл обновлять
+    assert store.load()["refresh_token"] == "RT2"
+
+
+def test_stale_refresh_does_not_delete_newer_token(store):
+    """Процесс со старым refresh_token получил invalid_grant — свежий токен другого процесса не трогаем."""
+    connected(store, expires_at=NOW - 10)
+    old = store.load()
+    calls = []
+    routes = {("POST", "/oauth2/token"): rotating_token_server(calls)}
+    c1, _ = client(TokenStore(store.path), routes)
+    c1._refresh(old)                      # первый процесс: RT → RT2
+    assert store.load()["refresh_token"] == "RT2"
+    c2, _ = client(TokenStore(store.path), routes)
+    got = c2._refresh(old)                # второй держит старую запись
+    assert got["refresh_token"] == "RT2" and calls == ["RT"]
+    assert store.load()["refresh_token"] == "RT2"
+
+
+def test_rejected_refresh_still_clears_when_token_is_ours(store):
+    connected(store, expires_at=NOW - 10)
+    calls = []
+    routes = {("POST", "/oauth2/token"): lambda r: calls.append(1) or httpx.Response(
+        400, json={"error": "invalid_grant", "error_description": "revoked"})}
+    c, _ = client(store, routes)
+    with pytest.raises(NotConnected):
+        c.whoami()
+    assert store.load() is None and calls == [1]
+
+
+def test_refresh_lock_works_across_processes(store, tmp_path):
+    """Замок — файловый: другой процесс, держащий его, задерживает наше обновление."""
+    import subprocess
+    import sys
+
+    connected(store, expires_at=NOW - 10)
+    lock = str(store.path) + ".lock"
+    holder = subprocess.Popen([sys.executable, "-c", (
+        "import fcntl, os, sys, time\n"
+        f"fd = os.open({lock!r}, os.O_CREAT | os.O_RDWR, 0o600)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "print('locked', flush=True)\n"
+        "time.sleep(1.0)\n")], stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "locked"
+    calls = []
+    c, _ = client(store, {("POST", "/oauth2/token"): rotating_token_server(calls),
+                          ("GET", "/api/v1/oauth2/user/whoami"): lambda r: httpx.Response(200, json={})})
+    t0 = time.time()
+    c.whoami()
+    assert time.time() - t0 >= 0.5 and calls == ["RT"]
+    holder.wait(timeout=5)
+
+
+# --- Глубокие ветки ответов (#16) ---
+
+def test_deep_reply_chain_is_fetched(store):
+    """Ставки цепочкой ответов глубже 5 уровней: дочитываем ветку по commentid."""
+    chain = [comment(f"C{i}", f"u{i}", 1_790_000_000 + i, f"${10 + i}", parent=(f"C{i - 1}" if i > 1 else None))
+             for i in range(1, 9)]
+    for raw in chain:
+        raw["replies"] = 1 if raw["commentid"] != "C8" else 0
+    seen = []
+
+    def comments(request):
+        params = dict(request.url.params)
+        seen.append(params)
+        root = params.get("commentid")
+        start = 0 if not root else int(root[1:])           # ветка начинается после root
+        part = chain[start:start + int(params["maxdepth"])]  # глубже API не отдаёт
+        return httpx.Response(200, json={"has_more": False, "next_offset": None, "has_less": False,
+                                         "prev_offset": None, "thread": part})
+
+    c, _ = client(connected(store), {("GET", "/api/v1/oauth2/comments/deviation/U"): comments})
+    out = c.deviation_comments("U")
+    assert [x.comment_id for x in out] == [f"C{i}" for i in range(1, 9)]
+    assert out[-1].depth == 7 and any(p.get("commentid") for p in seen)
+
+
+# --- Поиск UUID с кешем промахов (#17) ---
+
+def test_uuid_lookup_miss_cache(store):
+    calls = []
+    routes = {("GET", "/api/v1/oauth2/gallery/all"): lambda r: calls.append(1) or httpx.Response(
+        200, json={"results": [], "has_more": False, "next_offset": None})}
+    clock = {"t": NOW}
+    c, _ = client(connected(store, expires_at=NOW + 10 * da_api.UUID_MISS_TTL_S), routes, clock=lambda: clock["t"])
+    misses: dict = {}
+    url = "https://www.deviantart.com/moth/art/Moth-123"
+    assert c.deviation_uuid_from_url(url, max_pages=2, miss_cache=misses) is None
+    assert c.deviation_uuid_from_url(url, max_pages=2, miss_cache=misses) is None
+    assert len(calls) == 1 and url in misses
+    clock["t"] += da_api.UUID_MISS_TTL_S + 1
+    c.deviation_uuid_from_url(url, max_pages=2, miss_cache=misses)
+    assert len(calls) == 2
+
+
+def test_hidden_reply_does_not_trigger_extra_requests(store):
+    """Ответ скрыт автором — он пришёл, просто не ставка: лишних запросов за веткой нет."""
+    top = comment("C1", "anna", 1_790_000_000, "$10")
+    top["replies"] = 1
+    thread = [top, comment("C2", "kiwi", 1_790_000_100, "$15", parent="C1", hidden="hidden_by_owner")]
+    c, router = client(connected(store), {("GET", "/api/v1/oauth2/comments/deviation/U"): lambda r: httpx.Response(
+        200, json={"has_more": False, "next_offset": None, "has_less": False, "prev_offset": None, "thread": thread})})
+    assert [x.comment_id for x in c.deviation_comments("U")] == ["C1"]
+    assert len(router.calls) == 1 and not c.comments_truncated
+
+
+# --- Статистика работ (/deviation/metadata) ---
+
+META_PATH = ("GET", "/api/v1/oauth2/deviation/metadata")
+
+
+def meta_reply(request):
+    ids = request.url.params.get_list("deviationids[]")
+    return httpx.Response(200, json={"metadata": [
+        {"deviationid": u, "tags": [{"tag_name": "adopt"}, {"tag_name": "dragon"}],
+         "stats": {"views": 100 + i, "favourites": 10 + i, "comments": i, "downloads": 0}}
+        for i, u in enumerate(ids)]})
+
+
+def test_deviation_metadata_parses_stats_and_tags(store):
+    connected(store)
+    c, router = client(store, {META_PATH: meta_reply})
+    out = c.deviation_metadata(["U1", "U2", "U1", ""])
+    assert out["U1"] == {"views": 100, "favourites": 10, "comments": 0, "downloads": 0, "tags": ["adopt", "dragon"]}
+    assert out["U2"]["favourites"] == 11
+    assert len(router.calls) == 1
+    params = router.calls[0].url.params
+    assert params.get_list("deviationids[]") == ["U1", "U2"] and params["ext_stats"] == "true"
+
+
+def test_deviation_metadata_without_ext_stats(store):
+    connected(store)
+    c, router = client(store, {META_PATH: meta_reply})
+    c.deviation_metadata(["U1"], ext_stats=False)
+    assert "ext_stats" not in router.calls[0].url.params
+
+
+def test_deviation_metadata_chunks(store):
+    connected(store)
+    c, router = client(store, {META_PATH: meta_reply})
+    ids = [f"U{i}" for i in range(da_api.METADATA_CHUNK * 2 + 3)]
+    out = c.deviation_metadata(ids)
+    assert set(out) == set(ids)
+    assert [len(r.url.params.get_list("deviationids[]")) for r in router.calls] == [
+        da_api.METADATA_CHUNK, da_api.METADATA_CHUNK, 3]
+
+
+def test_deviation_metadata_empty_makes_no_requests(store):
+    connected(store)
+    c, router = client(store, {META_PATH: meta_reply})
+    assert c.deviation_metadata([]) == {}
+    assert router.calls == []
+
+
+def test_deviation_metadata_halves_chunk_on_too_many(store):
+    connected(store)
+
+    def reply(request):
+        if len(request.url.params.get_list("deviationids[]")) > 10:
+            return httpx.Response(400, json={"error": "invalid_request", "error_description": "Too many", "error_code": 0})
+        return meta_reply(request)
+    c, router = client(store, {META_PATH: reply})
+    ids = [f"U{i}" for i in range(30)]
+    out = c.deviation_metadata(ids)
+    assert set(out) == set(ids)
+    sizes = [len(r.url.params.get_list("deviationids[]")) for r in router.calls]
+    assert sizes[:3] == [30, 25, 12] and all(s <= 10 for s in sizes[3:]) and sum(sizes[3:]) == 30
+
+
+def test_deviation_metadata_other_errors_raise(store):
+    connected(store)
+    err = {"error": "invalid_request", "error_description": "Bad id", "error_code": 2}
+    c, _ = client(store, {META_PATH: lambda r: httpx.Response(400, json=err)})
+    with pytest.raises(DAApiError) as e:
+        c.deviation_metadata(["U1"])
+    assert e.value.code == 2
+
+
+def test_deviation_metadata_rate_limited(store):
+    connected(store)
+    c, router = client(store, {META_PATH: lambda r: httpx.Response(429)})
+    with pytest.raises(RateLimited):
+        c.deviation_metadata([f"U{i}" for i in range(120)])
+    assert len(router.calls) == 1
+
+
+def test_deviation_metadata_not_connected(store):
+    c, router = client(store, {META_PATH: meta_reply})
+    with pytest.raises(NotConnected):
+        c.deviation_metadata(["U1"])
+    assert router.calls == []

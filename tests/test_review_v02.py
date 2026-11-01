@@ -141,9 +141,9 @@ def test_external_tools_ask_every_time():
     import asyncio
 
     tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
-    for name in ("check_now", "bot_login", "set_background_checks"):
+    for name in ("check", "accounts", "set_background_checks"):
         assert tools[name].annotations.open_world_hint and not tools[name].annotations.idempotent_hint
-    assert tools["list_new_adopts"].annotations.read_only_hint
+    assert tools["findings"].annotations.read_only_hint
 
 
 def test_save_config_refuses_unreadable_without_force(tmp_path):

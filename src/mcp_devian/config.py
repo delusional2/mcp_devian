@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -19,6 +20,12 @@ DEFAULT_LOT_TYPES = ["auction", "ota", "bta", "flatsale", "raffle", "adopt"]
 MODES = ("chrome", "bot")
 LEGACY_MODES = {"claude": "chrome"}
 MIN_POLL_MINUTES = 15
+MAX_PAGES_PER_BOARD = 20
+# Потолки её комментариев на DA за сутки: настройкой их можно только снизить.
+DA_COMMENTS_MAX = 20
+DA_PINGS_MAX = 10
+WATERMARK_POSITIONS = ("tiled", "center", "bottom-right", "bottom-left", "top-right", "top-left")
+BOARD_SLUG = re.compile(r"^(\d+)\.[a-z0-9][a-z0-9\-]*$", re.I)
 
 
 @dataclass
@@ -51,8 +58,12 @@ class DeviantArt:
 class Toyhouse:
     mode: str = "bot"
     poll_minutes: int = 45
-    boards: list[int] = field(default_factory=lambda: [13, 5866])
+    # Номер доски (13) или «id.slug» («13.adoption-center») — второй вариант даёт проверенный адрес.
+    boards: list[int | str] = field(default_factory=lambda: [13, 5866])
+    # Сколько страниц доски читаем всегда…
     pages_per_board: int = 2
+    # …и до скольких можно дочитать, если на доске много нового с прошлой проверки (те же паузы).
+    max_pages_per_board: int = 6
     active_days: int = 5
     lf_keywords: list[str] = field(default_factory=list)
     read_first_posts: int = 5
@@ -65,6 +76,10 @@ class Notify:
     telegram: bool = False
     # Она продаёт, а не покупает: чужие лоты DA — только данные для цен, без уведомлений «можно купить».
     market_lots: bool = False
+    # Недельный разбор продаж: день недели (0 = понедельник … 6 = воскресенье) и час по её времени.
+    weekly_report: bool = True
+    weekly_report_weekday: int = 6
+    weekly_report_hour: int = 19
 
 
 @dataclass
@@ -90,6 +105,22 @@ class Posting:
     default_is_mature: bool = False
     default_is_ai_generated: bool = False
     default_noai: bool = True
+    # Уровень 18+ для DeviantArt, если работа помечена 18+: moderate или strict.
+    default_mature_level: str = "moderate"
+    # Её папки галереи DeviantArt, куда класть новые работы по умолчанию (например «Adopts — Open»).
+    default_gallery_folders: list[str] = field(default_factory=list)
+    # Её часовой пояс: расписание публикаций и «лучшее время».
+    timezone: str = "Europe/Moscow"
+    # Водяной знак превью (prepare_deviantart_publish(watermark=True)): подпись (пусто — её ник DA),
+    # PNG-логотип, положение и непрозрачность в процентах.
+    watermark_text: str = ""
+    watermark_logo: str = ""
+    watermark_position: str = "tiled"
+    watermark_opacity: float = 35
+    # Её комментарии на DA за сутки (закрытие аукционов, напоминания, пинги) и сколько из них пингов.
+    # Можно только уменьшить: больше — риск, что DeviantArt сочтёт это спамом.
+    da_comments_per_day: int = DA_COMMENTS_MAX
+    da_pings_per_day: int = DA_PINGS_MAX
 
 
 @dataclass
@@ -166,11 +197,127 @@ def load_config(path: Path | None = None) -> Config:
         path=path,
         warnings=warnings,
     )
+    _check_boards(cfg.toyhouse, warnings)
     cfg.toyhouse.mode = LEGACY_MODES.get(cfg.toyhouse.mode, cfg.toyhouse.mode)
     if cfg.toyhouse.mode not in MODES:
         warnings.append(f"toyhouse.mode = {cfg.toyhouse.mode!r}, беру bot")
         cfg.toyhouse.mode = "bot"
+    # Пояс и время отчёта читает каждая фоновая проверка: исправленный руками файл не должен её ронять.
+    if not valid_timezone(cfg.posting.timezone):
+        warnings.append(f"posting.timezone = {cfg.posting.timezone!r} — не часовой пояс, беру {DEFAULT_TIMEZONE}")
+        cfg.posting.timezone = DEFAULT_TIMEZONE
+    for key, top in (("weekly_report_weekday", 6), ("weekly_report_hour", 23)):
+        value, default = getattr(cfg.notify, key), getattr(Notify, key)
+        number = _whole(value, 0, top)
+        if number is None:
+            warnings.append(f"notify.{key} = {value!r} — нужно целое от 0 до {top}, беру {default}")
+            number = default
+        setattr(cfg.notify, key, number)
+    _check_posting(cfg.posting, warnings)
     return cfg
+
+
+def _check_posting(p: "Posting", warnings: list[str]) -> None:
+    """Руками исправленный файл не должен поднять потолок комментариев или сломать превью."""
+    for key, top in (("da_comments_per_day", DA_COMMENTS_MAX), ("da_pings_per_day", DA_PINGS_MAX)):
+        number = _whole(getattr(p, key), 0, top)
+        if number is None:
+            warnings.append(f"posting.{key} = {getattr(p, key)!r} — нужно целое от 0 до {top}, беру {top}")
+            number = top
+        setattr(p, key, number)
+    if p.watermark_position not in WATERMARK_POSITIONS:
+        warnings.append(f"posting.watermark_position = {p.watermark_position!r}, беру tiled")
+        p.watermark_position = "tiled"
+    try:
+        opacity = float(p.watermark_opacity)
+    except (TypeError, ValueError):
+        opacity = -1
+    if not 5 <= opacity <= 100:
+        warnings.append(f"posting.watermark_opacity = {p.watermark_opacity!r} — нужно 5–100, беру 35")
+        opacity = 35
+    p.watermark_opacity = opacity
+    for key in ("watermark_text", "watermark_logo"):
+        if not isinstance(getattr(p, key), str):
+            warnings.append(f"posting.{key} — не строка, беру пусто")
+            setattr(p, key, "")
+
+
+DEFAULT_TIMEZONE = "Europe/Moscow"
+
+
+def parse_board(value) -> int | str:
+    """13, «13» → 13; «13.adoption-center» → как есть (в нижнем регистре). Иначе SettingsError."""
+    if isinstance(value, bool):
+        raise SettingsError("toyhouse_boards: номер доски или «id.slug»")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int):
+        if value < 1:
+            raise SettingsError("toyhouse_boards: номер доски — целое больше 0")
+        return value
+    if isinstance(value, str):
+        v = value.strip().rstrip("/").split("/~forums/")[-1]
+        if v.isdigit() and int(v) > 0:
+            return int(v)
+        if BOARD_SLUG.match(v):
+            return v.lower()
+    raise SettingsError(f"toyhouse_boards: «{value}» — нужен номер доски (13) или «id.slug» (13.adoption-center)")
+
+
+def unique_boards(boards: list[int | str]) -> list[int | str]:
+    """13 и «13.adoption-center» — одна доска: оставляем одну запись (с адресом, если он есть),
+    иначе каждая проверка читала бы её дважды и лишний раз стучалась за Cloudflare."""
+    out: dict[int, int | str] = {}
+    for b in boards:
+        key = b if isinstance(b, int) else int(str(b).split(".", 1)[0])
+        if key not in out or isinstance(out[key], int):
+            out[key] = b
+    return list(out.values())
+
+
+def _check_boards(th: "Toyhouse", warnings: list[str]) -> None:
+    boards = []
+    for b in th.boards if isinstance(th.boards, list) else []:
+        try:
+            boards.append(parse_board(b))
+        except SettingsError as e:
+            warnings.append(str(e))
+    boards = unique_boards(boards)
+    th.boards = boards if boards or not th.boards else [13, 5866]
+    for key, low in (("pages_per_board", 1), ("max_pages_per_board", 1)):
+        number = _whole(getattr(th, key), low, MAX_PAGES_PER_BOARD)
+        if number is None:
+            default = getattr(Toyhouse, key)
+            warnings.append(f"toyhouse.{key} = {getattr(th, key)!r} — нужно целое от {low} до "
+                            f"{MAX_PAGES_PER_BOARD}, беру {default}")
+            number = default
+        setattr(th, key, number)
+    th.max_pages_per_board = max(th.max_pages_per_board, th.pages_per_board)
+
+
+def valid_timezone(name) -> bool:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    if not isinstance(name, str):
+        return False
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return False
+    return True
+
+
+def _whole(value, low: int, high: int) -> int | None:
+    """Целое в [low, high] из числа или строки «6»; иначе None. True/False — не числа."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        value = int(value.strip())
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if not isinstance(value, int) or not low <= value <= high:
+        return None
+    return value
 
 
 def save_config(cfg: Config, path: Path | None = None, force: bool = False) -> Path:
@@ -265,11 +412,21 @@ def apply_changes(cfg: Config, changes: dict) -> list[str]:
         elif key == "toyhouse_boards":
             if not isinstance(value, list) or not value:
                 raise SettingsError("toyhouse_boards: нужен список номеров досок")
-            th.boards = [int(_number(b, key, 1)) for b in value]
+            th.boards = unique_boards([parse_board(b) for b in value])
         elif key == "active_days":
             th.active_days = int(_number(value, key, 1))
         elif key == "pages_per_board":
             th.pages_per_board = int(_number(value, key, 1))
+            if th.pages_per_board > MAX_PAGES_PER_BOARD:
+                raise SettingsError(f"pages_per_board: не больше {MAX_PAGES_PER_BOARD}")
+            th.max_pages_per_board = max(th.max_pages_per_board, th.pages_per_board)
+        elif key == "max_pages_per_board":
+            pages = _whole(value, 1, MAX_PAGES_PER_BOARD)
+            if pages is None:
+                raise SettingsError(f"max_pages_per_board: целое от 1 до {MAX_PAGES_PER_BOARD}")
+            if pages < th.pages_per_board:
+                raise SettingsError(f"max_pages_per_board: не меньше pages_per_board ({th.pages_per_board})")
+            th.max_pages_per_board = pages
         elif key == "deviantart_poll_minutes":
             da.poll_minutes = int(_number(value, key, MIN_POLL_MINUTES))
         elif key == "toyhouse_poll_minutes":
@@ -291,6 +448,41 @@ def apply_changes(cfg: Config, changes: dict) -> list[str]:
             cfg.posting.da_client_id = client_id
         elif key in ("default_is_mature", "default_is_ai_generated", "default_noai"):
             setattr(cfg.posting, key, bool(value))
+        elif key == "default_gallery_folders":
+            cfg.posting.default_gallery_folders = _words(value, key)
+        elif key == "timezone":
+            if not valid_timezone(str(value)):
+                raise SettingsError("timezone: например Europe/Moscow")
+            cfg.posting.timezone = str(value)
+        elif key == "watermark_text":
+            # Латиница: шрифт превью кириллицу может не нарисовать (см. media.prepare_preview).
+            text = " ".join(str(value).split())
+            if len(text) > 40:
+                raise SettingsError("watermark_text: не длиннее 40 символов")
+            cfg.posting.watermark_text = text
+        elif key == "watermark_logo":
+            logo = str(value).strip()
+            if logo and not Path(logo).expanduser().suffix.lower() == ".png":
+                raise SettingsError("watermark_logo: путь к PNG-файлу с логотипом")
+            cfg.posting.watermark_logo = logo
+        elif key == "watermark_position":
+            pos = str(value).strip().lower()
+            if pos not in WATERMARK_POSITIONS:
+                raise SettingsError(f"watermark_position: {', '.join(WATERMARK_POSITIONS)}")
+            cfg.posting.watermark_position = pos
+        elif key == "watermark_opacity":
+            opacity = _number(value, key, 5)
+            if opacity > 100:
+                raise SettingsError("watermark_opacity: проценты, от 5 до 100")
+            cfg.posting.watermark_opacity = opacity
+        elif key in ("da_comments_per_day", "da_pings_per_day"):
+            top = DA_COMMENTS_MAX if key == "da_comments_per_day" else DA_PINGS_MAX
+            number = _whole(value, 0, top)
+            if number is None:
+                raise SettingsError(f"{key}: целое от 0 до {top} (больше нельзя — DeviantArt может счесть это спамом)")
+            setattr(cfg.posting, key, number)
+        elif key == "weekly_report":
+            nt.weekly_report = bool(value)
         elif key == "notify_market_lots":
             nt.market_lots = bool(value)
         elif key == "notify_macos":

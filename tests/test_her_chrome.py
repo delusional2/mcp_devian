@@ -23,6 +23,7 @@ def chrome_present(monkeypatch, tmp_path):
     app = tmp_path / "Google Chrome.app"
     app.mkdir()
     monkeypatch.setattr(her_chrome, "CHROME_PATHS", [app])
+    monkeypatch.setattr(th, "LOCK_FILE", tmp_path / "chrome.lock")  # замок — не в её настоящей папке
 
 
 def fake_osascript(answers):
@@ -55,6 +56,19 @@ def test_board_and_first_post():
     cmd = run.calls[0]
     assert cmd[:3] == ["osascript", "-l", "JavaScript"] and cmd[5] == "https://toyhou.se/~forums/13.adoption-center"
     assert "tr.forum-thread-row" in cmd[6]  # скрипт передаётся аргументом, без экранирования
+
+
+def test_board_rows_carry_raw_markup_and_slug_boards():
+    rows = [{**ROWS[0], "row_class": "row forum-thread-row sticky", "row_locked": True,
+             "created": "N/A", "created_title": "2026-10-31T10:00:00Z", "last": "yesterday"}]
+    run = fake_osascript([ok(json.dumps(rows)), ok("x" * 10)])
+    reader = her_chrome.HerChromeReader(runner=run)
+    got = reader.board("5866.design-marketplace", 2, NOW)
+    assert run.calls[0][5] == "https://toyhou.se/~forums/5866.design-marketplace?page=2"
+    assert got[0].board_id == 5866 and got[0].row_class == "row forum-thread-row sticky" and got[0].row_locked
+    assert got[0].created_ts is not None and got[0].activity_ts == NOW - 86400
+    reader.first_post("https://toyhou.se/~forums/13.x/900001.lf")
+    assert ".slice(0, 2500)" in run.calls[1][6]
 
 
 @pytest.mark.parametrize("stderr,hint", [
@@ -271,7 +285,7 @@ def test_deviantart_comments_timeout_bounded():
 
     with pytest.raises(th.ToyhouseError, match="не ответил"):
         her_chrome.run_deviantart_comments(DA_URL, max_load_more=5, runner=run, load_s=20)
-    assert seen["timeout"] == her_chrome.LAUNCH_WAIT_S + 20 + 5 * 7 + her_chrome.ERROR_EXTRA_S
+    assert seen["timeout"] == her_chrome.LAUNCH_WAIT_S + 20 + 120 + 5 * 7 + her_chrome.ERROR_EXTRA_S
 
 
 def test_da_jxa_and_generated_js_are_valid(tmp_path):
@@ -286,7 +300,58 @@ def test_da_jxa_and_generated_js_are_valid(tmp_path):
 const pick = (name) => { const m = String(run_).match(new RegExp("const " + name + " = ([\\\\s\\\\S]*?);\\\\n")); return m[1]; };
 const itemId = "1404679584";
 const cf = eval(pick('cf'));
-for (const n of ['probe', 'countJs', 'clickJs', 'extractJs']) { new Function("return (" + eval(pick(n)) + ");"); }
+const moreBtn = eval(pick('moreBtn'));
+for (const n of ['probe', 'countJs', 'clickJs', 'moreLeftJs', 'totalJs', 'extractJs']) {
+  new Function("return (" + eval(pick(n)) + ");");
+}
+// Заголовок «Comments 1,234» читается как число.
+const total = new Function('document', "return " + eval(pick('totalJs')));
+const node = (t) => ({textContent: t, childElementCount: 0});
+const got = total({getElementById: () => ({parentElement: {querySelectorAll: () => [node('Sort'), node('Comments 1,234')]}})});
+if (got !== 1234) throw new Error('total ' + got);
+// «Load more» ищем только внутри #comments.
+const left = new Function('document', "return " + eval(pick('moreLeftJs')));
+if (left({getElementById: () => null}) !== 0) throw new Error('more outside #comments');
 """, encoding="utf-8")
     done = subprocess.run([node, str(check)], capture_output=True, text=True, check=False)
     assert done.returncode == 0, done.stderr
+
+
+def test_deviantart_comments_complete_page_is_plain_list():
+    answer = {"state": "ready", "result": json.dumps(PAGE_ROWS), "clicks": 0, "stalled": False, "more_left": False,
+              "total": 5}
+    out = her_chrome.run_deviantart_comments(DA_URL, runner=fake_osascript([(0, json.dumps(answer), "")]))
+    assert isinstance(out, list) and len(out) == 5 and out.incomplete is False and out.reason == ""
+    assert out.total == 5
+
+
+@pytest.mark.parametrize("extra,words", [
+    ({"more_left": True}, "ещё есть комментарии"),
+    ({"stalled": True}, "перестала подгружать"),
+    ({"total": 40}, "прочитано 5 из 40"),
+])
+def test_deviantart_comments_reports_incomplete(extra, words):
+    answer = {"state": "ready", "result": json.dumps(PAGE_ROWS), "clicks": 3, **extra}
+    out = her_chrome.run_deviantart_comments(DA_URL, max_load_more=3,
+                                             runner=fake_osascript([(0, json.dumps(answer), "")]))
+    assert out.incomplete and words in out.reason
+    assert [c.comment_id for c in out] == ["10", "11", "30", "31", "32"]  # список по-прежнему работает
+
+
+def test_deviantart_comments_challenge_waits_and_shows_tab():
+    run = fake_osascript([ok("[]")])
+    her_chrome.run_deviantart_comments(DA_URL, max_load_more=7, runner=run, challenge_wait_s=90)
+    assert run.calls[0][9] == "90"
+    src = her_chrome.DA_COMMENTS_JXA
+    # Проверка «я человек»: вкладку выводим вперёд и ждём; при выходе с проверкой — тоже показываем её.
+    assert "state === 'challenge' && !waiting && challengeS > 0" in src
+    assert "if (state === 'challenge') { activate(id); try { chrome.activate(); }" in src
+    # «Load more» — только внутри комментариев, не любая кнопка на странице.
+    assert "document.getElementById('comments')" in src and "box.querySelectorAll('button')" in src
+
+
+def test_deviantart_comments_take_chrome_lock():
+    run = fake_osascript([ok("[]")])
+    with th.browser_lock(), pytest.raises(th.BrowserBusy):
+        her_chrome.run_deviantart_comments(DA_URL, runner=run, lock_wait_s=0)
+    assert run.calls == []

@@ -12,16 +12,20 @@ Cloudflare видит обычного посетителя; если он вс�
 """
 
 import json
+import re
 import subprocess
-from contextlib import contextmanager
+import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .toyhouse import (
     EXTRACT_BOARD_JS,
     EXTRACT_POST_JS,
+    BrowserBusy,
     ChallengeError,
     ThreadRow,
     ToyhouseError,
+    board_id,
     board_url,
     browser_lock,
     rows_from_extracted,
@@ -41,6 +45,8 @@ CLOSED_HINT = "Вкладку Toyhouse закрыли раньше, чем ст�
 CHROME_PATHS = [Path("/Applications/Google Chrome.app"), Path.home() / "Applications" / "Google Chrome.app"]
 LAUNCH_WAIT_S = 5
 ERROR_EXTRA_S = 30
+# Сколько ждать, пока Chrome освободит другая задача (проверка по расписанию, другой отклик).
+LOCK_WAIT_S = 90
 
 # JXA: аргументы приходят через argv, поэтому скрипт-экстрактор не надо экранировать.
 # argv: url, js, ready-селектор, секунд на загрузку, секунд ждать галочку, оставить ли вкладку с проверкой.
@@ -214,15 +220,15 @@ class HerChromeReader:
                 self.on_challenge()
             return run_in_chrome(url, js, ready, challenge_wait_s=wait, keep_on_challenge=True, runner=self.runner)
 
-    def board(self, board_id: int, page: int, now: float) -> list[ThreadRow]:
-        raw = self._run(board_url(board_id, page), EXTRACT_BOARD_JS, "tr.forum-thread-row")
+    def board(self, board, page: int, now: float) -> list[ThreadRow]:
+        raw = self._run(board_url(board, page), EXTRACT_BOARD_JS, "tr.forum-thread-row")
         if raw is None:
             return []
         try:
             items = json.loads(raw)
         except json.JSONDecodeError as e:
             raise ToyhouseError("скрипт вернул не JSON") from e
-        return rows_from_extracted(items if isinstance(items, list) else [], board_id, now)
+        return rows_from_extracted(items if isinstance(items, list) else [], board_id(board), now)
 
     def first_post(self, url: str) -> str | None:
         raw = self._run(url, EXTRACT_POST_JS, ".forum-post")
@@ -231,15 +237,25 @@ class HerChromeReader:
 
 # --- Отклик в тред: один запуск osascript на всё ---
 #
-# argv: url треда, режим (inspect | fill | submit), скрипт формы, скрипт проверки поста, секунд на загрузку.
-# Допущения, которые надо проверить на её залогиненной странице:
-# - форма ответа есть на странице треда (на последней — точно); если на первой её нет,
-#   идём по ссылке «Next» (a[rel=next]) до последней страницы, не больше MAX_HOPS раз;
-# - после отправки Toyhouse сам открывает страницу с новым постом, и мы ищем его там.
+# argv: url треда, режим (inspect | fill | submit), скрипт формы, функция проверки поста,
+# секунд на загрузку страницы, сколько раз можно перейти по «Next», общий бюджет в секундах.
+# Правила, которые держит скрипт:
+# - всё происходит только на https://toyhou.se в этом же треде (номер треда сверяется перед
+#   каждым чтением и перед вставкой текста); чужая ссылка «Next» или переход в другой тред — wrong_page;
+# - после перехода по «Next» ждём новую страницу (старая помечена window.__mcpHop), а не читаем старую;
+# - кнопку отправки жмём не больше одного раза; если после возможного клика что-то сломалось —
+#   uncertain («неизвестно, ушло ли»), а не ошибка;
+# - вкладка открывается в фоне: её текущая вкладка остаётся на месте (кроме fill и проверки «я человек»);
+# - весь запуск укладывается в бюджет: на клик идём, только если осталось время дождаться поста.
 REPLY_JXA = r"""
 function run(argv) {
   const url = argv[0], mode = argv[1], formJs = argv[2], verifyJs = argv[3];
-  const loadS = Number(argv[4]), maxHops = Number(argv[5]);
+  const loadS = Number(argv[4]), maxHops = Number(argv[5]), budgetS = Number(argv[6]);
+  const hardDeadline = Date.now() + budgetS * 1000;
+  const POST_WAIT_S = 30, VERIFY_RESERVE_S = 15;
+  const tidOf = (u) => { const m = /^https:\/\/toyhou\.se\/~forums\/[^\/?#]+\/(\d+)\./.exec(u || ''); return m ? m[1] : ''; };
+  const tid = tidOf(url);
+  if (!tid) return JSON.stringify({state: 'wrong_page', error: 'not a toyhou.se thread'});
   const chrome = Application('Google Chrome');
   if (!chrome.running()) { chrome.launch(); }
   let modes = [];
@@ -256,9 +272,11 @@ function run(argv) {
   const win = chrome.windows.byId(chrome.windows.id()[modes.indexOf('normal')]);
   let beforeId = null;
   try { beforeId = win.activeTab.id(); } catch (e) {}
-  win.tabs.push(chrome.Tab({url: url}));
-  const ids = win.tabs.id();
-  const id = ids[ids.length - 1];
+  const made = chrome.Tab({url: url});
+  win.tabs.push(made);
+  let id = null;
+  try { id = made.id(); } catch (e) {}
+  if (id === null) { const ids = win.tabs.id(); id = ids[ids.length - 1]; }
   const find = () => {
     try { const t = win.tabs.byId(id); t.id(); return t; } catch (e) {}
     for (const wid of chrome.windows.id()) {
@@ -269,15 +287,23 @@ function run(argv) {
   const activate = (tabId) => {
     try { const i = win.tabs.id().indexOf(tabId); if (i >= 0) win.activeTabIndex = i + 1; } catch (e) {}
   };
+  // Новая вкладка становится активной — сразу возвращаем ей её вкладку (кроме fill: там форму покажем).
+  if (mode !== 'fill' && beforeId !== null) activate(beforeId);
+  const left = () => (hardDeadline - Date.now()) / 1000;
   const cf = "(window._cf_chl_opt || document.getElementById('challenge-error-text') || " +
     "document.getElementById('challenge-form'))";
-  const probe = "document.querySelector('.forum-post') ? (document.readyState === 'complete' ? 'ready' : 'wait') : " +
+  const probe = "window.__mcpHop ? 'wait' : document.querySelector('.forum-post') ? " +
+    "(document.readyState === 'complete' ? 'ready' : 'wait') : " +
     cf + " ? 'challenge' : ((document.readyState === 'complete' && " +
     "document.querySelector('.navbar, nav, footer, #main')) ? 'loaded' : 'wait')";
+  // Номер треда открытой страницы: только https://toyhou.se/~forums/<доска>/<номер>.<...>
+  const pageTid = "(function () { var m = /^\\/~forums\\/[^\\/]+\\/(\\d+)\\./.exec(location.pathname); " +
+    "return (location.origin === 'https://toyhou.se' && m) ? m[1] : ''; })()";
+  const onThread = () => { const t = find(); return !!t && t.execute({javascript: pageTid}) === tid; };
   let lastError = null;
   // Ждать, пока страница во вкладке догрузится. Возвращает ready | loaded | challenge | tab_closed | error | timeout.
   const waitPage = () => {
-    const deadline = Date.now() + loadS * 1000;
+    const deadline = Math.min(Date.now() + loadS * 1000, hardDeadline);
     while (Date.now() < deadline) {
       delay(1);
       const tab = find();
@@ -297,56 +323,84 @@ function run(argv) {
     return 'timeout';
   };
   const run_js = (js) => JSON.parse(find().execute({javascript: js}));
-  let result = {state: 'timeout'}, keep = false;
+  // Форма ответа на странице — та же проверка, что в скрипте формы: POST на toyhou.se в форум, с полем текста.
+  const hasForm = "(Array.prototype.slice.call(document.querySelectorAll('form')).some(function (f) {" +
+    " if (!f.querySelector('.fr-element, textarea')) return false;" +
+    " if ((f.getAttribute('method') || 'get').toLowerCase() !== 'post') return false;" +
+    " try { var a = new URL(f.getAttribute('action') || location.href, location.href);" +
+    " return a.origin === 'https://toyhou.se' && a.pathname.indexOf('/~forums/') === 0; } catch (e) { return false; }" +
+    " })) ? 1 : 0";
+  // «Next» — только ссылка пагинации вне постов, на тот же тред на toyhou.se.
+  const nextHref = "(function () { var links = Array.prototype.slice.call(document.querySelectorAll('.pagination a[rel=next]'))" +
+    ".filter(function (a) { return !a.closest('.forum-post, .user-content'); });" +
+    " if (links.length < 1) return ''; var u;" +
+    " try { u = new URL(links[0].getAttribute('href'), location.href); } catch (e) { return ''; }" +
+    " var m = /^\\/~forums\\/[^\\/]+\\/(\\d+)\\./.exec(u.pathname);" +
+    " return (u.origin === 'https://toyhou.se' && m && m[1] === " + JSON.stringify(tid) + ") ? u.href : ''; })()";
+  let result = {state: 'timeout'}, keep = false, clicked = false;
+  const fail = (st) => {
+    if (st === 'challenge') { keep = true; activate(id); chrome.activate(); }
+    result = {state: st === 'loaded' ? 'no_form' : st, error: lastError};
+    return JSON.stringify(result);
+  };
   try {
     let st = waitPage();
-    if (st !== 'ready') {
-      if (st === 'challenge') { keep = true; activate(id); chrome.activate(); }
-      result = {state: st === 'loaded' ? 'no_form' : st, error: lastError};
-      return JSON.stringify(result);
-    }
-    // Формы нет на этой странице — идём к последней по «Next».
-    const hasForm = "(Array.prototype.slice.call(document.querySelectorAll('form')).some(function (f) " +
-      "{ return f.querySelector('.fr-element, textarea'); })) ? 1 : 0";
-    const nextHref = "(document.querySelector('.pagination a[rel=next]') || {}).href || ''";
+    if (st !== 'ready') return fail(st);
+    if (!onThread()) { result = {state: 'wrong_page'}; return JSON.stringify(result); }
+    // Формы нет на этой странице — идём к последней по «Next» этого же треда.
     for (let hop = 0; hop < maxHops && find().execute({javascript: hasForm}) !== 1; hop++) {
       const next = find().execute({javascript: nextHref});
-      if (!next) break;
+      if (!next || tidOf(next) !== tid) break;
+      find().execute({javascript: "window.__mcpHop = 1; 1"});  // старая страница больше не «готова»
       find().url = next;
       st = waitPage();
-      if (st !== 'ready') {
-        if (st === 'challenge') { keep = true; activate(id); chrome.activate(); }
-        result = {state: st === 'loaded' ? 'no_form' : st, error: lastError};
-        return JSON.stringify(result);
-      }
+      if (st !== 'ready') return fail(st);
+      if (!onThread()) { result = {state: 'wrong_page'}; return JSON.stringify(result); }
     }
+    if (mode === 'submit' && left() < POST_WAIT_S + VERIFY_RESERVE_S) {
+      result = {state: 'timeout'}; return JSON.stringify(result);  // не успеем проверить — не жмём
+    }
+    if (!onThread()) { result = {state: 'wrong_page'}; return JSON.stringify(result); }
+    if (mode === 'submit') clicked = true;  // с этого момента клик мог случиться
     result = run_js(formJs);
     if (mode === 'inspect') { result = {state: 'inspected', form: result}; return JSON.stringify(result); }
-    if (result.state === 'filled') { keep = true; activate(id); chrome.activate(); return JSON.stringify(result); }
+    if (result.state !== 'submitted') clicked = false;
+    if (result.state === 'filled' || result.state === 'no_submit_button') {
+      keep = true; activate(id); chrome.activate(); return JSON.stringify(result);  // текст в форме — покажем ей
+    }
     if (result.state !== 'submitted') return JSON.stringify(result);
-    // Отправили один раз. Ждём, пока Toyhouse откроет страницу с постом, и ищем его. Повторно не жмём.
+    // Отправили один раз. Ждём новую страницу (у старой стоит __mcpDevianSubmitted) и ищем пост. Повторно не жмём.
     keep = true;
-    const before = find() ? find().url() : url;
-    const deadline = Date.now() + 30 * 1000;
+    const existing = result.existing || [];
+    const deadline = Math.min(Date.now() + POST_WAIT_S * 1000, hardDeadline - VERIFY_RESERVE_S * 1000);
     while (Date.now() < deadline) {
       delay(1);
       const tab = find();
       if (!tab) break;
-      let ready = false;
-      try { ready = tab.execute({javascript: "document.readyState === 'complete' ? 1 : 0"}) === 1; } catch (e) {}
-      if (ready && tab.url() !== before) break;
+      let fresh = false;
+      try {
+        fresh = tab.execute({javascript: "(!window.__mcpDevianSubmitted && document.readyState === 'complete') ? 1 : 0"}) === 1;
+      } catch (e) {}
+      if (fresh) break;
     }
     try {
-      const found = run_js(verifyJs);
-      if (found.found) { result = {state: 'posted', permalink: found.permalink}; keep = false; }
-      else { result = {state: 'submitted_unverified'}; }
+      if (!onThread()) { result = {state: 'submitted_unverified', error: 'после отправки открылась другая страница'}; }
+      else {
+        const found = run_js("(" + verifyJs + ")(" + JSON.stringify(existing) + ")");
+        if (found.found) { result = {state: 'posted', permalink: found.permalink}; keep = false; }
+        else { result = {state: 'submitted_unverified', reason: found.reason || null}; }
+      }
     } catch (e) { result = {state: 'submitted_unverified', error: String(e)}; }
+    return JSON.stringify(result);
+  } catch (e) {
+    if (clicked) { keep = true; result = {state: 'uncertain', error: String(e)}; }
+    else { result = {state: 'error', error: String(e)}; }
     return JSON.stringify(result);
   } finally {
     if (!keep && result.state !== 'tab_closed') {
       try { const tab = find(); if (tab) tab.close(); } catch (e) {}
       if (beforeId !== null) activate(beforeId);
-    } else if (keep) {
+    } else if (keep && ['filled', 'no_submit_button', 'challenge'].indexOf(result.state) >= 0) {
       activate(id);
     }
   }
@@ -354,10 +408,14 @@ function run(argv) {
 """
 
 MAX_HOPS = 60
+# Ожидание поста после клика (как POST_WAIT_S в скрипте) и запас на его проверку.
+POST_WAIT_S = 30
 REPLY_MESSAGES = {
     "posted": "Отклик опубликован.",
     "submitted_unverified": ("Отклик отправлен, но я не нашла его на странице. Вкладка открыта — "
                              "пусть она глянет; второй раз не отправляю."),
+    "uncertain": ("Кнопку отправки, возможно, уже нажали, но дальше Chrome не ответил. Ушёл ли отклик — неизвестно: "
+                  "посмотрите тред, прежде чем пробовать снова."),
     "filled": "Текст вставлен в форму ответа в её Chrome. Проверь и нажми «Post» сама.",
     "no_form": "На странице треда не нашлось формы ответа: возможно, тред закрыт или нужен вход.",
     "closed": "Тред закрыт для ответов.",
@@ -365,27 +423,53 @@ REPLY_MESSAGES = {
     "fill_failed": "Не получилось вставить текст в форму ответа. Ничего не отправлено.",
     "no_submit_button": "Не нашла кнопку отправки. Текст в форме — можно отправить вручную.",
     "already_submitted": "На этой странице отклик уже отправлялся — второй раз не отправляю.",
+    "wrong_page": "Вкладка ушла с этого треда Toyhouse — ничего не вставляла и не отправляла.",
     "challenge": "Toyhouse просит подтвердить, что она человек: вкладка открыта, нужно нажать галочку и попросить ещё раз.",
     "timeout": "Страница треда не загрузилась вовремя. Ничего не отправлено.",
     "inspected": "Форма ответа осмотрена.",
 }
+THREAD_URL = re.compile(r"^https://toyhou\.se/~forums/[^/?#]+/\d+\.")
+
+
+def reply_budget_s(load_s: int) -> int:
+    """Весь запуск: первая страница и несколько переходов к последней, ожидание поста и его проверка."""
+    return load_s * 6 + POST_WAIT_S + 15
+
+
+@contextmanager
+def chrome_turn(wait_s: float = LOCK_WAIT_S, sleep=time.sleep):
+    """Дождаться своей очереди к её Chrome (тот же замок, что у проверок Toyhouse). Не дождались — BrowserBusy."""
+    give_up = time.monotonic() + wait_s
+    with ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(browser_lock())
+                break
+            except BrowserBusy:
+                if time.monotonic() >= give_up:
+                    raise
+                sleep(1)
+        yield
 
 
 def _reply_call(thread_url: str, mode: str, form_js: str, verify_js: str, runner, load_s: int) -> dict:
-    if not thread_url.startswith("https://toyhou.se/~forums/"):
+    if not THREAD_URL.match(thread_url):
         raise ToyhouseError("Нужна ссылка на тред форума Toyhouse.")
     if not chrome_installed():
         raise ChromeSetupError(NOT_INSTALLED_HINT)
-    # Запас: несколько загрузок страниц (переходы к последней) + ожидание после отправки.
-    timeout = LAUNCH_WAIT_S + load_s * 4 + 30 + ERROR_EXTRA_S
+    budget = reply_budget_s(load_s)
+    # Скрипт сам укладывается в бюджет; сверху — запуск Chrome и запас на медленный ответ.
+    timeout = LAUNCH_WAIT_S + budget + ERROR_EXTRA_S
     try:
         done = (runner or subprocess.run)(
             ["osascript", "-l", "JavaScript", "-e", REPLY_JXA, thread_url, mode, form_js, verify_js,
-             str(load_s), str(MAX_HOPS)],
+             str(load_s), str(MAX_HOPS), str(budget)],
             capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
-        raise ToyhouseError("Chrome не ответил вовремя. Отправился ли отклик — неизвестно: "
-                            "посмотрите тред, прежде чем пробовать снова.") from e
+        if mode == "submit":
+            # Клик мог случиться: это не «ошибка», а «неизвестно».
+            return {"state": "uncertain", "error": "osascript timeout", "message": REPLY_MESSAGES["uncertain"]}
+        raise ToyhouseError("Chrome не ответил вовремя — ничего не отправлялось (вкладка могла остаться открытой).") from e
     except OSError as e:
         raise ToyhouseError(f"не получилось запустить osascript: {e}") from e
     if done.returncode != 0:
@@ -393,6 +477,8 @@ def _reply_call(thread_url: str, mode: str, form_js: str, verify_js: str, runner
     try:
         answer = json.loads(done.stdout.strip() or "{}")
     except json.JSONDecodeError as e:
+        if mode == "submit":
+            return {"state": "uncertain", "error": done.stdout[:200], "message": REPLY_MESSAGES["uncertain"]}
         raise ToyhouseError(f"Chrome вернул что-то странное: {done.stdout[:200]}") from e
     state = answer.get("state")
     if state == "tab_closed":
@@ -403,25 +489,37 @@ def _reply_call(thread_url: str, mode: str, form_js: str, verify_js: str, runner
     return answer
 
 
+_TH_LINK = re.compile(r'href="(https://toyhou\.se/[^"]+)"')
+
+
 def run_reply(thread_url: str, html: str, submit: bool, username: str, marker: str, runner=None,
-              load_s: int = 30) -> dict:
+              load_s: int = 30, character_url: str = "", lock_wait_s: float = LOCK_WAIT_S) -> dict:
     """Вставить её отклик в форму ответа треда в её Chrome и, если submit, отправить один раз.
 
-    Возвращает {"state", "message", ...}: posted (+permalink), submitted_unverified, filled,
-    no_form, closed, not_logged_in, fill_failed, no_submit_button, challenge, timeout.
-    Ошибки настройки Chrome бросаются как ChromeSetupError.
+    Возвращает {"state", "message", ...}: posted (+permalink), submitted_unverified,
+    uncertain (клик мог случиться, исход неизвестен — повторять нельзя), filled, no_form (+reason),
+    closed, not_logged_in, fill_failed, no_submit_button, already_submitted,
+    wrong_page (вкладка ушла с треда, ничего не делали), challenge, timeout.
+    Ошибки настройки Chrome бросаются как ChromeSetupError; занятый Chrome — BrowserBusy (до клика).
+    character_url — ссылка на перса из черновика: пост засчитывается, только если она в нём есть
+    (по умолчанию берётся первая ссылка на toyhou.se из html).
     """
     from .th_reply import fill_reply_js, verify_post_js
 
-    return _reply_call(thread_url, "submit" if submit else "fill", fill_reply_js(html, submit),
-                       verify_post_js(marker, username), runner, load_s)
+    if not character_url:
+        m = _TH_LINK.search(html)
+        character_url = m.group(1) if m else ""
+    with chrome_turn(lock_wait_s):
+        return _reply_call(thread_url, "submit" if submit else "fill", fill_reply_js(html, submit),
+                           verify_post_js(marker, username, character_url), runner, load_s)
 
 
-def inspect_reply_form(thread_url: str, runner=None, load_s: int = 30) -> dict:
+def inspect_reply_form(thread_url: str, runner=None, load_s: int = 30, lock_wait_s: float = LOCK_WAIT_S) -> dict:
     """Только посмотреть форму ответа (ничего не вводит и не отправляет), вкладку закрыть."""
     from .th_reply import INSPECT_REPLY_FORM_JS
 
-    answer = _reply_call(thread_url, "inspect", INSPECT_REPLY_FORM_JS, "", runner, load_s)
+    with chrome_turn(lock_wait_s):
+        answer = _reply_call(thread_url, "inspect", INSPECT_REPLY_FORM_JS, "", runner, load_s)
     if answer.get("state") == "inspected" and isinstance(answer.get("form"), str):
         answer["form"] = json.loads(answer["form"])
     return answer
@@ -441,11 +539,13 @@ def open_her_chrome(interactive: bool = False, on_challenge=None):
 # - у тела комментария есть data-commentid (и data-itemid = номер работы), текст — в [data-editor-viewer];
 # - блок комментария — ближайший предок с data-indent="<глубина>";
 # - автор — a[data-username] внутри блока, время — <time datetime="ISO">;
-# - ещё комментарии подгружает кнопка «Load more». Кликаем её, пока число комментариев растёт.
-# argv: url, номер работы, секунд на загрузку, сколько раз жать «Load more».
+# - ещё комментарии подгружает кнопка «Load more» внутри #comments. Кликаем её, пока число комментариев растёт;
+#   если кнопка осталась или комментариев меньше, чем в заголовке «Comments N», — список неполный.
+# argv: url, номер работы, секунд на загрузку, сколько раз жать «Load more», сколько ждать галочку «я человек».
 DA_COMMENTS_JXA = r"""
 function run(argv) {
   const url = argv[0], itemId = argv[1], loadS = Number(argv[2]), maxMore = Number(argv[3]);
+  const challengeS = Number(argv[4] || 0);
   const chrome = Application('Google Chrome');
   if (!chrome.running()) { chrome.launch(); }
   let modes = [];
@@ -480,9 +580,17 @@ function run(argv) {
   const probe = "(document.readyState === 'complete' && document.getElementById('comments')) ? 'ready' : " +
     cf + " ? 'challenge' : 'wait'";
   const countJs = "document.querySelectorAll('[data-commentid][data-itemid=" + JSON.stringify(itemId) + "]').length";
-  const clickJs = "(() => { const re = /^(load more|show more|загрузить ещё|загрузить еще|показать ещё|показать еще)$/i;" +
-    " const b = [...document.querySelectorAll('button')].find(x => re.test(x.textContent.trim()));" +
-    " if (!b || b.disabled) return 'none'; b.click(); return 'clicked'; })()";
+  const moreBtn = "const re = /^(load more|show more|загрузить ещё|загрузить еще|показать ещё|показать еще)$/i;" +
+    " const box = document.getElementById('comments');" +
+    " const b = box ? [...box.querySelectorAll('button')].find(x => re.test(x.textContent.trim()) && !x.disabled) : null;";
+  const clickJs = "(() => { " + moreBtn + " if (!b) return 'none'; b.click(); return 'clicked'; })()";
+  const moreLeftJs = "(() => { " + moreBtn + " return b ? 1 : 0; })()";
+  // Сколько комментариев обещает заголовок («Comments 123»); -1 — не нашли.
+  const totalJs = "(() => { const box = document.getElementById('comments'); if (!box) return -1;" +
+    " const scope = box.parentElement || box; const h = [...scope.querySelectorAll('h1, h2, h3, h4, span, div')]" +
+    ".map(n => n.childElementCount < 3 ? (n.textContent || '').trim() : '')" +
+    ".map(t => /^(?:comments|комментари[а-я]*)\\s*([\\d,.\\s]+)$/i.exec(t)).find(Boolean);" +
+    " return h ? Number(h[1].replace(/[^\\d]/g, '')) : -1; })()";
   const extractJs = "JSON.stringify([...document.querySelectorAll('[data-commentid][data-itemid=" +
     JSON.stringify(itemId) + "]')].map(el => {" +
     " const box = el.closest('[data-indent]') || el;" +
@@ -493,8 +601,8 @@ function run(argv) {
     " posted: t ? t.getAttribute('datetime') : '', depth: Number(box.getAttribute('data-indent') || 0)," +
     " text: (v ? v.innerText : el.innerText || '').trim()}; }))";
 
-  let state = 'wait', lastError = null;
-  const deadline = Date.now() + loadS * 1000;
+  let state = 'wait', lastError = null, waiting = false;
+  let deadline = Date.now() + loadS * 1000;
   try {
     while (Date.now() < deadline) {
       delay(1);
@@ -508,10 +616,17 @@ function run(argv) {
         continue;
       }
       if (state === 'ready') break;
+      // Проверка «я человек»: показываем ей вкладку и ждём галочку (если разрешено ждать).
+      if (state === 'challenge' && !waiting && challengeS > 0) {
+        waiting = true;
+        activate(id);
+        chrome.activate();
+        deadline = Date.now() + challengeS * 1000;
+      }
     }
     if (state !== 'ready') return JSON.stringify({state: state === 'wait' ? 'timeout' : state, error: lastError});
     delay(1.5);  // комментарии дорисовываются после загрузки страницы
-    let clicks = 0;
+    let clicks = 0, stalled = false;
     for (; clicks < maxMore; clicks++) {
       const tab = find();
       if (!tab) return JSON.stringify({state: 'closed'});
@@ -522,16 +637,21 @@ function run(argv) {
         delay(0.5);
         grown = Number(tab.execute({javascript: countJs}) || 0) > before;
       }
-      if (!grown) break;
+      if (!grown) { stalled = true; break; }
     }
     const tab = find();
     if (!tab) return JSON.stringify({state: 'closed'});
-    return JSON.stringify({state: 'ready', clicks: clicks, result: tab.execute({javascript: extractJs})});
+    let moreLeft = 0, total = -1;
+    try { moreLeft = Number(tab.execute({javascript: moreLeftJs}) || 0); } catch (e) {}
+    try { total = Number(tab.execute({javascript: totalJs})); } catch (e) {}
+    return JSON.stringify({state: 'ready', clicks: clicks, stalled: stalled, more_left: moreLeft === 1,
+                           total: isNaN(total) ? -1 : total, result: tab.execute({javascript: extractJs})});
   } finally {
     if (state !== 'challenge' && state !== 'closed') {
       try { const tab = find(); if (tab) tab.close(); } catch (e) {}
     }
-    if (state !== 'challenge' && beforeId !== null) activate(beforeId);
+    if (state === 'challenge') { activate(id); try { chrome.activate(); } catch (e) {} }
+    else if (beforeId !== null) activate(beforeId);
   }
 }
 """
@@ -539,10 +659,27 @@ function run(argv) {
 DA_COMMENTS_HINT_CLOSED = "Вкладку DeviantArt закрыли раньше, чем комментарии загрузились. Можно попросить ещё раз."
 
 
-def run_deviantart_comments(deviation_url: str, max_load_more: int = 20, runner=None, load_s: int = 30) -> list:
+class CommentsPage(list):
+    """Список комментариев (обычный list) + честная пометка, что прочитано не всё.
+
+    incomplete — True, если «Load more» осталась, перестала подгружать или комментариев меньше,
+    чем в заголовке страницы; reason — почему (по-русски, для ответа ей).
+    """
+
+    def __init__(self, items=(), incomplete: bool = False, reason: str = "", total: int | None = None):
+        super().__init__(items)
+        self.incomplete = incomplete
+        self.reason = reason
+        self.total = total
+
+
+def run_deviantart_comments(deviation_url: str, max_load_more: int = 20, runner=None, load_s: int = 30,
+                            challenge_wait_s: int = 120, lock_wait_s: float = LOCK_WAIT_S) -> CommentsPage:
     """Комментарии под работой DeviantArt, прочитанные в её Chrome (если DA не подключён через API).
 
-    Возвращает list[bids.Comment] по времени (старые первыми); parent_id — по вложенности.
+    Возвращает CommentsPage (это list[bids.Comment] по времени, старые первыми; parent_id — по вложенности)
+    с .incomplete/.reason, если прочитаны не все комментарии. Если DeviantArt спросит «я человек»,
+    вкладка выходит на передний план и ждёт галочку до challenge_wait_s секунд.
     """
     from .bids import Comment
     from .da_api import DEVIATION_URL
@@ -553,13 +690,14 @@ def run_deviantart_comments(deviation_url: str, max_load_more: int = 20, runner=
     if not chrome_installed():
         raise ChromeSetupError(NOT_INSTALLED_HINT)
     item_id = m.group(2)
-    # Загрузка + до 6 с на каждую подгрузку + запас.
-    timeout = LAUNCH_WAIT_S + load_s + max_load_more * 7 + ERROR_EXTRA_S
+    # Загрузка + ожидание галочки + до 7 с на каждую подгрузку + запас.
+    timeout = LAUNCH_WAIT_S + load_s + challenge_wait_s + max_load_more * 7 + ERROR_EXTRA_S
     try:
-        done = (runner or subprocess.run)(
-            ["osascript", "-l", "JavaScript", "-e", DA_COMMENTS_JXA, deviation_url.strip(), item_id,
-             str(load_s), str(max_load_more)],
-            capture_output=True, text=True, timeout=timeout, check=False)
+        with chrome_turn(lock_wait_s):
+            done = (runner or subprocess.run)(
+                ["osascript", "-l", "JavaScript", "-e", DA_COMMENTS_JXA, deviation_url.strip(), item_id,
+                 str(load_s), str(max_load_more), str(challenge_wait_s)],
+                capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
         raise ToyhouseError("Chrome не ответил вовремя (вкладка DeviantArt могла остаться открытой)") from e
     except OSError as e:
@@ -583,7 +721,21 @@ def run_deviantart_comments(deviation_url: str, max_load_more: int = 20, runner=
         items = json.loads(answer.get("result") or "[]")
     except json.JSONDecodeError as e:
         raise ToyhouseError("скрипт вернул не JSON") from e
-    return comments_from_page(items if isinstance(items, list) else [], Comment)
+    comments = comments_from_page(items if isinstance(items, list) else [], Comment)
+    return _with_completeness(comments, answer, max_load_more)
+
+
+def _with_completeness(comments: list, answer: dict, max_load_more: int) -> CommentsPage:
+    total = answer.get("total")
+    total = total if isinstance(total, int) and total >= 0 else None
+    reasons = []
+    if answer.get("stalled"):
+        reasons.append("кнопка «Load more» перестала подгружать комментарии")
+    elif answer.get("more_left"):
+        reasons.append(f"после {max_load_more} нажатий «Load more» под работой ещё есть комментарии")
+    if total is not None and len(comments) < total:
+        reasons.append(f"прочитано {len(comments)} из {total} комментариев")
+    return CommentsPage(comments, incomplete=bool(reasons), reason="; ".join(reasons), total=total)
 
 
 def comments_from_page(items: list, comment_cls) -> list:

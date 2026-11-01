@@ -85,3 +85,59 @@ def test_interactive_gives_up_after_wait():
     reader = th.Reader(FakeContext(FakePage(solve_after=None)), interactive=True, challenge_wait_s=30)
     with pytest.raises(th.ChallengeError):
         reader.board(13, 1, now=1_800_000_000)
+
+
+# --- Разбор доски и первого поста ---
+
+def test_first_post_reads_2500_chars():
+    from fixtures_th import LONG_THREAD_HTML
+
+    text = th.parse_first_post(LONG_THREAD_HTML)
+    assert "Budget: $15-$40" in text and "paypal invoice only" in text
+    assert len(th.parse_first_post("<div class='forum-post'><div class='user-content'>" + "a " * 3000 + "</div></div>")) == 2500
+    assert ".slice(0, 2500)" in th.EXTRACT_POST_JS
+
+
+def test_board_rows_keep_raw_class_and_lock():
+    from fixtures_th import board_page, row
+
+    html = board_page(row(1, "LF: cats", "a", 3600, 2, 60, "a", css="row forum-thread-row sticky", locked=True),
+                      row(2, "LF: dogs", "b", 3600, 2, 60, "b"))
+    rows = th.parse_board(html, 13, 1_800_000_000)
+    assert rows[0].row_class == "row forum-thread-row sticky" and rows[0].row_locked is True
+    assert rows[1].row_locked is False
+    item = th.row_to_item(rows[0])
+    assert item.extra["row_class"] == "row forum-thread-row sticky" and item.extra["row_locked"] is True
+    assert "row_class" in th.EXTRACT_BOARD_JS and "row_locked" in th.EXTRACT_BOARD_JS
+
+
+def test_abbr_title_is_fallback_for_time():
+    from fixtures_th import board_page, row
+
+    html = board_page(row(5, "LF: cats", "a", 7200, 2, 300, "a")).replace(
+        'title="x">5 minutes ago', 'title="2026-10-31 20:00:00">sometime')
+    rows = th.parse_board(html, 13, 1_800_000_000)
+    assert rows[0].activity_ts == th.absolute_to_ts("2026-10-31 20:00:00") is not None
+    assert rows[0].created_ts == 1_800_000_000 - 7200
+
+
+@pytest.mark.parametrize("board,url", [
+    (13, "https://toyhou.se/~forums/13.adoption-center"),
+    ("13.adoption-center", "https://toyhou.se/~forums/13.adoption-center"),
+    ("777.closed-species-forum", "https://toyhou.se/~forums/777.closed-species-forum?page=2"),
+])
+def test_board_url_accepts_slug(board, url):
+    assert th.board_url(board, 2 if "777" in str(board) else 1) == url
+
+
+def test_slug_board_place_name():
+    assert th.board_name("777.closed-species-forum") == "Closed Species Forum"
+    assert th.board_name(5866) == "Design Marketplace" and th.board_name(99) == "доска 99"
+
+
+@pytest.mark.parametrize("text,seconds", [("yesterday", 86400), ("today", 0), ("an hour ago", 3600),
+                                          ("a day ago", 86400), ("2 days, 3 hours ago", 2 * 86400 + 3 * 3600)])
+def test_relative_time_words(text, seconds):
+    from mcp_devian.timeparse import relative_seconds
+
+    assert relative_seconds(text) == seconds

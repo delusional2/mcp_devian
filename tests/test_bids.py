@@ -183,3 +183,148 @@ def test_summary_without_bids_and_closed():
 
 def test_money_format():
     assert money(1500, "points") == "1500 pts" and money(12.5, "eur") == "€12.5" and money(None, "usd") == "?"
+
+
+# --- Регрессии по ревью 0.3 ---
+
+@pytest.mark.parametrize("owner_text", [
+    "@bob not sold yet, still open!",
+    "I won't end it early, don't worry",
+    "аукцион ещё не закрыт :)",
+    "@bob this is a closed species, but you can still bid",
+    "@anna you're currently the winner!",
+    "congrats on the first bid @anna!",
+    "thanks! winner gets announced once it ends",
+    "AB not taken yet! still open",
+])
+def test_owner_chatter_does_not_end_auction(owner_text):
+    st = parse_bids(thread(("anna", "SB"), (OWNER, owner_text), ("bob", "$15"), ("cara", "$20")),
+                    OWNER, sb=10, ab=80, currency="usd")
+    assert not st.ended and not st.ab_hit and st.winner is None
+    assert st.top.user == "cara" and st.top.amount == 20
+
+
+@pytest.mark.parametrize("owner_text,winner", [
+    ("Sold to @bob! Will send the files after payment", "bob"),
+    ("Closed! I will send files soon", None),
+    ("Sold for $20! thank you all", None),
+    ("Ended! Winner: TBA after payment check", None),
+    ("Closed, sold to highest bidder", None),
+    ("sold to bob, thanks", "bob"),
+])
+def test_real_close_even_with_future_words(owner_text, winner):
+    st = parse_bids(thread(("anna", "$12"), ("bob", "$20"), (OWNER, owner_text), ("cara", "$25")),
+                    OWNER, sb=10, currency="usd")
+    assert st.ended and st.winner == winner and st.top.amount == 20
+
+
+@pytest.mark.parametrize("owner_text", ["Will be closed tomorrow", "Winner will be announced tomorrow",
+                                        "закроется через сутки после последней ставки"])
+def test_future_close_keeps_auction_open(owner_text):
+    st = parse_bids(thread((OWNER, owner_text), ("anna", "$15")), OWNER, sb=10, currency="usd")
+    assert not st.ended and st.winner is None and st.top.amount == 15
+
+
+@pytest.mark.parametrize("text", ["omg wish I could AB 😭", "dang the AB is too much for me 💔",
+                                  "can I AB with points instead", "SB! (can't afford AB lol)"])
+def test_mentioning_ab_is_not_an_autobuy(text):
+    st = parse_bids(thread(("bob", text)), OWNER, sb=10, ab=80, currency="usd")
+    assert not st.ab_hit and not st.ended and (st.top is None or st.top.amount < 80)
+
+
+def test_ab_username_is_not_ab():
+    st = parse_bids(thread(("bob", "@ab_cat $20")), OWNER, sb=10, ab=80, currency="usd")
+    assert st.top.amount == 20 and st.top.kind == "bid" and not st.ab_hit
+
+
+@pytest.mark.parametrize("text", ["AB!", "AB please", "I'll AB", "AB $80", "автобай"])
+def test_real_ab_claims(text):
+    st = parse_bids(thread(("anna", "$15"), ("bob", text)), OWNER, sb=10, ab=80, currency="usd")
+    assert st.ab_hit and st.ended and st.winner == "bob"
+
+
+def test_retracted_ab_reopens_auction():
+    st = parse_bids(thread(("anna", "$15"), ("bob", "AB!"), ("bob", "nvm sorry, can't pay right now, retracting"),
+                           ("carl", "$20")), OWNER, sb=10, ab=80, currency="usd")
+    assert st.top.user == "carl" and st.top.amount == 20
+    assert not st.ab_hit and not st.ended and st.winner is None
+    assert any("автобай" in n and "снова открыт" in n for n in st.notes)
+
+
+def test_quoted_previous_bid_and_correction():
+    st = parse_bids(thread(("anna", "$20"), ("bob", "@anna bid $20 so I bid $25")), OWNER, sb=10, currency="usd")
+    assert st.top.user == "bob" and st.top.amount == 25
+    st = parse_bids(thread(("anna", "$40"), ("bob", "$30 wait no, $45")), OWNER, sb=10, currency="usd")
+    assert st.top.user == "bob" and st.top.amount == 45
+
+
+def test_ambiguous_multiple_amounts_are_noted_not_guessed():
+    st = parse_bids(thread(("anna", "$15"), ("bob", "$25 or $30")), OWNER, sb=10, currency="usd")
+    assert st.top.user == "anna" and any("несколько сумм" in n for n in st.notes)
+
+
+def test_nvm_with_new_amount_replaces_bid():
+    st = parse_bids(thread(("anna", "$15"), ("bob", "$20"), ("anna", "nvm make it $30 then")),
+                    OWNER, sb=10, currency="usd")
+    assert st.top.user == "anna" and st.top.amount == 30
+
+
+def test_retraction_after_close_is_ignored():
+    st = parse_bids(thread(("anna", "$15"), ("bob", "$20"), (OWNER, "Sold to @bob!"), ("bob", "nvm")),
+                    OWNER, sb=10, currency="usd")
+    assert st.top.user == "bob" and st.winner == "bob" and any("после закрытия" in n for n in st.notes)
+
+
+@pytest.mark.parametrize("text,amount", [
+    ("$15 - I read the TOS", 15), ("$20, read the terms!", 20), ("$30, can be paid immediately", 30),
+])
+def test_tos_and_payment_mentions_are_still_bids(text, amount):
+    st = parse_bids(thread(("anna", text)), OWNER, sb=10, currency="usd")
+    assert st.top is not None and st.top.amount == amount
+
+
+def test_ab_with_tos_note():
+    st = parse_bids(thread(("anna", "AB, TOS read")), OWNER, sb=10, ab=80, currency="usd")
+    assert st.ab_hit and st.top.amount == 80
+
+
+@pytest.mark.parametrize("text,amount", [
+    ("SB please!", 10), ("sb por favor", 10), ("I bid 25", 25), ("20 pls", 20),
+    ("20 dólares", 20), ("Puja: 20", 20), ("oferto 25 dolares", 25),
+])
+def test_common_phrasings(text, amount):
+    st = parse_bids(thread(("anna", text)), OWNER, sb=10, currency="usd")
+    assert st.top is not None and st.top.amount == amount
+
+
+def test_unparsed_short_numeric_comment_gets_a_note():
+    st = parse_bids(thread(("anna", "SB"), ("bob", "20 if possible 2")), OWNER, sb=10, currency="usd")
+    assert any("не поняла" in n or "несколько сумм" in n for n in st.notes) or st.top.user == "bob"
+
+
+def test_find_amounts_dedupes_overlaps():
+    from mcp_devian.bids import find_amounts
+
+    assert [(v, c) for _, v, c in find_amounts("$20 or 25$ or 300 pts")] == [(20, "usd"), (25, "usd"), (300, "points")]
+    assert find_amount("@kitty123 $25") == (25, "usd")
+
+
+def test_bidder_records_one_per_user_highest_first():
+    from mcp_devian.bids import Comment, bidder_records, parse_bids
+
+    comments = [Comment(str(i), None, u, 1000.0 + i, t) for i, (u, t) in enumerate(
+        [("anna", "SB"), ("Kiwi", "$15"), ("anna", "$20"), ("kiwi", "$25"), ("bob", "$26")])]
+    state = parse_bids(comments, owner="moth", sb=10, currency="usd")
+    assert len(state.bids) == 5  # все ставки на месте
+    records = bidder_records(state)
+    assert [(r["user"], r["amount"], r["n"]) for r in records] == [("bob", 26, 1), ("kiwi", 25, 2), ("anna", 20, 2)]
+    assert all(r["currency"] == "usd" and r["ts"] for r in records)
+    assert len(bidder_records(state, limit=2)) == 2
+
+
+def test_points_with_space_thousands():
+    """«1 000 / 1 500 / 2 000 pts» — тысячи через пробел, а не 0 и 500."""
+    st = parse_bids(thread(("anna", "1 000 pts"), ("bob", "1 500 pts"), ("cat", "2 000 points")),
+                    OWNER, sb=1000, currency="points")
+    assert [b.amount for b in st.bids] == [1000, 1500, 2000] and st.top.user == "cat"
+    assert find_amount("#2 100$") == (100, "usd")  # лот 2 за $100, не $2100

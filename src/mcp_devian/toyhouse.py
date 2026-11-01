@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 
 from .config import DATA_DIR
 from .db import Item
-from .timeparse import relative_to_ts
+from .timeparse import absolute_to_ts, relative_to_ts
 
 BASE = "https://toyhou.se"
 PROFILE_DIR = DATA_DIR / "chrome-profile"
@@ -36,6 +36,9 @@ BOARDS = {
     13973: ("13973.character-games-freebies", "Character Games & Freebies"),
 }
 THREAD_ID = re.compile(r"/~forums/(\d+)\.[^/]+/(\d+)\.")
+BOARD_SLUG = re.compile(r"^(\d+)\.[a-z0-9][a-z0-9\-]*$", re.I)
+# Сколько текста первого поста читаем: бюджет и «not looking for» в длинных LF-постах часто ниже 700 символов.
+FIRST_POST_CHARS = 2500
 
 
 class ToyhouseError(Exception):
@@ -65,17 +68,51 @@ class ThreadRow:
     created_ts: float | None
     activity_ts: float | None
     last_poster: str | None
+    # Сырые признаки строки (класс tr, есть ли значок замка). Селекторы за Cloudflare не проверены —
+    # пока только собираем, решения по ним не принимаем.
+    row_class: str | None = None
+    row_locked: bool | None = None
 
 
-def board_url(board_id: int, page: int = 1) -> str:
-    slug = BOARDS[board_id][0] if board_id in BOARDS else str(board_id)
+def board_id(board) -> int:
+    """Номер доски из настройки: 13 или «13.adoption-center»."""
+    if isinstance(board, str):
+        m = BOARD_SLUG.match(board.strip())
+        if m:
+            return int(m.group(1))
+        return int(board.strip())
+    return int(board)
+
+
+def board_url(board, page: int = 1) -> str:
+    """Адрес доски. «id.slug» из настройки берём как есть; номер не из BOARDS — /~forums/<id>
+    (такой адрес не проверен: лучше задавать доску как «id.slug»)."""
+    if isinstance(board, str) and BOARD_SLUG.match(board.strip()):
+        slug = board.strip().lower()
+    else:
+        bid = board_id(board)
+        slug = BOARDS[bid][0] if bid in BOARDS else str(bid)
     url = f"{BASE}/~forums/{slug}"
     return url if page <= 1 else f"{url}?page={page}"
 
 
+def board_name(board) -> str:
+    bid = board_id(board)
+    if bid in BOARDS:
+        return BOARDS[bid][1]
+    if isinstance(board, str) and BOARD_SLUG.match(board.strip()):
+        return board.strip().split(".", 1)[1].replace("-", " ").title()
+    return f"доска {bid}"
+
+
+def _when(relative: str | None, absolute: str | None, now: float) -> float | None:
+    """Относительный текст («4 hours ago») не зависит от пояса; не разобрался — абсолютный title."""
+    return relative_to_ts(relative, now) or absolute_to_ts(absolute)
+
+
 def _abbr_ts(el, now: float) -> float | None:
-    """Время из <abbr class="datetime">. Берём относительный текст: он не зависит от часового пояса."""
-    return relative_to_ts(el.get_text(" ", strip=True), now) if el else None
+    """Время из <abbr class="datetime">: относительный текст, запасной вариант — атрибут title."""
+    return _when(el.get_text(" ", strip=True), el.get("title"), now) if el else None
 
 
 def is_challenge(html_text: str, title: str = "") -> bool:
@@ -116,6 +153,8 @@ def parse_board(html_text: str, board_id: int, now: float) -> list[ThreadRow]:
             created_ts=created,
             activity_ts=_abbr_ts(last_el, now) or created,
             last_poster=last_author.get_text(strip=True) if last_author else None,
+            row_class=" ".join(tr.get("class") or []) or None,
+            row_locked=tr.select_one("[class*=lock]") is not None,
         ))
     return rows
 
@@ -126,17 +165,23 @@ EXTRACT_BOARD_JS = """JSON.stringify([...document.querySelectorAll('tr.forum-thr
   const a = tr.querySelector('.forum-thread-title a');
   const info = tr.querySelector('.forum-thread-info');
   const t = el => el ? el.textContent.replace(/\\s+/g, ' ').trim() : null;
+  const at = el => el ? el.getAttribute('title') : null;
+  const created = info && info.querySelector('abbr.datetime');
+  const last = tr.querySelector('.forum-last-update-date abbr.datetime');
   return {
     title: t(a), href: a && a.href,
     author: t(info && info.querySelector('.display-user a')),
-    created: t(info && info.querySelector('abbr.datetime')),
+    created: t(created), created_title: at(created),
     posts: t(tr.querySelector('.forum-thread-posts')),
-    last: t(tr.querySelector('.forum-last-update-date abbr.datetime')),
+    last: t(last), last_title: at(last),
     last_poster: t(tr.querySelector('.forum-last-update-author .display-user a')),
+    row_class: tr.className || null,
+    row_locked: !!tr.querySelector('[class*=lock]'),
   };
 }))"""
 
-EXTRACT_POST_JS = """(document.querySelector('.forum-post .user-content') || {innerText: ''}).innerText.slice(0, 700)"""
+EXTRACT_POST_JS = ("""(document.querySelector('.forum-post .user-content') || {innerText: ''}).innerText"""
+                   f""".slice(0, {FIRST_POST_CHARS})""")
 
 
 def rows_from_extracted(items: list[dict], board_id: int, now: float) -> list[ThreadRow]:
@@ -151,7 +196,7 @@ def rows_from_extracted(items: list[dict], board_id: int, now: float) -> list[Th
         if not m or not title or not href.startswith(BASE + "/~forums/"):
             continue
         posts_m = re.search(r"\d[\d,]*", str(it.get("posts") or ""))
-        created = relative_to_ts(it.get("created"), now)
+        created = _when(it.get("created"), it.get("created_title"), now)
         rows.append(ThreadRow(
             board_id=board_id,
             thread_id=m.group(2),
@@ -160,13 +205,15 @@ def rows_from_extracted(items: list[dict], board_id: int, now: float) -> list[Th
             author=it.get("author") or None,
             posts=int(posts_m.group().replace(",", "")) if posts_m else None,
             created_ts=created,
-            activity_ts=relative_to_ts(it.get("last"), now) or created,
+            activity_ts=_when(it.get("last"), it.get("last_title"), now) or created,
             last_poster=it.get("last_poster") or None,
+            row_class=str(it.get("row_class"))[:200] if it.get("row_class") else None,
+            row_locked=bool(it.get("row_locked")) if it.get("row_locked") is not None else None,
         ))
     return rows
 
 
-def parse_first_post(html_text: str, limit: int = 700) -> str | None:
+def parse_first_post(html_text: str, limit: int = FIRST_POST_CHARS) -> str | None:
     soup = BeautifulSoup(html_text, "html.parser")
     body = soup.select_one(".forum-post .user-content")
     if not body:
@@ -181,11 +228,12 @@ def row_to_item(row: ThreadRow) -> Item:
         title=row.title,
         url=row.url,
         author=row.author,
-        place=BOARDS[row.board_id][1] if row.board_id in BOARDS else f"доска {row.board_id}",
+        place=board_name(row.board_id),
         posts=row.posts,
         activity_ts=row.activity_ts,
         published_ts=row.created_ts,
-        extra={"board_id": row.board_id, "last_poster": row.last_poster},
+        extra={"board_id": row.board_id, "last_poster": row.last_poster, "row_class": row.row_class,
+               "row_locked": row.row_locked},
     )
 
 
@@ -312,8 +360,8 @@ class Reader:
         except Exception:
             return None
 
-    def board(self, board_id: int, page: int, now: float) -> list[ThreadRow]:
-        return parse_board(self.get(board_url(board_id, page), "tr.forum-thread-row"), board_id, now)
+    def board(self, board, page: int, now: float) -> list[ThreadRow]:
+        return parse_board(self.get(board_url(board, page), "tr.forum-thread-row"), board_id(board), now)
 
     def first_post(self, url: str) -> str | None:
         return parse_first_post(self.get(url, ".forum-post"))
