@@ -2,8 +2,9 @@
 
 Что есть в данных: стартовые цены (SB) аукционов и фикс-цены, тип лота, теги,
 когда лот появился, когда последний раз встречался в ленте (updated_ts) и когда
-впервые стал закрытым (closed_ts). Чего нет: финальных ставок (они в комментариях)
-и того, продан ли лот на самом деле — «закрыт» не всегда значит «продан».
+впервые стал закрытым (closed_ts). Ставки берутся из таблицы auctions (разбор
+комментариев, bids.py) — только для лотов, чьи комментарии читали; разбор может
+ошибаться. «Закрыт» не всегда значит «продан».
 Поэтому прогноз — это ориентир по похожим лотам, а не обещание.
 """
 
@@ -13,6 +14,7 @@ import statistics
 import time
 from dataclasses import dataclass, field
 
+from .bids import money
 from .classify import TAG_TYPES, keyword_hits
 
 DAY = 86400
@@ -122,6 +124,21 @@ class Position:
 
 
 @dataclass
+class BidStats:
+    """Ставки по аукционам из комментариев: финальные (закрытые) и текущие (открытые)."""
+    final: dict[str, PriceStats] = field(default_factory=dict)      # unit -> максимальные ставки закрытых
+    final_sb: dict[str, PriceStats] = field(default_factory=dict)   # unit -> их SB
+    ratio: dict[str, float | None] = field(default_factory=dict)    # unit -> медиана «ставка / SB»
+    ratio_n: dict[str, int] = field(default_factory=dict)
+    current: dict[str, PriceStats] = field(default_factory=dict)    # unit -> текущие ставки открытых
+    no_bids_closed: int = 0                                          # закрылись без единой ставки
+
+    @property
+    def n(self) -> int:
+        return sum(s.n for s in self.final.values())
+
+
+@dataclass
 class Forecast:
     keywords: list[str]
     ignored_keywords: list[str]   # слишком общие, не участвовали
@@ -140,6 +157,7 @@ class Forecast:
     other_currency: int
     confidence: str
     positions: list[Position] = field(default_factory=list)
+    bids: BidStats = field(default_factory=BidStats)
 
     # Старые имена полей — для совместимости.
     @property
@@ -186,6 +204,58 @@ def comparables(conn, keywords: list[str], lot_type: str | None = None, days: in
     if len(hits) >= MIN_SIMILAR:
         return hits, hits, False
     return rows, hits, True
+
+
+def _auction_rows(conn, rows) -> dict[str, dict]:
+    """Строки таблицы auctions для этих лотов (если таблицы нет или пусто — {})."""
+    ids = [r["id"] for r in rows if GROUP_OF.get(r["lot_type"]) == "auction"]
+    out: dict[str, dict] = {}
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        try:
+            found = conn.execute(f"SELECT * FROM auctions WHERE deviation_id IN ({','.join('?' * len(chunk))})",
+                                 chunk).fetchall()
+        except Exception:  # noqa: BLE001 — старая база без таблицы auctions
+            return {}
+        out.update({a["deviation_id"]: dict(a) for a in found})
+    return out
+
+
+def bid_stats(conn, rows) -> BidStats:
+    auctions = _auction_rows(conn, rows)
+    result = BidStats()
+    if not auctions:
+        return result
+    by_id = {r["id"]: r for r in rows}
+    finals: dict[str, list[float]] = {u: [] for u in UNITS}
+    sbs: dict[str, list[float]] = {u: [] for u in UNITS}
+    ratios: dict[str, list[float]] = {u: [] for u in UNITS}
+    current: dict[str, list[float]] = {u: [] for u in UNITS}
+    for dev_id, a in auctions.items():
+        r = by_id.get(dev_id)
+        unit = a.get("currency")
+        if r is None or unit not in UNITS:
+            continue
+        ended = bool(a.get("ended")) or r["status"] == "closed"
+        if not a.get("n_bids") or not a.get("top_amount"):
+            result.no_bids_closed += ended
+            continue
+        top = float(a["top_amount"])
+        if ended:
+            finals[unit].append(top)
+            sb = r[f"price_{unit}"]
+            if sb:
+                sbs[unit].append(sb)
+                ratios[unit].append(top / sb)
+        else:
+            current[unit].append(top)
+    for u in UNITS:
+        result.final[u] = price_stats(list(finals[u]))
+        result.final_sb[u] = price_stats(list(sbs[u]))
+        result.ratio[u] = statistics.median(ratios[u]) if ratios[u] else None
+        result.ratio_n[u] = len(ratios[u])
+        result.current[u] = price_stats(list(current[u]))
+    return result
 
 
 def _confidence(n: int) -> str:
@@ -269,6 +339,7 @@ def forecast(conn, keywords: list[str], lot_type: str | None = None, my_usd: flo
                            and ("€" in r["price_text"] or "£" in r["price_text"])),
         confidence=level,
         positions=positions,
+        bids=bid_stats(conn, rows),
     )
 
 
@@ -339,14 +410,53 @@ def render(fc: Forecast, lot_type: str | None = None) -> str:
         lines.append("Не учтены в «закрылись»: " + ", ".join(skipped) + ".")
     if fc.other_currency:
         lines.append(f"{fc.other_currency} лотов с ценой в €/£ — в статистику $ не включены.")
+    lines += _bid_lines(fc.bids)
+    bids_note = ("ставки взяты из комментариев только тех лотов, которые читали, и разбор может ошибаться"
+                 if fc.bids.n or any(s.n for s in fc.bids.current.values())
+                 else "финальных ставок пока не видно (комментарии ещё не читали)")
     lines += [
         "",
-        "Ограничения: SB — стартовая цена, финальных ставок не видно; «закрыт» не всегда «продан»; "
+        f"Ограничения: SB — стартовая цена; {bids_note}; «закрыт» не всегда «продан»; "
         "данные только из папок и галерей, которые отслеживаются, и копятся с момента установки.",
         "",
         GENTLE,
     ]
     return "\n".join(lines)
+
+
+def _bid_lines(b: BidStats) -> list[str]:
+    lines = []
+    for unit in UNITS:
+        final, sb, ratio = b.final.get(unit), b.final_sb.get(unit), b.ratio.get(unit)
+        if final and final.n:
+            assert final.median is not None
+            if sb and sb.n and ratio:
+                assert sb.median is not None
+                line = (f"По ставкам: аукционы с SB около {_fmt(sb.median, unit)} уходят примерно за "
+                        f"{_fmt(final.median, unit)} (×{ratio:.1f}), по {final.n} {'лоту' if final.n == 1 else 'лотам'}")
+            else:
+                line = f"По ставкам: закрытые аукционы ушли примерно за {_fmt(final.median, unit)}, по {final.n} лотам"
+            if final.n < 5:
+                line += f" — цены: {', '.join(_fmt(v, unit) for v in final.values)}; лотов мало, это скорее ориентир"
+            lines.append(line)
+        current = b.current.get(unit)
+        if current and current.n:
+            assert current.median is not None
+            lines.append(f"Сейчас на открытых аукционах ставки около {_fmt(current.median, unit)} "
+                         f"(по {current.n}, ещё могут вырасти)")
+    if b.no_bids_closed:
+        lines.append(f"Закрылись без единой ставки: {b.no_bids_closed}")
+    return lines
+
+
+def _her_bids(conn, ids: list[str]) -> dict[str, dict]:
+    if not ids:
+        return {}
+    try:
+        rows = conn.execute(f"SELECT * FROM auctions WHERE deviation_id IN ({','.join('?' * len(ids))})", ids).fetchall()
+    except Exception:  # noqa: BLE001 — старая база без таблицы auctions
+        return {}
+    return {a["deviation_id"]: dict(a) for a in rows}
 
 
 def my_works(conn, days: int = 90, now: float | None = None) -> str:
@@ -359,11 +469,18 @@ def my_works(conn, days: int = 90, now: float | None = None) -> str:
         return ("Её работ в базе пока нет. Нужен её ник на DeviantArt (update_settings my_da_username), "
                 "после ближайшей проверки галерея подтянется.")
     lines = [f"Её работ за {days} дн: {len(rows)}"]
+    her_bids = _her_bids(conn, [r["id"] for r in rows[:15]])
     for r in rows[:15]:
         status = {"closed": "закрыт", "open": "открыт"}.get(r["status"], "статус не указан")
         bits = [r["lot_type"] or "", r["price_text"] or "", status]
         if r["status"] == "closed" and r["closed_ts"] and r["closed_ts"] > r["first_seen_ts"]:
             bits.append(f"закрылся за {(r['closed_ts'] - _start(r)) / DAY:.1f} дн")
+        a = her_bids.get(r["id"])
+        if a and a.get("n_bids") and a.get("top_amount"):
+            bits.append(f"ставок {a['n_bids']}, максимум {money(float(a['top_amount']), a['currency'] or 'usd')}"
+                        + (f" у {a['winner']}" if a.get("winner") else ""))
+        elif a:
+            bits.append("ставок пока нет")
         lines.append(f"- {r['title']} — {' · '.join(b for b in bits if b)}")
     lines += ["", GENTLE]
     return "\n".join(lines)

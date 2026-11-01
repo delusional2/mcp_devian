@@ -102,3 +102,22 @@ def test_bot_login_spawns_window(monkeypatch):
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda cmd, **kw: started.append(cmd))
     assert "Пароль" in mcp_server.bot_login()
     assert started and started[0][-1] == "login"
+
+
+def test_posting_settings_via_tool():
+    out = mcp_server.update_settings(da_client_id="12345", th_username="@mothy", th_auto_submit=False,
+                                     toyhouse_poll_minutes=90, default_noai=True)
+    assert "Сохранено" in out
+    cfg = load_config()
+    assert cfg.posting.da_client_id == "12345" and cfg.posting.th_username == "mothy"
+    assert cfg.posting.th_auto_submit is False and cfg.toyhouse.poll_minutes == 90
+    assert "Не сохранила" in mcp_server.update_settings(da_client_id="abc")
+    assert "Не сохранила" in mcp_server.update_settings(toyhouse_poll_minutes=5)
+
+
+def test_da_connect_without_client_id_explains_steps(monkeypatch):
+    from mcp_devian import posting
+
+    monkeypatch.setattr(posting, "SENDING_ENABLED", True)
+    out = mcp_server.da_connect()
+    assert "developers/register" in out and "http://localhost:8765/callback" in out and "client_secret НЕ нужен" in out

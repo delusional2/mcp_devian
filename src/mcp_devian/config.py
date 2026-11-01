@@ -63,6 +63,33 @@ class Toyhouse:
 class Notify:
     macos: bool = True
     telegram: bool = False
+    # Она продаёт, а не покупает: чужие лоты DA — только данные для цен, без уведомлений «можно купить».
+    market_lots: bool = False
+
+
+@dataclass
+class Posting:
+    # Шаблоны откликов — только её текст, слово в слово. Слоты: {name} {url} {price} {note}.
+    reply_templates: dict[str, str] = field(default_factory=dict)
+    # Её персонажи на продажу: {"name", "url", "price", "tags": [...]}.
+    characters: list[dict] = field(default_factory=list)
+    # Наборы групп DA: имя → [{"group", "folder_id", "folder_name"}].
+    group_presets: dict[str, list[dict]] = field(default_factory=dict)
+    th_replies_per_day: int = 8
+    th_min_gap_minutes: int = 3
+    th_same_character_per_day: int = 2
+    th_thread_cooldown_days: int = 7
+    da_submissions_per_group_per_day: int = 3
+    # Её ник на Toyhouse: по нему проверяем, что отклик появился в треде.
+    th_username: str = ""
+    # True — по «го» отклик отправляется сам; False — текст вставляется, «Post» она жмёт сама.
+    th_auto_submit: bool = False
+    # client_id приложения DeviantArt (публичный, секрета нет).
+    da_client_id: str = ""
+    # Её работы по умолчанию: не 18+, не ИИ, запрет на обучение ИИ.
+    default_is_mature: bool = False
+    default_is_ai_generated: bool = False
+    default_noai: bool = True
 
 
 @dataclass
@@ -71,6 +98,7 @@ class Config:
     deviantart: DeviantArt = field(default_factory=DeviantArt)
     toyhouse: Toyhouse = field(default_factory=Toyhouse)
     notify: Notify = field(default_factory=Notify)
+    posting: Posting = field(default_factory=Posting)
     configured: bool = False
     configured_at: float = 0
     path: Path | None = None
@@ -78,7 +106,8 @@ class Config:
     unreadable: bool = False
 
 
-SECTIONS = {"filters": Filters, "deviantart": DeviantArt, "toyhouse": Toyhouse, "notify": Notify}
+SECTIONS = {"filters": Filters, "deviantart": DeviantArt, "toyhouse": Toyhouse, "notify": Notify,
+            "posting": Posting}
 
 
 def settings_path() -> Path:
@@ -131,6 +160,7 @@ def load_config(path: Path | None = None) -> Config:
         deviantart=deviantart,
         toyhouse=_pick(Toyhouse, _section(raw, "toyhouse", warnings), "toyhouse", warnings),
         notify=_pick(Notify, _section(raw, "notify", warnings), "notify", warnings),
+        posting=_pick(Posting, _section(raw, "posting", warnings), "posting", warnings),
         configured=bool(raw.get("configured")),
         configured_at=float(raw.get("configured_at") or 0),
         path=path,
@@ -244,6 +274,25 @@ def apply_changes(cfg: Config, changes: dict) -> list[str]:
             da.poll_minutes = int(_number(value, key, MIN_POLL_MINUTES))
         elif key == "toyhouse_poll_minutes":
             th.poll_minutes = int(_number(value, key, MIN_POLL_MINUTES))
+        elif key in ("th_replies_per_day", "th_min_gap_minutes", "th_same_character_per_day",
+                     "th_thread_cooldown_days", "da_submissions_per_group_per_day"):
+            setattr(cfg.posting, key, int(_number(value, key, 1)))
+        elif key == "th_username":
+            name = str(value).strip().strip("@").rstrip("/").split("toyhou.se/")[-1].split("/")[0]
+            if name and not all(c.isalnum() or c in "-_" for c in name):
+                raise SettingsError("th_username: ник Toyhouse из букв, цифр, - и _")
+            cfg.posting.th_username = name
+        elif key == "th_auto_submit":
+            cfg.posting.th_auto_submit = bool(value)
+        elif key == "da_client_id":
+            client_id = str(value).strip()
+            if client_id and not client_id.isdigit():
+                raise SettingsError("da_client_id: это число из настроек приложения DeviantArt")
+            cfg.posting.da_client_id = client_id
+        elif key in ("default_is_mature", "default_is_ai_generated", "default_noai"):
+            setattr(cfg.posting, key, bool(value))
+        elif key == "notify_market_lots":
+            nt.market_lots = bool(value)
         elif key == "notify_macos":
             nt.macos = bool(value)
         elif key == "notify_telegram":

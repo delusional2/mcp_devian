@@ -93,7 +93,7 @@ def test_closed_ts_resets_when_lot_reopens(tmp_path):
 
 
 def test_market_only_folder_drops_closed_lot(tmp_path, monkeypatch):
-    from mcp_devian.config import DAGroup, DeviantArt
+    from mcp_devian.config import DAGroup, DeviantArt, Notify
 
     rss_open = """<rss xmlns:media="http://search.yahoo.com/mrss/"><channel><item>
       <title>Dragon adopt auction [OPEN] SB: $10</title>
@@ -103,11 +103,13 @@ def test_market_only_folder_drops_closed_lot(tmp_path, monkeypatch):
 
     monkeypatch.setattr(monitor.da, "polite_pause", lambda: None)
     with db.session(tmp_path / "m.sqlite3") as conn:
-        cfg = Config(deviantart=DeviantArt(groups=[DAGroup(url="https://www.deviantart.com/g/gallery/1/a")]))
+        cfg = Config(notify=Notify(market_lots=True),
+                     deviantart=DeviantArt(groups=[DAGroup(url="https://www.deviantart.com/g/gallery/1/a")]))
         monitor.check_deviantart(conn, cfg, NOW, http=httpx.Client(transport=httpx.MockTransport(
             lambda r: httpx.Response(200, text=rss_open))))
         assert db.get_item(conn, "da:1404000001")["matched"] == 1
-        cfg = Config(deviantart=DeviantArt(groups=[DAGroup(url="https://www.deviantart.com/m/gallery/2/b", notify=False)]))
+        cfg = Config(notify=Notify(market_lots=True),
+                     deviantart=DeviantArt(groups=[DAGroup(url="https://www.deviantart.com/m/gallery/2/b", notify=False)]))
         monitor.check_deviantart(conn, cfg, NOW + 60, http=httpx.Client(transport=httpx.MockTransport(
             lambda r: httpx.Response(200, text=rss_closed))))
         assert db.get_item(conn, "da:1404000001")["matched"] == 0

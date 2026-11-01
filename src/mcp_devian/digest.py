@@ -128,6 +128,19 @@ def send_telegram(chunks: list[str]) -> str | None:
     return None
 
 
+def notify_bids(cfg: Config, events: list) -> None:
+    """Новые ставки на её аукционах — отдельным уведомлением, это важнее дайджеста."""
+    from .auctions import describe_event
+
+    if not events:
+        return
+    lines = [describe_event(e) for e in events[:5]]
+    if cfg.notify.macos:
+        notify_macos("Ставки", "; ".join(lines)[:220])
+    if cfg.notify.telegram:
+        send_telegram(["\n".join(html.escape(line) for line in lines)])
+
+
 def deliver(conn, cfg: Config, problems: list[str] | None = None) -> dict:
     """Отправляет всё новое, что ещё не уходило. Возвращает, что сделано."""
     rows = db.pending_digest(conn)

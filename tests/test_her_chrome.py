@@ -198,3 +198,95 @@ def test_check_toyhouse_chrome_mode_setup_error(tmp_path):
     with db.session(tmp_path / "t.sqlite3") as conn:
         res = monitor.check_toyhouse(conn, cfg, NOW, interactive=True, her_chrome_session=session)
     assert "Автоматизация" in res.error
+
+
+# --- DeviantArt: комментарии в её Chrome ---
+
+DA_URL = "https://www.deviantart.com/fuvuart/art/Adopt-3-OPEN-1404679584"
+
+# Как их отдаёт скрипт со страницы: порядок как на экране (новые ветки сверху, ответы под родителем).
+PAGE_ROWS = [
+    {"comment_id": "30", "user": "carol", "posted": "2026-10-31T22:00:00.000Z", "depth": 0, "text": "$25"},
+    {"comment_id": "31", "user": "Fuvuart", "posted": "2026-10-31T22:05:00.000Z", "depth": 1, "text": "ok!"},
+    {"comment_id": "32", "user": "carol", "posted": "2026-10-31T22:06:00.000Z", "depth": 2, "text": "yay"},
+    {"comment_id": "10", "user": "alice", "posted": "2026-10-31T20:00:00.000Z", "depth": 0, "text": "SB"},
+    {"comment_id": "11", "user": "bob", "posted": "2026-10-31T21:00:00.000Z", "depth": 1, "text": "+5"},
+    {"comment_id": "10", "user": "alice", "posted": "2026-10-31T20:00:00.000Z", "depth": 0, "text": "SB"},  # дубль
+]
+
+
+def test_deviantart_comments_parents_and_order():
+    run = fake_osascript([ok(json.dumps(PAGE_ROWS))])
+    out = her_chrome.run_deviantart_comments(DA_URL, max_load_more=7, runner=run)
+    assert [c.comment_id for c in out] == ["10", "11", "30", "31", "32"]  # по времени, без дубля
+    parents = {c.comment_id: c.parent_id for c in out}
+    assert parents == {"10": None, "11": "10", "30": None, "31": "30", "32": "31"}
+    assert [c.depth for c in out] == [0, 1, 0, 1, 2]
+    cmd = run.calls[0]
+    assert cmd[:3] == ["osascript", "-l", "JavaScript"]
+    assert cmd[5:9] == [DA_URL, "1404679584", "30", "7"]
+    assert "data-commentid" in cmd[4] and "Load more" not in cmd[5:]  # селекторы внутри скрипта, не в argv
+
+
+def test_deviantart_comments_empty_page():
+    assert her_chrome.run_deviantart_comments(DA_URL, runner=fake_osascript([ok("[]")])) == []
+
+
+@pytest.mark.parametrize("url", ["https://toyhou.se/~forums/13.x/1.y", "https://www.deviantart.com/a/gallery/1",
+                                 "https://evil.example/a/art/x-1", "https://www.deviantart.com/a/art/no-number"])
+def test_deviantart_comments_rejects_other_urls(url):
+    run = fake_osascript([ok("[]")])
+    with pytest.raises(th.ToyhouseError):
+        her_chrome.run_deviantart_comments(url, runner=run)
+    assert run.calls == []
+
+
+@pytest.mark.parametrize("answer,exc,text", [
+    (state("challenge"), th.ChallengeError, "человек"),
+    (state("closed"), th.ToyhouseError, "закрыли"),
+    (state("timeout"), th.ToyhouseError, "не загрузилась"),
+    ((0, json.dumps({"state": "error", "error": RU_DISABLED}), ""), her_chrome.ChromeSetupError, "событий Apple"),
+    ((1, "", "execution error: Error: Произошла ошибка. (-1743)"), her_chrome.ChromeSetupError, "Автоматизация"),
+    ((0, "не json", ""), th.ToyhouseError, "странное"),
+])
+def test_deviantart_comments_errors(answer, exc, text):
+    with pytest.raises(exc, match=text):
+        her_chrome.run_deviantart_comments(DA_URL, runner=fake_osascript([answer]))
+
+
+def test_deviantart_comments_without_chrome(monkeypatch, tmp_path):
+    monkeypatch.setattr(her_chrome, "CHROME_PATHS", [tmp_path / "нет.app"])
+    run = fake_osascript([ok("[]")])
+    with pytest.raises(her_chrome.ChromeSetupError, match="Не нашла Google Chrome"):
+        her_chrome.run_deviantart_comments(DA_URL, runner=run)
+    assert run.calls == []
+
+
+def test_deviantart_comments_timeout_bounded():
+    seen = {}
+
+    def run(cmd, **kw):
+        seen["timeout"] = kw["timeout"]
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    with pytest.raises(th.ToyhouseError, match="не ответил"):
+        her_chrome.run_deviantart_comments(DA_URL, max_load_more=5, runner=run, load_s=20)
+    assert seen["timeout"] == her_chrome.LAUNCH_WAIT_S + 20 + 5 * 7 + her_chrome.ERROR_EXTRA_S
+
+
+def test_da_jxa_and_generated_js_are_valid(tmp_path):
+    import shutil
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("нет node")
+    src = her_chrome.DA_COMMENTS_JXA.replace("function run(", "function run_(")
+    check = tmp_path / "check.js"
+    check.write_text(src + """
+const pick = (name) => { const m = String(run_).match(new RegExp("const " + name + " = ([\\\\s\\\\S]*?);\\\\n")); return m[1]; };
+const itemId = "1404679584";
+const cf = eval(pick('cf'));
+for (const n of ['probe', 'countJs', 'clickJs', 'extractJs']) { new Function("return (" + eval(pick(n)) + ");"); }
+""", encoding="utf-8")
+    done = subprocess.run([node, str(check)], capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr

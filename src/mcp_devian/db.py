@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import time
@@ -47,6 +48,47 @@ CREATE TABLE IF NOT EXISTS runs (
     last_error TEXT,
     fail_count INTEGER DEFAULT 0
 );
+
+-- Всё, что может уйти на сайт, сначала черновик: она видит его целиком и говорит «го».
+CREATE TABLE IF NOT EXISTS drafts (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,            -- da_groups | th_reply
+    status TEXT NOT NULL,          -- pending | sending | sent | failed | cancelled
+    created_ts REAL NOT NULL,
+    payload TEXT NOT NULL,         -- JSON: что именно отправить
+    preview TEXT NOT NULL,         -- что ей показали
+    result TEXT,
+    sent_ts REAL
+);
+
+-- Журнал отправок: по нему считаются лимиты.
+CREATE TABLE IF NOT EXISTS sent_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,            -- da_group | th_reply
+    target TEXT NOT NULL,          -- группа DA или id треда
+    ref TEXT,                      -- работа DA или персонаж
+    ts REAL NOT NULL,
+    ok INTEGER NOT NULL,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS sent_log_kind_ts ON sent_log(kind, ts);
+
+-- Состояние аукционов по комментариям (ставки). Для её лотов и для рыночной статистики.
+CREATE TABLE IF NOT EXISTS auctions (
+    deviation_id TEXT PRIMARY KEY, -- как в items: da:<id>
+    owner TEXT,
+    top_amount REAL,               -- текущая/финальная максимальная ставка
+    currency TEXT,                 -- usd | points | eur | gbp
+    n_bids INTEGER DEFAULT 0,
+    bidders INTEGER DEFAULT 0,
+    last_bid_ts REAL,
+    ab_hit INTEGER DEFAULT 0,      -- кто-то взял автобай
+    ended INTEGER DEFAULT 0,       -- автор написал, что закрыто/продано
+    winner TEXT,
+    comments_seen INTEGER DEFAULT 0,
+    updated_ts REAL NOT NULL,
+    extra TEXT
+);
 """
 
 # Колонки, добавленные после первой версии схемы.
@@ -86,6 +128,7 @@ class Item:
 
 
 ITEM_COLUMNS = [f for f in Item.__dataclass_fields__ if f != "extra"]
+KEEP_EXTRA = ("uuid",)
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
@@ -120,8 +163,13 @@ def upsert_item(conn: sqlite3.Connection, item: Item, now: float | None = None) 
     data = asdict(item)
     extra = json.dumps(data.pop("extra"), ensure_ascii=False)
     closed = now if item.status == "closed" else None
-    old = conn.execute("SELECT status, closed_ts FROM items WHERE id = ?", (item.id,)).fetchone()
+    old = conn.execute("SELECT status, closed_ts, extra FROM items WHERE id = ?", (item.id,)).fetchone()
     if old:
+        # Служебные поля, которые мы досчитали сами (UUID работы), не теряем при повторном чтении ленты.
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            kept = {k: v for k, v in json.loads(old["extra"] or "{}").items() if k in KEEP_EXTRA}
+            if kept:
+                extra = json.dumps({**json.loads(extra), **kept}, ensure_ascii=False)
         # Момент закрытия нужен для прогноза «как быстро уходят похожие». Если лот снова открыли
         # (ON HOLD → OPEN), сбрасываем: следующее закрытие запишется заново.
         closed = (old["closed_ts"] or now) if item.status == "closed" else None

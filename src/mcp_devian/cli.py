@@ -90,7 +90,12 @@ def _check_job(args) -> int:
         with db.session() as conn:
             results = monitor.run_check(conn, cfg, sources=sources, force=True, interactive=True,
                                         manual_cooldown=True)
-        jobs.finish(args.job, monitor.format_results(results))
+            lines = monitor.format_results(results)
+            if "deviantart" in sources:
+                bid_lines, events = monitor.refresh_auctions(conn, cfg)
+                lines += bid_lines
+                digest.notify_bids(cfg, events)
+        jobs.finish(args.job, lines)
         return 0
     except Exception as e:
         traceback.print_exc()
@@ -108,6 +113,11 @@ def _check(args, tick: float | None) -> int:
         results = monitor.run_check(conn, cfg, sources=sources, force=not args.scheduled, now=tick,
                                     interactive=not args.scheduled)
         _print_results(results)
+        if any(r.source == "deviantart" and not r.skipped for r in results):
+            bid_lines, events = monitor.refresh_auctions(conn, cfg)
+            for line in bid_lines:
+                print(line)
+            digest.notify_bids(cfg, events)
         if args.notify or args.scheduled:
             sent = digest.deliver(conn, cfg, _problems(before, results, cfg.toyhouse.mode))
             if sent["items"]:
@@ -203,6 +213,26 @@ def cmd_uninstall(args) -> int:
     return 0
 
 
+def cmd_send_draft(args) -> int:
+    """Отправка черновика в отдельном процессе (запускает submit_draft)."""
+    from . import posting
+
+    cfg = load_config()
+    with db.session() as conn:
+        print(posting.send(conn, cfg, args.draft_id))
+    return 0
+
+
+def cmd_da_connect(args) -> int:
+    from . import da_api
+
+    cfg = load_config()
+    if not cfg.posting.da_client_id:
+        print("Нет client_id приложения DeviantArt.")
+        return 1
+    return da_api.connect_main(cfg.posting.da_client_id)
+
+
 def cmd_serve(args) -> int:
     from .mcp_server import main as serve
 
@@ -242,6 +272,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("uninstall", help="выключить автозапуск").set_defaults(func=cmd_uninstall)
 
     sub.add_parser("serve", help="MCP-сервер для Claude (stdio)").set_defaults(func=cmd_serve)
+
+    sd = sub.add_parser("send-draft", help="отправить черновик (запускается из чата)")
+    sd.add_argument("draft_id")
+    sd.set_defaults(func=cmd_send_draft)
+    sub.add_parser("da-connect", help="подключить DeviantArt (кнопка «Разрешить» в браузере)").set_defaults(func=cmd_da_connect)
 
     args = p.parse_args(argv)
     return args.func(args)

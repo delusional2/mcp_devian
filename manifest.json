@@ -2,8 +2,8 @@
   "manifest_version": "0.4",
   "name": "mcp-devian",
   "display_name": "Адопты: DeviantArt и Toyhouse",
-  "version": "0.2.1",
-  "description": "Следит за группами DeviantArt и форумами Toyhouse, находит адоптов и LF-треды, подсказывает цены по рынку.",
+  "version": "0.3.0",
+  "description": "Следит за группами DeviantArt и форумами Toyhouse, подсказывает цены и публикует по её «го».",
   "long_description": "После установки просто напиши Claude «давай настроим помощника по адоптам» — он сам задаст вопросы. Ничего не публикует.",
   "author": {
     "name": "Andrei Bugerov"
@@ -117,6 +117,78 @@
     {
       "name": "feedback_sent",
       "description": "Отметить отзывы отправленными"
+    },
+    {
+      "name": "da_connect",
+      "description": "Подключить DeviantArt (кнопка «Разрешить»)"
+    },
+    {
+      "name": "da_status",
+      "description": "Подключён ли DeviantArt"
+    },
+    {
+      "name": "add_group_to_preset",
+      "description": "Добавить группу в набор"
+    },
+    {
+      "name": "remove_group_from_preset",
+      "description": "Убрать группу из набора"
+    },
+    {
+      "name": "recent_images",
+      "description": "Последние картинки для публикации"
+    },
+    {
+      "name": "prepare_deviantart_publish",
+      "description": "Черновик публикации на DeviantArt"
+    },
+    {
+      "name": "set_reply_template",
+      "description": "Её шаблон отклика"
+    },
+    {
+      "name": "add_character",
+      "description": "Добавить перса на продажу"
+    },
+    {
+      "name": "remove_character",
+      "description": "Убрать перса"
+    },
+    {
+      "name": "suggest_replies",
+      "description": "LF-треды под её персов"
+    },
+    {
+      "name": "prepare_toyhouse_reply",
+      "description": "Черновик отклика на Toyhouse"
+    },
+    {
+      "name": "inspect_reply_form",
+      "description": "Посмотреть форму ответа в треде"
+    },
+    {
+      "name": "submit_draft",
+      "description": "Отправить черновик после её «го»"
+    },
+    {
+      "name": "draft_status",
+      "description": "Статус отправки"
+    },
+    {
+      "name": "cancel_draft",
+      "description": "Отменить черновик"
+    },
+    {
+      "name": "list_drafts",
+      "description": "Открытые черновики"
+    },
+    {
+      "name": "my_auctions",
+      "description": "Её аукционы: ставки и максимум"
+    },
+    {
+      "name": "auction_status",
+      "description": "Ставки на аукционе по ссылке"
     }
   ],
   "tools_generated": true,

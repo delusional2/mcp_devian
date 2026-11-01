@@ -225,3 +225,61 @@ def test_market_forecast_tool_without_data(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "connect", lambda path=None: real_connect(path or tmp_path / "e.sqlite3"))
     out = mcp_server.market_forecast(keywords=["dragon"])
     assert "мало данных" in out and "бережно" in out
+
+
+def auction(conn, n, top, currency="usd", n_bids=3, ended=1, winner=None):
+    conn.execute("INSERT OR REPLACE INTO auctions (deviation_id, owner, top_amount, currency, n_bids, bidders, "
+                 "ended, winner, updated_ts) VALUES (?, 'x', ?, ?, ?, 2, ?, ?, ?)",
+                 (f"da:{n}", top, currency, n_bids, ended, winner, NOW))
+    conn.commit()
+
+
+def test_bid_stats_final_prices_and_ratio(conn):
+    for i, (sb, top) in enumerate([(10, 30), (10, 25), (12, 40), (15, 45), (10, 20)]):
+        lot(conn, i, f"Moth auction {i}", "auction", usd=sb, status="closed", tags=["moth"])
+        auction(conn, i, top)
+    lot(conn, 9, "Moth auction open", "auction", usd=10, tags=["moth"])
+    auction(conn, 9, 18, ended=0)
+    lot(conn, 10, "Moth auction nobody", "auction", usd=10, status="closed", tags=["moth"])
+    auction(conn, 10, None, n_bids=0)
+    fc = market.forecast(conn, ["moth"], "auction", now=NOW)
+    b = fc.bids
+    assert b.final["usd"].n == 5 and b.final["usd"].median == 30
+    assert b.final_sb["usd"].median == 10 and b.ratio["usd"] == pytest.approx(3.0)
+    assert b.current["usd"].values == [18] and b.no_bids_closed == 1
+    text = market.render(fc, "auction")
+    assert "По ставкам: аукционы с SB около $10 уходят примерно за $30 (×3.0), по 5 лотам" in text
+    assert "Сейчас на открытых аукционах ставки около $18" in text
+    assert "Закрылись без единой ставки: 1" in text
+    assert "ставки взяты из комментариев" in text
+
+
+def test_bid_stats_points_separate_and_small_sample(conn):
+    lot(conn, 1, "Fox auction", "auction", pts=1000, status="closed")
+    auction(conn, 1, 2500, currency="points")
+    lot(conn, 2, "Fox auction 2", "auction", usd=10, status="closed")
+    auction(conn, 2, 15, currency="eur")  # €/£ в статистику не идут
+    fc = market.forecast(conn, [], "auction", now=NOW)
+    assert fc.bids.final["points"].values == [2500] and fc.bids.final["usd"].n == 0
+    text = market.render(fc, "auction")
+    assert "2500 pts" in text and "лотов мало" in text
+
+
+def test_no_auction_data_keeps_old_wording(market_db):
+    text = market.render(market.forecast(market_db, ["dragon"], "auction", now=NOW), "auction")
+    assert "По ставкам" not in text and "финальных ставок пока не видно" in text
+
+
+def test_ended_by_auction_flag_even_if_title_open(conn):
+    lot(conn, 1, "Moth auction [OPEN]", "auction", usd=10)
+    auction(conn, 1, 50, ended=1)
+    assert market.forecast(conn, [], "auction", now=NOW).bids.final["usd"].values == [50]
+
+
+def test_my_works_show_bids(conn):
+    lot(conn, 1, "My moth auction", "auction", usd=10, own=True)
+    auction(conn, 1, 42, ended=1, winner="kiwi")
+    lot(conn, 2, "My cat auction", "auction", usd=10, own=True)
+    auction(conn, 2, None, n_bids=0, ended=0)
+    text = market.my_works(conn, now=NOW)
+    assert "ставок 3, максимум $42 у kiwi" in text and "ставок пока нет" in text

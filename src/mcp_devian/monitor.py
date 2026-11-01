@@ -105,6 +105,9 @@ def check_deviantart(conn, cfg: Config, now: float | None = None, http=None) -> 
                     if item.matched and keep and old:
                         item.match_reason = old["match_reason"] or item.match_reason
                     item.matched = item.matched and keep
+                # Чужие лоты становятся «находками» (дайджест, уведомления), только если она покупает.
+                if not cfg.notify.market_lots:
+                    item.matched = False
                 item.match_kind = "lot" if item.matched else None
                 res.seen += 1
                 if db.upsert_item(conn, item, now):
@@ -280,6 +283,28 @@ def check_toyhouse(conn, cfg: Config, now: float | None = None, browser=None,
         res.error = f"{type(e).__name__}: {e}"
     db.record_run(conn, "toyhouse", res.error, now)
     return res
+
+
+def refresh_auctions(conn, cfg: Config, now: float | None = None, market_sample: int | None = None,
+                     own_limit: int = 20) -> tuple[list[str], list]:
+    """Ставки на аукционах через API DeviantArt, если она его подключила. (строки отчёта, новые ставки)."""
+    from . import auctions, posting
+
+    try:
+        client = posting.da_client(cfg)
+        if not client.is_connected():
+            return [], []
+    except Exception:  # noqa: BLE001 — не подключён или нет client_id: просто пропускаем
+        return [], []
+    try:
+        sample = auctions.MARKET_SAMPLE_PER_RUN if market_sample is None else market_sample
+        done, events = auctions.refresh_via_api(conn, cfg, client, now, market_sample=sample, own_limit=own_limit)
+    except Exception as e:  # noqa: BLE001
+        log.warning("auction refresh failed: %s", e)
+        return [f"ставки: не получилось обновить ({type(e).__name__})"], []
+    lines = [f"ставки: обновлено аукционов {done}"] if done else []
+    lines += [auctions.describe_event(e) for e in events]
+    return lines, events
 
 
 def format_results(results: list[SourceResult]) -> list[str]:

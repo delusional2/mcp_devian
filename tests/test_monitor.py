@@ -6,7 +6,7 @@ from fixtures import BOARD, RSS, THREAD
 
 from mcp_devian import db, digest, monitor
 from mcp_devian import toyhouse as th
-from mcp_devian.config import Config, DAGroup, DeviantArt, Filters, Toyhouse
+from mcp_devian.config import Config, DAGroup, DeviantArt, Filters, Notify, Toyhouse
 
 NOW = 1_800_000_000.0
 
@@ -29,7 +29,8 @@ def fake_http(status=200, body=RSS):
 
 
 def da_cfg(**filters):
-    return Config(filters=Filters(**filters), deviantart=DeviantArt(
+    # В этих тестах она «покупает»: чужие лоты становятся находками.
+    return Config(filters=Filters(**filters), notify=Notify(market_lots=True), deviantart=DeviantArt(
         groups=[DAGroup(url="https://www.deviantart.com/test-group/gallery/123/auctions")]))
 
 
@@ -181,3 +182,12 @@ def test_digest_flow(conn, monkeypatch):
 
     db.set_dismissed(conn, ["da:1404000001"])
     assert not db.query_items(conn, source="deviantart")
+
+
+def test_seller_default_market_lots_are_data_not_findings(conn):
+    cfg = da_cfg()
+    cfg.notify.market_lots = False
+    res = monitor.check_deviantart(conn, cfg, NOW, http=fake_http())
+    assert res.seen == 3 and res.new_matched == 0
+    assert db.get_item(conn, "da:1404000001")["lot_type"] == "auction"  # для прогноза данные есть
+    assert db.pending_digest(conn) == []
