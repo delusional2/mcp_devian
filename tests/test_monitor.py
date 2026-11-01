@@ -74,7 +74,7 @@ def fake_browser(headless=True):
 
 
 def th_cfg(**kw):
-    return Config(toyhouse=Toyhouse(boards=[13], pages_per_board=1, **kw))
+    return Config(toyhouse=Toyhouse(mode="bot", boards=[13], pages_per_board=1, **kw))
 
 
 def test_toyhouse_check(conn, monkeypatch):
@@ -118,7 +118,7 @@ def test_toyhouse_snippet_kept_between_runs(conn, monkeypatch):
 
 def test_toyhouse_sale_threads_with_buy_keywords(conn, monkeypatch):
     monkeypatch.setattr(monitor.th, "Reader", FakeReader)
-    cfg = Config(filters=Filters(keywords=["dragon"]), toyhouse=Toyhouse(boards=[13], pages_per_board=1))
+    cfg = Config(filters=Filters(keywords=["dragon"]), toyhouse=Toyhouse(mode="bot", boards=[13], pages_per_board=1))
     monitor.check_toyhouse(conn, cfg, NOW, browser=fake_browser)
     sale = db.get_item(conn, "th:869446")
     assert sale["sells_characters"] == 1 and sale["matched"] == 1
@@ -142,7 +142,7 @@ def test_toyhouse_challenge_midway_keeps_first_board(conn, monkeypatch):
             return super().board(board_id, page, now)
 
     monkeypatch.setattr(monitor.th, "Reader", SecondBlocked)
-    cfg = Config(toyhouse=Toyhouse(boards=[13, 5866], pages_per_board=1))
+    cfg = Config(toyhouse=Toyhouse(mode="bot", boards=[13, 5866], pages_per_board=1))
     res = monitor.check_toyhouse(conn, cfg, NOW, browser=fake_browser)
     assert res.needs_login and res.seen == 5
     assert db.get_item(conn, "th:865492") is not None

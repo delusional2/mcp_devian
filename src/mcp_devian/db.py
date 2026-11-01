@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS items (
     matched INTEGER DEFAULT 0,
     match_kind TEXT,               -- lot (DA), lf (ищут персов), sale (продают)
     match_reason TEXT,
+    own INTEGER DEFAULT 0,         -- её собственная работа
+    closed_ts REAL,                -- когда впервые увидели лот закрытым
     first_seen_ts REAL NOT NULL,
     updated_ts REAL NOT NULL,
     notified INTEGER DEFAULT 0,
@@ -51,6 +53,8 @@ CREATE TABLE IF NOT EXISTS runs (
 MIGRATIONS = [
     ("items", "match_kind", "TEXT"),
     ("runs", "fail_count", "INTEGER DEFAULT 0"),
+    ("items", "own", "INTEGER DEFAULT 0"),
+    ("items", "closed_ts", "REAL"),
 ]
 
 
@@ -77,6 +81,7 @@ class Item:
     matched: bool = False
     match_kind: str | None = None
     match_reason: str | None = None
+    own: bool = False
     extra: dict = field(default_factory=dict)
 
 
@@ -114,16 +119,30 @@ def upsert_item(conn: sqlite3.Connection, item: Item, now: float | None = None) 
     now = now or time.time()
     data = asdict(item)
     extra = json.dumps(data.pop("extra"), ensure_ascii=False)
-    exists = conn.execute("SELECT 1 FROM items WHERE id = ?", (item.id,)).fetchone()
-    if exists:
+    closed = now if item.status == "closed" else None
+    old = conn.execute("SELECT status, closed_ts FROM items WHERE id = ?", (item.id,)).fetchone()
+    if old:
+        # Момент закрытия нужен для прогноза «как быстро уходят похожие». Если лот снова открыли
+        # (ON HOLD → OPEN), сбрасываем: следующее закрытие запишется заново.
+        closed = (old["closed_ts"] or now) if item.status == "closed" else None
         sets = ", ".join(f"{c} = :{c}" for c in ITEM_COLUMNS if c != "id")
-        conn.execute(f"UPDATE items SET {sets}, extra = :extra, updated_ts = :now WHERE id = :id",
-                     {**data, "extra": extra, "now": now})
+        conn.execute(f"UPDATE items SET {sets}, extra = :extra, closed_ts = :closed, updated_ts = :now WHERE id = :id",
+                     {**data, "extra": extra, "closed": closed, "now": now})
         return False
-    cols = ITEM_COLUMNS + ["extra", "first_seen_ts", "updated_ts"]
+    cols = ITEM_COLUMNS + ["extra", "closed_ts", "first_seen_ts", "updated_ts"]
     conn.execute(f"INSERT INTO items ({', '.join(cols)}) VALUES ({', '.join(':' + c for c in cols)})",
-                 {**data, "extra": extra, "first_seen_ts": now, "updated_ts": now})
+                 {**data, "extra": extra, "closed_ts": closed, "first_seen_ts": now, "updated_ts": now})
     return True
+
+
+def relabel_own(conn: sqlite3.Connection, my_username: str) -> None:
+    """После смены ника: «её» только работы этого автора, остальные — обычный рынок."""
+    if my_username:
+        conn.execute("UPDATE items SET own = (lower(author) = lower(?)) WHERE source = 'deviantart'", (my_username,))
+        conn.execute("UPDATE items SET matched = 0, match_kind = NULL WHERE own = 1")
+    else:
+        conn.execute("UPDATE items SET own = 0 WHERE source = 'deviantart'")
+    conn.commit()
 
 
 def known_ids(conn: sqlite3.Connection, ids: list[str]) -> set[str]:

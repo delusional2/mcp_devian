@@ -206,3 +206,24 @@ def test_thread_pays():
     assert classify_thread("looking for cat ocs, paying usd").pays == ["usd"]
     # У распродажи «LF: $$» — это что продавец хочет, а не чем платит.
     assert classify_thread("ORANGE'S PURGE (LF: Art, Ocs, $$, etc.)").pays == []
+
+
+@pytest.mark.parametrize("title,text,usd,points,other,label", [
+    # #28: у каждой суммы своя валюта; € и £ не попадают в usd.
+    ("Moth auction", "SB: €30 AB: €90", None, None, (30, "eur"), "SB €30"),
+    ("Fox flatsale £25", "", None, None, (25, "gbp"), "£25"),
+    ("Cat adopt 20 EUR", "", None, None, (20, "eur"), "€20"),
+    ("Owl", "SB: $10 AB: €50", 10, None, None, "SB $10"),
+    ("Kitsune", "SB: €15 or 1500 points", None, 1500, (15, "eur"), "SB €15 / 1500 pts"),
+    ("Dragon adopt $12", "", 12, None, None, "$12"),
+])
+def test_currencies(title, text, usd, points, other, label):
+    lot = classify_lot(title, text)
+    assert (lot.usd, lot.points, lot.other_price, lot.price_text) == (usd, points, other, label)
+
+
+def test_euro_lot_skips_usd_budget():
+    # Курс не угадываем: бюджет в $ к лоту в € не применяется, но тип и цена видны.
+    f = Filters(max_usd=10)
+    lot = classify_lot("Moth adopt €40")
+    assert lot.lot_type == "adopt" and match_lot(f, lot, "Moth adopt €40")[0]

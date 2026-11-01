@@ -79,14 +79,29 @@ class Lot:
     lot_type: str
     status: str
     price_text: str | None = None
-    usd: float | None = None
+    usd: float | None = None      # только доллары
     points: float | None = None
+    # Цена в € или £: (сумма, "eur" | "gbp"). В доллары не пересчитываем — курс плавает,
+    # поэтому бюджет в $ к таким лотам не применяется, а в статистику $ они не попадают.
+    other_price: tuple[float, str] | None = None
+
+
+OTHER_CURRENCIES = {"eur": "€", "gbp": "£"}
+
+
+def _currency_of(symbol: str) -> str:
+    s = symbol.lower()
+    if s in ("€",) or s.startswith("eur"):
+        return "eur"
+    if s in ("£", "gbp"):
+        return "gbp"
+    return "usd"
 
 
 @dataclass
 class _Amount:
     value: float
-    currency: str  # usd | points
+    currency: str  # usd | eur | gbp | points
     anchor: int    # где начинается «$10» или «10$»
     end: int
     label: str | None = None  # sb | skip
@@ -103,12 +118,13 @@ def _amounts(text: str) -> list[_Amount]:
     found: dict[int, _Amount] = {}  # по началу числа: «$15 USD» — одна цена, не две
     for sym in CUR_SYM.finditer(text):
         word = sym.group().isalpha()
+        currency = _currency_of(sym.group())
         before = text[:sym.start()]
         tail = NUM_TAIL.search(before)
         # «5$» — символ после числа; для «5 usd» допускаем пробел, для «5 $» нет.
         if tail and (word or not tail.group(3)):
             start = tail.start(1)
-            found.setdefault(start, _Amount(_num(tail.group(1), tail.group(2)), "usd", start, sym.end()))
+            found.setdefault(start, _Amount(_num(tail.group(1), tail.group(2)), currency, start, sym.end()))
             continue
         pos = sym.end()
         # «$ 60» бывает только после метки («SB : $ 60»), иначе «LF $ 3 left» даст мусор.
@@ -116,7 +132,7 @@ def _amounts(text: str) -> list[_Amount]:
             pos += 1
         head = NUM_HEAD.match(text, pos)
         if head:
-            found.setdefault(head.start(1), _Amount(_num(head.group(1), head.group(2)), "usd", sym.start(), head.end()))
+            found.setdefault(head.start(1), _Amount(_num(head.group(1), head.group(2)), currency, sym.start(), head.end()))
     for m in POINTS.finditer(text):
         found.setdefault(m.start(1), _Amount(_num(m.group(1), m.group(2)), "points", m.start(1), m.end()))
 
@@ -152,34 +168,56 @@ def _pick(amounts: list[_Amount], currency: str, any_sb: bool) -> tuple[float | 
     return (min(rest), False) if rest else (None, False)
 
 
-def _prices(text: str) -> tuple[float | None, float | None, bool] | None:
+@dataclass
+class _Prices:
+    usd: float | None = None
+    points: float | None = None
+    other: tuple[float, str] | None = None
+    is_sb: bool = False
+
+
+def _prices(text: str) -> _Prices | None:
     amounts = _amounts(text)
     if not amounts:
         return None
     any_sb = any(a.label == "sb" for a in amounts)
-    usd, usd_sb = _pick(amounts, "usd", any_sb)
-    points, pts_sb = _pick(amounts, "points", any_sb)
-    is_sb = usd_sb or pts_sb
-    if not any_sb and usd is None and points is None:
+    out = _Prices()
+    out.usd, usd_sb = _pick(amounts, "usd", any_sb)
+    out.points, pts_sb = _pick(amounts, "points", any_sb)
+    other_sb = False
+    for cur in OTHER_CURRENCIES:
+        value, sb = _pick(amounts, cur, any_sb)
+        if value is not None and out.other is None:
+            out.other, other_sb = (value, cur), sb
+    out.is_sb = usd_sb or pts_sb or other_sb
+    if not any_sb and out.usd is None and out.points is None and out.other is None:
         # «SB: 5 / MI: $1» — у SB нет валюты; если валюта в посте одна, это она.
         bare = BARE_SB.search(text)
         currencies = {a.currency for a in amounts}
         if bare and len(currencies) == 1:
             value = _num(bare.group(1), bare.group(2))
-            usd, points = (value, None) if "usd" in currencies else (None, value)
-            is_sb = True
-    return usd, points, is_sb
+            cur = currencies.pop()
+            if cur == "usd":
+                out.usd = value
+            elif cur == "points":
+                out.points = value
+            else:
+                out.other = (value, cur)
+            out.is_sb = True
+    return out
 
 
-def _price_label(usd: float | None, points: float | None, is_sb: bool) -> str | None:
+def _price_label(p: _Prices) -> str | None:
     parts = []
-    if usd is not None:
-        parts.append(f"${usd:g}")
-    if points is not None:
-        parts.append(f"{points:g} pts")
+    if p.usd is not None:
+        parts.append(f"${p.usd:g}")
+    if p.other is not None:
+        parts.append(f"{OTHER_CURRENCIES[p.other[1]]}{p.other[0]:g}")
+    if p.points is not None:
+        parts.append(f"{p.points:g} pts")
     if not parts:
         return None
-    return ("SB " if is_sb else "") + " / ".join(parts)
+    return ("SB " if p.is_sb else "") + " / ".join(parts)
 
 
 def _tag_type(tags: list[str] | tuple) -> str | None:
@@ -247,11 +285,11 @@ def classify_lot(title: str, text: str = "", tags: list[str] | tuple = ()) -> Lo
     for source in (title, text):
         prices = _prices(source)
         if prices:
-            lot.usd, lot.points, is_sb = prices
-            lot.price_text = _price_label(lot.usd, lot.points, is_sb)
+            lot.usd, lot.points, lot.other_price = prices.usd, prices.points, prices.other
+            lot.price_text = _price_label(prices)
             break
     # Лента — папка группы адоптов: лот с ценой без явного типа — это адопт.
-    if lot.lot_type == "other" and (lot.usd is not None or lot.points is not None):
+    if lot.lot_type == "other" and (lot.usd is not None or lot.points is not None or lot.other_price):
         lot.lot_type = "adopt"
     return lot
 
@@ -264,6 +302,7 @@ def keyword_hits(keywords: list[str], *texts: str) -> list[str]:
 
 
 def within_budget(filters: Filters, usd: float | None, points: float | None) -> bool:
+    # Цены в €/£ сюда не приходят (usd=None): бюджет в $ к ним не применяем, курс не угадываем.
     if filters.max_usd and usd is not None and usd > filters.max_usd:
         return False
     if filters.max_points and points is not None and points > filters.max_points:

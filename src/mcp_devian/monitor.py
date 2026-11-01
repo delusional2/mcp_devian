@@ -20,6 +20,7 @@ MAX_BACKOFF_S = 6 * 3600
 # Ручные проверки из Claude не чаще, чем раз в N секунд, чтобы случайно не долбить сайты.
 MANUAL_COOLDOWN_S = {"toyhouse": 10 * 60, "deviantart": 2 * 60}
 RATE_LIMIT_COOLDOWN_S = 30 * 60
+RETRY_AFTER_FAIL_S = 60
 
 
 @dataclass
@@ -50,6 +51,11 @@ def cooldown_reason(conn, source: str, now: float) -> str | None:
     err = row["last_error"] or ""
     if source == "deviantart" and ("429" in err or "403" in err) and ago < RATE_LIMIT_COOLDOWN_S:
         return f"DeviantArt недавно просил притормозить, подожду ещё {int((RATE_LIMIT_COOLDOWN_S - ago) // 60) + 1} мин"
+    if err:
+        # Прошлая попытка не удалась (например, она как раз нажала галочку): повтор можно почти сразу.
+        if ago < RETRY_AFTER_FAIL_S:
+            return f"прошлая проверка не удалась ({err[:120]}), попробую снова через минуту"
+        return None
     if ago < MANUAL_COOLDOWN_S[source]:
         return f"проверяли {int(ago // 60)} мин назад, данные свежие"
     return None
@@ -57,36 +63,48 @@ def cooldown_reason(conn, source: str, now: float) -> str | None:
 
 def check_deviantart(conn, cfg: Config, now: float | None = None, http=None) -> SourceResult:
     res = SourceResult("deviantart")
+    me = cfg.deviantart.my_username.lower()
     try:
-        feeds = da.feeds_from_config(cfg.deviantart.groups, cfg.deviantart.artists)
+        feeds = da.feeds_from_config(cfg.deviantart.groups, cfg.deviantart.artists, cfg.deviantart.my_username)
     except da.DAError as e:
         res.error = str(e)
         db.record_run(conn, "deviantart", res.error, now)
         return res
     if not feeds:
-        res.skipped = "в config.toml нет групп и художников"
+        res.skipped = "в настройках нет групп и художников"
         return res
 
     own_http = http is None
     http = http or da.client()
     try:
-        for i, (query, place) in enumerate(feeds):
+        for i, feed in enumerate(feeds):
             if i:
                 da.polite_pause()
             try:
-                entries = da.fetch_feed(http, query, place)
+                entries = da.fetch_feed(http, feed.query, feed.place)
             except da.RateLimited as e:
                 res.error = str(e)
                 break
             except (da.DAError, OSError) as e:
-                res.notes.append(f"{place}: {e}")
+                res.notes.append(f"{feed.place}: {e}")
                 continue
             for entry in entries:
                 item = da.entry_to_item(entry)
                 lot = classify_lot(entry["title"], entry["text"], entry["tags"])
                 item.lot_type, item.status, item.price_text = lot.lot_type, lot.status, lot.price_text
                 item.price_usd, item.price_points = lot.usd, lot.points
+                item.own = feed.own or bool(me and (entry["author"] or "").lower() == me)
                 item.matched, item.match_reason = match_lot(cfg.filters, lot, entry["title"], entry["text"], entry["tags"])
+                # Её собственные лоты и папки «только для рынка» в находки не попадают.
+                if item.own:
+                    item.matched = False
+                elif not feed.notify:
+                    # Тот же лот мог прийти и из обычной папки: находкой остаётся, пока проходит фильтры.
+                    old = db.get_item(conn, item.id)
+                    keep = bool(old and old["match_kind"] == "lot")
+                    if item.matched and keep and old:
+                        item.match_reason = old["match_reason"] or item.match_reason
+                    item.matched = item.matched and keep
                 item.match_kind = "lot" if item.matched else None
                 res.seen += 1
                 if db.upsert_item(conn, item, now):
@@ -150,6 +168,12 @@ def ask_to_pass_check() -> None:
     from .digest import notify_macos
 
     notify_macos("Toyhouse", "Просит подтвердить, что ты человек: нажми галочку в окне Chrome")
+
+
+def ask_in_her_chrome() -> None:
+    from .digest import notify_macos
+
+    notify_macos("Toyhouse", "Просит подтвердить, что ты человек: вкладка в твоём Chrome открыта, нажми галочку")
 
 
 def _challenged(res: SourceResult, e: th.ChallengeError) -> None:
@@ -217,17 +241,29 @@ def _save_threads(conn, cfg: Config, rows: list[th.ThreadRow], snippets: dict, n
     conn.commit()
 
 
-def check_toyhouse(conn, cfg: Config, now: float | None = None, browser=th.open_browser,
-                   interactive: bool = False) -> SourceResult:
+@contextlib.contextmanager
+def _bot_reader(cfg: Config, interactive: bool, browser):
+    with browser(headless=cfg.toyhouse.headless) as context:
+        yield th.Reader(context, interactive=interactive and not cfg.toyhouse.headless,
+                        on_challenge=ask_to_pass_check)
+
+
+def check_toyhouse(conn, cfg: Config, now: float | None = None, browser=None,
+                   interactive: bool = False, her_chrome_session=None) -> SourceResult:
     res = SourceResult("toyhouse")
     now = now or time.time()
     if not cfg.toyhouse.boards:
-        res.skipped = "в config.toml не выбраны доски"
+        res.skipped = "в настройках не выбраны доски"
         return res
+    if cfg.toyhouse.mode == "chrome":
+        from . import her_chrome
+
+        opener = her_chrome_session or her_chrome.open_her_chrome
+        session = opener(interactive=interactive, on_challenge=ask_in_her_chrome)
+    else:
+        session = _bot_reader(cfg, interactive, browser or th.open_browser)
     try:
-        with browser(headless=cfg.toyhouse.headless) as context:
-            reader = th.Reader(context, interactive=interactive and not cfg.toyhouse.headless,
-                               on_challenge=ask_to_pass_check)
+        with session as reader:
             rows = _read_boards(reader, cfg, now, res)
             if not rows and res.notes and not res.error:
                 raise th.ToyhouseError("; ".join(res.notes[:3]))
@@ -244,6 +280,22 @@ def check_toyhouse(conn, cfg: Config, now: float | None = None, browser=th.open_
         res.error = f"{type(e).__name__}: {e}"
     db.record_run(conn, "toyhouse", res.error, now)
     return res
+
+
+def format_results(results: list[SourceResult]) -> list[str]:
+    lines = []
+    for r in results:
+        if r.skipped:
+            lines.append(f"{r.source}: пропуск — {r.skipped}")
+        elif r.error:
+            lines.append(f"{r.source}: ошибка — {r.error}")
+        else:
+            lines.append(f"{r.source}: просмотрено {r.seen}, новых {r.new}, подходит из новых {r.new_matched}")
+        lines.extend(f"  ! {n}" for n in r.notes[:5])
+    return lines
+
+
+CHROME_MODE_SKIP ="режим chrome: Toyhouse читается по просьбе в чате, в её Chrome"
 
 
 def _guarded(fn, source: str, conn, *args, **kwargs) -> SourceResult:
@@ -271,7 +323,9 @@ def run_check(conn, cfg: Config, sources=SOURCES, force: bool = False, now: floa
         if source not in sources:
             continue
         reason = cooldown_reason(conn, source, now) if manual_cooldown else None
-        if reason:
+        if source == "toyhouse" and cfg.toyhouse.mode == "chrome" and not interactive:
+            results.append(SourceResult(source, skipped=CHROME_MODE_SKIP))
+        elif reason:
             results.append(SourceResult(source, skipped=reason))
         elif force or is_due(conn, source, polls[source], now):
             results.append(checks[source]())

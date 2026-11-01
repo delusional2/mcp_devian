@@ -1,0 +1,124 @@
+{
+  "manifest_version": "0.4",
+  "name": "mcp-devian",
+  "display_name": "Адопты: DeviantArt и Toyhouse",
+  "version": "0.2.0",
+  "description": "Следит за группами DeviantArt и форумами Toyhouse, находит адоптов и LF-треды, подсказывает цены по рынку.",
+  "long_description": "После установки просто напиши Claude «давай настроим помощника по адоптам» — он сам задаст вопросы. Ничего не публикует.",
+  "author": {
+    "name": "Andrei Bugerov"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/delusional2/mcp_devian"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "src/mcp_devian/__main__.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--frozen",
+        "--no-dev",
+        "--directory",
+        "${__dirname}",
+        "python",
+        "-m",
+        "mcp_devian",
+        "serve"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "get_settings",
+      "description": "Настройки и вопросы для первой настройки"
+    },
+    {
+      "name": "update_settings",
+      "description": "Сохранить её ответы"
+    },
+    {
+      "name": "da_group_folders",
+      "description": "Папки группы DeviantArt"
+    },
+    {
+      "name": "add_da_folders",
+      "description": "Добавить папки групп в отслеживание"
+    },
+    {
+      "name": "remove_da_folders",
+      "description": "Убрать папки групп"
+    },
+    {
+      "name": "set_background_checks",
+      "description": "Фоновая проверка с уведомлениями"
+    },
+    {
+      "name": "bot_login",
+      "description": "Войти в аккаунт в окне бота"
+    },
+    {
+      "name": "check_now",
+      "description": "Проверить прямо сейчас"
+    },
+    {
+      "name": "check_status",
+      "description": "Итог проверки"
+    },
+    {
+      "name": "list_new_adopts",
+      "description": "Свежие лоты DeviantArt"
+    },
+    {
+      "name": "list_lf_threads",
+      "description": "Треды Toyhouse, где ищут персов"
+    },
+    {
+      "name": "list_sale_threads",
+      "description": "Треды Toyhouse с продажей"
+    },
+    {
+      "name": "pending_digest",
+      "description": "Что нового с прошлого раза"
+    },
+    {
+      "name": "dismiss",
+      "description": "Скрыть находки"
+    },
+    {
+      "name": "sources_status",
+      "description": "Когда проверялся каждый источник"
+    },
+    {
+      "name": "read_thread",
+      "description": "Первый пост треда Toyhouse"
+    },
+    {
+      "name": "market_forecast",
+      "description": "Прогноз цены по похожим лотам"
+    },
+    {
+      "name": "my_works_overview",
+      "description": "Её работы и как они продаются"
+    }
+  ],
+  "tools_generated": true,
+  "prompts_generated": true,
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ]
+  },
+  "keywords": [
+    "deviantart",
+    "toyhouse",
+    "adopts",
+    "monitoring"
+  ],
+  "license": "MIT"
+}

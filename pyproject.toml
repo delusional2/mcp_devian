@@ -1,9 +1,9 @@
 [project]
 name = "mcp-devian"
-version = "0.1.0"
+version = "0.2.0"
 description = "Мониторинг адоптов и аукционов на DeviantArt и Toyhouse с MCP-сервером для Claude"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "beautifulsoup4>=4.12",
     "defusedxml>=0.7",
@@ -17,6 +17,10 @@ mcp-devian = "mcp_devian.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.uv]
+# Claude Desktop при установке делает uv sync: инструменты разработки ей не нужны.
+default-groups = []
 
 [build-system]
 requires = ["hatchling"]

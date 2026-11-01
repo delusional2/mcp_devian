@@ -151,15 +151,28 @@ def entry_to_item(entry: dict) -> Item:
     )
 
 
-def feeds_from_config(groups, artists) -> list[tuple[str, str]]:
-    """(query, подпись) для всех источников из конфига."""
+@dataclass
+class Feed:
+    query: str
+    place: str
+    notify: bool = True   # присылать ли находки (иначе только статистика рынка)
+    own: bool = False     # её собственная галерея
+
+
+MY_GALLERY = "мои работы"
+
+
+def feeds_from_config(groups, artists, my_username: str = "") -> list[Feed]:
+    """Все RSS-источники из настроек."""
     feeds = []
     for g in groups:
         folder = parse_folder_url(g.url)
         label = g.label or f"{folder.group}: {folder.name or folder.folder_id}"
-        feeds.append((folder.query, label))
+        feeds.append(Feed(folder.query, label, notify=getattr(g, "notify", True)))
     for name in artists:
-        feeds.append((f"gallery:{name}", f"художник {name}"))
+        feeds.append(Feed(f"gallery:{name}", f"художник {name}"))
+    if my_username:
+        feeds.append(Feed(f"gallery:{my_username}", MY_GALLERY, notify=False, own=True))
     return feeds
 
 

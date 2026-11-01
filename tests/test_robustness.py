@@ -38,7 +38,7 @@ def test_one_source_crash_does_not_stop_the_other(conn, monkeypatch):
     ran = []
     monkeypatch.setattr(monitor, "check_deviantart", boom)
     monkeypatch.setattr(monitor, "check_toyhouse", lambda *a, **k: ran.append(1) or monitor.SourceResult("toyhouse"))
-    results = monitor.run_check(conn, Config(), force=True, now=NOW)
+    results = monitor.run_check(conn, Config(toyhouse=Toyhouse(mode="bot")), force=True, now=NOW)
     assert results[0].error.startswith("RuntimeError") and ran == [1]
     assert db.last_run(conn, "deviantart")["last_error"]
 
@@ -132,13 +132,15 @@ def test_sale_thread_goes_to_sale_section():
     assert match_kind == "sale" and reason.startswith("продают")
 
 
-def test_config_warnings(tmp_path):
-    path = tmp_path / "config.toml"
-    path.write_text('[toyhouse]\nboard = [71]\n[filtres]\nkeywords = ["x"]\n', encoding="utf-8")
+def test_settings_unknown_keys_and_broken_file(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text('{"toyhouse": {"board": [71], "mode": "robot"}}', encoding="utf-8")
     cfg = load_config(path)
-    assert any("board" in w and "boards" in w for w in cfg.warnings)
-    assert any("filtres" in w for w in cfg.warnings)
-    assert cfg.toyhouse.boards == [13, 5866]
+    assert any("toyhouse.board" in w for w in cfg.warnings)
+    assert cfg.toyhouse.boards == [13, 5866] and cfg.toyhouse.mode == "bot"
+
+    path.write_text("{не json", encoding="utf-8")
+    assert load_config(path).warnings
 
 
 def test_old_database_gets_new_columns(tmp_path):

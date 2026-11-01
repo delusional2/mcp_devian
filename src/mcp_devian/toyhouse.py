@@ -120,6 +120,52 @@ def parse_board(html_text: str, board_id: int, now: float) -> list[ThreadRow]:
     return rows
 
 
+# Режим Claude: эти скрипты Claude выполняет на открытой странице в её Chrome
+# и передаёт результат в ingest_toyhouse_board / ingest_first_post.
+EXTRACT_BOARD_JS = """JSON.stringify([...document.querySelectorAll('tr.forum-thread-row')].map(tr => {
+  const a = tr.querySelector('.forum-thread-title a');
+  const info = tr.querySelector('.forum-thread-info');
+  const t = el => el ? el.textContent.replace(/\\s+/g, ' ').trim() : null;
+  return {
+    title: t(a), href: a && a.href,
+    author: t(info && info.querySelector('.display-user a')),
+    created: t(info && info.querySelector('abbr.datetime')),
+    posts: t(tr.querySelector('.forum-thread-posts')),
+    last: t(tr.querySelector('.forum-last-update-date abbr.datetime')),
+    last_poster: t(tr.querySelector('.forum-last-update-author .display-user a')),
+  };
+}))"""
+
+EXTRACT_POST_JS = """(document.querySelector('.forum-post .user-content') || {innerText: ''}).innerText.slice(0, 700)"""
+
+
+def rows_from_extracted(items: list[dict], board_id: int, now: float) -> list[ThreadRow]:
+    """Строки, которые вернул EXTRACT_BOARD_JS, в ThreadRow. Мусор молча пропускаем."""
+    rows = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        href = urljoin(BASE, str(it.get("href") or ""))
+        m = THREAD_ID.search(href)
+        title = " ".join(str(it.get("title") or "").split())
+        if not m or not title or not href.startswith(BASE + "/~forums/"):
+            continue
+        posts_m = re.search(r"\d[\d,]*", str(it.get("posts") or ""))
+        created = relative_to_ts(it.get("created"), now)
+        rows.append(ThreadRow(
+            board_id=board_id,
+            thread_id=m.group(2),
+            title=title,
+            url=href.split("?")[0].split("#")[0],
+            author=it.get("author") or None,
+            posts=int(posts_m.group().replace(",", "")) if posts_m else None,
+            created_ts=created,
+            activity_ts=relative_to_ts(it.get("last"), now) or created,
+            last_poster=it.get("last_poster") or None,
+        ))
+    return rows
+
+
 def parse_first_post(html_text: str, limit: int = 700) -> str | None:
     soup = BeautifulSoup(html_text, "html.parser")
     body = soup.select_one(".forum-post .user-content")
@@ -158,17 +204,36 @@ def browser_lock():
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+NO_CHROME = ("Не нашла Google Chrome. Его нужно поставить с google.com/chrome — "
+             "и бот, и режим «её Chrome» работают через него.")
+CHROME_APP = "Google Chrome.app"
+
+
+def chrome_app_path() -> Path | None:
+    """Где стоит Chrome (без Apple Events, просто по файлам)."""
+    for base in (Path("/Applications"), Path.home() / "Applications"):
+        if (base / CHROME_APP).exists():
+            return base / CHROME_APP
+    return None
+
+
 @contextmanager
 def open_browser(headless: bool = True, profile_dir: Path = PROFILE_DIR):
     from playwright.sync_api import sync_playwright
 
+    app = chrome_app_path()
+    if not app:
+        raise ToyhouseError(NO_CHROME)
+    # channel="chrome" ищет только в /Applications; из ~/Applications запускаем по пути.
+    where = ({"channel": "chrome"} if app.parent == Path("/Applications")
+             else {"executable_path": str(app / "Contents/MacOS/Google Chrome")})
     profile_dir.mkdir(parents=True, exist_ok=True)
     with browser_lock(), sync_playwright() as pw:
         context = pw.chromium.launch_persistent_context(
             str(profile_dir),
-            channel="chrome",
             headless=headless,
             viewport={"width": 1280, "height": 900},
+            **where,
         )
         try:
             yield context

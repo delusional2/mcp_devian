@@ -64,8 +64,12 @@ def test_feeds_from_config():
          DAGroup(url="https://www.deviantart.com/g2/gallery/2", label="моя метка")],
         ["artist1"],
     )
-    assert feeds == [("gallery:g1/1", "g1: points adopts"), ("gallery:g2/2", "моя метка"),
-                     ("gallery:artist1", "художник artist1")]
+    assert [(f.query, f.place, f.notify, f.own) for f in feeds] == [
+        ("gallery:g1/1", "g1: points adopts", True, False), ("gallery:g2/2", "моя метка", True, False),
+        ("gallery:artist1", "художник artist1", True, False)]
+
+    mine = da.feeds_from_config([], [], "moth-art")
+    assert [(f.query, f.notify, f.own) for f in mine] == [("gallery:moth-art", False, True)]
 
 
 def test_parse_board():

@@ -33,3 +33,7 @@ node_modules/
 
 # macOS
 .DS_Store
+
+# сборка установщика
+build/
+dist/

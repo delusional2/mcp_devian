@@ -1,33 +1,29 @@
 import argparse
 import hashlib
 import logging
-import plistlib
 import random
-import shutil
-import subprocess
 import sys
 import time
 import traceback
-from pathlib import Path
 
-from . import db, digest, monitor
+from . import background, db, digest, jobs, monitor
 from . import deviantart as da
 from . import toyhouse as th
-from .config import DATA_DIR, PROJECT_DIR, load_config, load_dotenv
+from .config import DATA_DIR, load_config, load_dotenv
 
-LAUNCHD_LABEL = "com.mcp-devian.monitor"
-LAUNCHD_PLIST = Path("~/Library/LaunchAgents").expanduser() / f"{LAUNCHD_LABEL}.plist"
-LOG_DIR = DATA_DIR / "logs"
+LOG_DIR = background.LOG_DIR
 CRASH_STATE = DATA_DIR / "last-crash.txt"
 MAX_LOG_BYTES = 1_000_000
 
 
-def _problems(before: dict, results: list[monitor.SourceResult]) -> list[str]:
-    """Сообщаем об ошибке один раз, а не каждые 15 минут."""
+def _problems(before: dict, results: list[monitor.SourceResult], mode: str = "bot") -> list[str]:
+    """Сообщаем об ошибке один раз, а не каждые 15 минут. Подсказки — словами для чата, без терминала."""
     out = []
     for r in results:
         if r.error and r.error != before.get(r.source):
-            hint = " Запусти: mcp-devian login" if r.needs_login else ""
+            hint = ""
+            if r.needs_login and mode == "bot":
+                hint = " Попроси Claude: «открой окно бота для входа»."
             out.append(f"{r.source}: {r.error}.{hint}")
     return out
 
@@ -64,10 +60,12 @@ def _report_crash(exc: BaseException) -> None:
         CRASH_STATE.write_text(key)
     except OSError:
         pass
-    digest.notify_macos("mcp_devian не запустился", f"{text[:180]}. Проверь config.toml и mcp-devian status")
+    digest.notify_macos("mcp_devian не запустился", f"{text[:180]}. Спроси у Claude: «что с мониторингом?»")
 
 
 def cmd_check(args) -> int:
+    if args.job:
+        return _check_job(args)
     if args.scheduled:
         _rotate_logs()
         # Время слота запоминаем до случайной паузы, чтобы расписание не съезжало.
@@ -84,10 +82,26 @@ def cmd_check(args) -> int:
     return _check(args, None)
 
 
+def _check_job(args) -> int:
+    """Проверка, запущенная из чата (jobs.start): результат пишется в файл задачи."""
+    try:
+        cfg = load_config()
+        sources = monitor.SOURCES if args.source == "all" else (args.source,)
+        with db.session() as conn:
+            results = monitor.run_check(conn, cfg, sources=sources, force=True, interactive=True,
+                                        manual_cooldown=True)
+        jobs.finish(args.job, monitor.format_results(results))
+        return 0
+    except Exception as e:
+        traceback.print_exc()
+        jobs.finish(args.job, [f"проверка упала: {type(e).__name__}: {e}"], ok=False)
+        return 1
+
+
 def _check(args, tick: float | None) -> int:
     cfg = load_config()
     for w in cfg.warnings:
-        print(f"config.toml: {w}", file=sys.stderr)
+        print(f"настройки: {w}", file=sys.stderr)
     sources = monitor.SOURCES if args.source == "all" else (args.source,)
     with db.session() as conn:
         before = {s: (db.last_run(conn, s) or {"last_error": None})["last_error"] for s in monitor.SOURCES}
@@ -95,7 +109,7 @@ def _check(args, tick: float | None) -> int:
                                     interactive=not args.scheduled)
         _print_results(results)
         if args.notify or args.scheduled:
-            sent = digest.deliver(conn, cfg, _problems(before, results))
+            sent = digest.deliver(conn, cfg, _problems(before, results, cfg.toyhouse.mode))
             if sent["items"]:
                 print(f"дайджест: {sent['items']} шт. → {sent['file']}")
             if sent["telegram_error"]:
@@ -152,18 +166,17 @@ def cmd_da_folders(args) -> int:
         return 1
     for f in folders:
         print(f"{f.name or '—':32} {f.url}")
-    print("\nНужные строки скопируй в config.toml → [deviantart] groups.")
+    print("\nДобавить папки проще всего в чате с Claude: «добавь папки auctions и points adopts».")
     return 0
 
 
 def cmd_status(args) -> int:
+    from .mcp_server import describe_settings
+
     cfg = load_config()
-    print(f"конфиг: {cfg.path or 'нет config.toml, работаю с настройками по умолчанию'}")
-    for w in cfg.warnings:
-        print(f"  ! {w}")
+    print(describe_settings(cfg).split("\n\n")[0])
+    print(f"настройки: {cfg.path}")
     print(f"данные: {DATA_DIR}")
-    print(f"DA: групп {len(cfg.deviantart.groups)}, художников {len(cfg.deviantart.artists)}")
-    print(f"TH: доски {cfg.toyhouse.boards}")
     with db.session() as conn:
         for s in monitor.SOURCES:
             row = db.last_run(conn, s)
@@ -173,43 +186,20 @@ def cmd_status(args) -> int:
             ok = digest.ago(row["last_ok_ts"]) if row["last_ok_ts"] else "никогда"
             err = f", ошибка: {row['last_error']}" if row["last_error"] else ""
             print(f"{s}: последний запуск {digest.ago(row['last_run_ts'])}, успешный {ok}{err}")
-    print(f"автозапуск: {'включён' if LAUNCHD_PLIST.exists() else 'выключен'}")
     return 0
 
 
 def cmd_install(args) -> int:
-    uv = shutil.which("uv")
-    if not uv:
-        print("Не нашёл uv. Поставь: https://docs.astral.sh/uv/")
+    try:
+        print(background.enable(max(15, args.minutes)))
+    except (OSError, RuntimeError) as e:
+        print(f"Не получилось: {e}")
         return 1
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    plist = {
-        "Label": LAUNCHD_LABEL,
-        "ProgramArguments": [uv, "run", "--project", str(PROJECT_DIR), "mcp-devian", "check", "--scheduled"],
-        "WorkingDirectory": str(PROJECT_DIR),
-        "StartInterval": args.minutes * 60,
-        "RunAtLoad": True,
-        "StandardOutPath": str(LOG_DIR / "monitor.log"),
-        "StandardErrorPath": str(LOG_DIR / "monitor.err.log"),
-        "EnvironmentVariables": {"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"},
-    }
-    LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
-    # Если агент ещё не загружен, unload ругается — это нормально.
-    subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)], capture_output=True, check=False)
-    LAUNCHD_PLIST.write_bytes(plistlib.dumps(plist))
-    subprocess.run(["launchctl", "load", str(LAUNCHD_PLIST)], check=True)
-    print(f"Автозапуск включён: раз в {args.minutes} мин, пока мак не спит.")
-    print(f"Логи: {LOG_DIR}")
     return 0
 
 
 def cmd_uninstall(args) -> int:
-    if LAUNCHD_PLIST.exists():
-        subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)], capture_output=True, check=False)
-        LAUNCHD_PLIST.unlink()
-        print("Автозапуск выключен.")
-    else:
-        print("Автозапуск и так выключен.")
+    print(background.disable())
     return 0
 
 
@@ -231,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("source", nargs="?", default="all", choices=["all", *monitor.SOURCES])
     c.add_argument("--notify", action="store_true", help="разослать дайджест после проверки")
     c.add_argument("--scheduled", action="store_true", help="режим для launchd: пауза, расписание, дайджест")
+    c.add_argument("--job", metavar="ID", help="запуск из чата: итог пишется в файл задачи с этим id")
     c.set_defaults(func=cmd_check)
 
     d = sub.add_parser("digest", help="показать, что накопилось")
