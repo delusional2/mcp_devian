@@ -30,7 +30,8 @@ FAMILY_ERROR = 0.1         # на семейство сравнений: ожи�
 STALE_DAYS = 3
 
 Source = Literal["her_lots", "her_sales", "market_da", "market_da_search", "th_lf", "model", "rule_of_thumb",
-                 "palette", "experiment", "market_th_stated", "x_manual", "crm"]
+                 "palette", "experiment", "market_th_stated", "x_manual", "crm",
+                 "market_commishes"]
 Kind = Literal["observed", "estimate", "heuristic"]
 Level = Literal["нет вывода", "низкая", "средняя", "высокая"]
 LEVELS: tuple[str, ...] = ("нет вывода", "низкая", "средняя", "высокая")
@@ -39,7 +40,8 @@ SOURCE_LABEL = {"her_lots": "её лоты", "her_sales": "её продажи",
                 "market_da_search": "рынок DA, из поиска", "th_lf": "LF-треды Toyhouse", "model": "модель",
                 "rule_of_thumb": "общая практика", "palette": "палитры лотов",
                 "experiment": "её эксперимент", "market_th_stated": "заявленные цены TH",
-                "x_manual": "X — ссылки, которые она принесла", "crm": "её покупатели и участники"}
+                "x_manual": "X — ссылки, которые она принесла", "crm": "её покупатели и участники",
+                "market_commishes": "рынок ych.commishes"}
 KIND_LABEL = {"observed": "наблюдение", "estimate": "оценка", "heuristic": "общая практика"}
 
 
@@ -213,7 +215,9 @@ DA_SELL = "DeviantArt Sell: https://www.deviantart.com/team/journal/DeviantArt-S
 # --- На чём стоит аналитика ---
 
 HEALTH_SOURCES = (("deviantart", "лента DeviantArt"), ("toyhouse", "Toyhouse"), ("da_auctions", "ставки DA"),
-                  ("enrich", "просмотры/фавы DA"), ("da_sampler", "поиск по рынку DA"))
+                  ("enrich", "просмотры/фавы DA"), ("da_sampler", "поиск по рынку DA"),
+                  ("commishes", "её аукционы ych.commishes"), ("commishes_market", "рынок ych.commishes"))
+OPTIONAL_HEALTH = ("commishes", "commishes_market")  # показываем, только если там уже что-то читали
 try:  # контракт C1: место «поиск DA: …» у лотов, найденных только поиском
     from .db import SEARCH_PLACE_PREFIX
 except ImportError:  # pragma: no cover
@@ -249,6 +253,8 @@ def render_health(conn, now: float | None = None) -> str:
             row = conn.execute("SELECT * FROM runs WHERE source = ?", (source,)).fetchone()
         except Exception:  # noqa: BLE001
             row = None
+        if row is None and source in OPTIONAL_HEALTH:
+            continue
         ok = row["last_ok_ts"] if row else None
         err = row["last_error"] if row and row["last_error"] else None
         flag = " — данные старые" if ok and now - ok > STALE_DAYS * DAY else ""

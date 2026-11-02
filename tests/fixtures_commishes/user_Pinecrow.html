@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Pinecrow - YCH.Commishes</title>
+<link type="application/atom+xml" rel="alternate" href="/home/index.rss"/>
+</head><body>
+<main class="mb-auto">
+<div id="profile">
+	<span class="hidden" ref="username">Pinecrow</span>
+	<div class="mx-auto max-w-4xl">
+		<profile-hero
+			token=""
+			crm="https://crm.commishes.com"
+			ping="https://ping.commishes.com:443/"
+			banner="https://account.commishes.com/image/attribute/banner/195459/1280/300/?t=1791492000"
+			avatar="https://account.commishes.com/image/user/195459/256/?t=1792590600"
+			userid="195459"
+			username="Pinecrow"
+			:sponsor="false"
+			registered="1679299483"
+			></profile-hero>
+		<div class="h-12"></div>
+		<profile-linktree
+			username="Pinecrow"
+			:approval="100"
+			:reputation="2345"
+			:testimonials="20"
+			:started="748"
+			:posts="6"
+			:follows="2"
+			:followers="0"
+			:uploads="233"
+		></profile-linktree>
+		<div class="h-12"></div>
+		<div class="h-8"></div>
+		<span class="inline-block text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 rounded-full px-3 py-1 text-xs">
+			Current auctions
+		</span>
+		<div>
+			<auction-card 
+				id="6334553"
+				userName=""
+				:user-kofi="false"
+				userImg="https://account.commishes.com/image/user/195459/64/?t=1792590600"
+				url="/auction/show/61A2P/loyal-shepherd-dog-adopt/"
+				title="Loyal Shepherd Dog - Adopt"
+				:hide-thumbs="false"
+				alt-thumb="https://ych.commishes.com/image/thumb/6334553/?adult=plz"
+				rating="0"
+				avg-color="#000000"
+				endsunix="1793646341"
+				:sale="false"
+				:promoted="true"
+				bid="37"></auction-card>
+			<noscript>
+			<a class="auction-card" href="/auction/show/61A2P/loyal-shepherd-dog-adopt/">
+				<img src="https://ych.commishes.com/image/thumb/6334553/"
+						class="preview">
+				<div class="inner">
+					<span class="title overflow-ellipsis" title="…">
+								Loyal Shepherd Dog - Adopt					</span>
+					<span class="timer">
+						<span class="desktop-only">6 hours to go</span>
+						<span class="mobile-only">6h</span>
+					</span>
+					<span class="bid"  >$37.00</span>
+				</div>
+			</a>
+			</noscript>
+			<auction-card 
+				id="6335065"
+				userName=""
+				:user-kofi="false"
+				userImg="https://account.commishes.com/image/user/195459/64/?t=1792590600"
+				url="/auction/show/61AIP/shy-candy-bear-adopt/"
+				title="Shy Candy Bear - Adopt"
+				:hide-thumbs="false"
+				alt-thumb="https://ych.commishes.com/image/thumb/6335065/?adult=plz"
+				rating="1"
+				avg-color="#000000"
+				endsunix="1793655336"
+				:sale="true"
+				:promoted="true"
+				bid="50"></auction-card>
+			<noscript>
+			<a class="auction-card" href="/auction/show/61AIP/shy-candy-bear-adopt/">
+				<img src="https://ych.commishes.com/image/thumb/6335065/"
+						class="preview">
+				<div class="inner">
+					<span class="title overflow-ellipsis" title="…">
+								Shy Candy Bear - Adopt					</span>
+					<span class="timer">
+						<span class="desktop-only">8 hours to go</span>
+						<span class="mobile-only">8h</span>
+					</span>
+					<span class="bid"  >$50.00</span>
+				</div>
+			</a>
+			</noscript>
+					</div>
+	</div>
+	<div class="h-10"></div>
+	<div class="shadow-inner bg-slate-200 dark:bg-slate-800 dark:text-white">
+		<div class="h-5"></div>
+		<div class="container mx-auto max-w-2xl">
+			<div class="prose p-4 dark:prose-invert">
+				<h1>Get updates to your inbox</h1>
+				<p>
+					Use our free email notifications to get told as soon as Pinecrow					starts a new auction.
+					You can unsubscribe at any time! This email is only used for auction notifications.
+				</p>
+			</div>
+			<div class="p-4 mx-auto max-w-xl">
+				<form method="POST" action="/user/subscribe/" class="flex items-center gap-3">
+					<input type="hidden" name="csrf" value="CSRF" />
+					<input type="hidden" name="user" value="195459">
+					<input type="email" name="email" placeholder="Email" class="border border-gray-300 w-full rounded dark:border-gray-800 dark:bg-slate-700 dark:text-white">
+					<button type="submit" class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded text-lg flex-1 md:flex-none dark:bg-indigo-600">Subscribe</button>
+				</form>
+				<div class="text-xs mt-4 text-gray-500 dark:text-gray-300">
+					You may unsubscribe at any time by clicking the unsubscribe button
+					on one of the emails you may get. Your email will only be used to
+					notify you.
+				</div>
+			</div>
+		</div>
+		<div class="h-2.5"></div>
+	</div>
+	<div class="h-12"></div>
+		<div class="mx-auto max-w-4xl">
+		<span class="inline-block text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 rounded-full px-3 py-1 text-xs">
+			Past auctions
+		</span>
+		<infinite-list @exhausted="loadPastAuctions" :auctions="history" :eop="historyExhausted" :busy="historyBusy" :explicit-intent="requireExplicitIntent"></infinite-list>
+	</div>
+	</div>
+<div class="h-5"></div>
+		</main>
+</body></html>

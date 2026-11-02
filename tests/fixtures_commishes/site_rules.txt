@@ -1,0 +1,12 @@
+# Короткие выдержки с ych.commishes.com, снятые 02.11.2026 (исследование, вежливые запросы, честный UA).
+# Источник указан над каждой выдержкой. Только для тестов: правила, на которые опираются тексты помощника.
+
+## https://ych.commishes.com/ (баннер главной)
+<span class="font-semibold mr-2 text-left flex-auto">AI generated images, neural network filters and similar are not permitted</span>
+
+## https://ych.commishes.com/assets/src/js/auction.min.js (форма ставки)
+Once a bid has been confirmed it is final, you cannot retract it and you are required to buy the resulting commission.
+{title:"Bid collission",body:"Your bid was ommitted. This means there was already a bid with the amount you offered."}
+var Sn={0:1,5:2.5,10:5,50:10,100:20,300:50,1e3:100};
+minimumBid:function(){return null!==this.firstSlot.bids&&this.firstSlot.bids.length>0?parseFloat(this.firstSlot.bids[0].bid)+parseFloat(this.firstSlot.minincrease):parseFloat(this.firstSlot.startbid)}
+suggestedBid:function(e){var t=.5;for(var n in Sn)n<e&&(t=Sn[n]);

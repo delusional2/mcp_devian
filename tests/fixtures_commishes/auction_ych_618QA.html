@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>YCH COUPLE - YCH.Commishes</title>
+<link type="application/atom+xml" rel="alternate" href="/home/index.rss"/>
+</head><body>
+<main class="mb-auto">
+<!-- 
+	Here go the tabs that separate the auctions depending on the category they're
+	placed in.
+-->
+<div class="h-2.5"></div>
+<!-- Started: bin/templates/elements/auction-tabs.php -->
+<div class="tabs"><a class='tab' href='/'>Featured</a><a class='tab' href='/category/furry/'>Furry</a><a class='tab' href='/category/brony/'>Pony</a><a class='tab active' href='/category/human/'>Human</a><a class='tab' href='/category/adopt/'>Adoptables</a><a class='tab' href='/category/crafts/'>Crafts</a></div>
+<!-- Ended: bin/templates/elements/auction-tabs.php -->	
+<div class="h-2.5"></div>
+<div class="row3">
+	<div class="span2" >
+		<a href="https://ych.commishes.com/image/download/6333258/" style="display: block;">
+						<img src="https://ych.commishes.com/image/resize/6333258/" class="w-full" width="700">
+					</a>
+		<div class="h-1"></div>
+		<div class="h-1"></div>
+	</div>
+	<div id="auction" class="span1" data-endtime="1793626096">
+		<bid-form 
+			v-if="endtime > ((+new Date()) / 1000)" 
+			:slots="slots"
+			:action="'/bids/post.json'"
+			:auction="'6333258'"
+			:csrf="'CSRF'"
+			:guest="true"
+			></bid-form>
+		<watchlist-button 
+			v-if="false"
+			auction="6333258" 
+			:active="false"
+			></watchlist-button>
+		<div class="border border-gray-300 dark:border-gray-800 dark:bg-slate-600 shadow-md rounded-md">
+			<timer :end="this.endtime"></timer>
+			<div class="border-b border-b-gray-200 dark:border-b-gray-700"></div>
+			<div class="h-8"></div>
+			<slots :slots="slots"></slots>
+		</div>
+		<div class="h-2"></div>
+		<form 
+			v-if="endtime < ((+new Date()) / 1000)" 
+			action="/user/subscribe/" 
+			METHOD="POST" 
+			class="border border-gray-300 dark:border-gray-800 dark:bg-slate-600 shadow-md rounded-md p-4 bg-slate-50">
+			<span class="text-lg">This auction is over!</span>
+			<p class="text-sm">But if you tell us your email we will notify you when this user starts a new one</p>
+			<div class="h-2"></div>
+			<input type="hidden" name="csrf" value="CSRF" />
+			<input type="hidden" name="user" value="">
+			<input type="email" name="email" placeholder="Email" class="rounded border border-gray-300 w-full mr-4">
+			<div class="h-2"></div>
+			<button class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded text-xl w-full">Subscribe</button>
+		</form>
+		<div class="h-2"></div>
+		<div class="p-4">
+			<!-- User icon and name go here-->
+			<div class="flex">
+				<div class="w-16 shrink-0">
+					<a href="/user/Mothwick/">
+						<img class="w-full rounded-full" src="https://account.commishes.com/image/user/196422/64/?t=1792534083">
+					</a>
+				</div>
+				<div class="px-2">
+					<a href="/user/Mothwick/" class="text-black dark:text-white text-lg font-semibold">Mothwick</a>
+										<loot-badges :badges="badges"></loot-badges>
+				</div>
+			</div>
+		</div>
+		<div class="h-5"></div>
+		<div class="h-6"></div>
+		<div class="settings-badges">
+					</div>
+		<div class="h-2.5"></div>
+			</div>
+</div>
+<div class="row3">
+	<div class="span2">
+		<h1 class="text-3xl">
+			<small class="text-sm font-semibold leading-4 block text-sky-400">Auction</small>
+			<span class="force-wrap font-extrabold leading-6 tracking-tight">YCH COUPLE</span>
+		</h1>
+		<div class="h-4"></div>
+		<!-- Description of the auction goes here-->
+		<p class="text-slate-600 text-lg">
+			<span class="whitespace-pre-wrap">Welcome to my ych^^
+♢ SB: $15
+♢ MB: $5
+♢AB: -
+SB - Sketch
+$50 - colored sketch 
+$80 - full art + render
+Changes:
+- Any gender (female, male)
+- Any species (people, neko, other)
+- You can change the emotion, genitalia, a speech bubble
+(But I reserve the right to ask for an additional fee if I deem it necessary)
+Rules:
+- PayPal only
+- Payment within 24 hours 
+- I’ll start drawing after payment 
+- My telegram channel: <a href="https://t.me/mothwick">https://t.me/mothwick</a>
+- Twitter: @mothwick_x
+♢Сustomer reviews: <a href="https://loot.commishes.com/">https://loot.commishes.com/</a>
+♢Portfolio: <a href="https://portfolio.commishes.com/user/Mothwick/">https://portfolio.commishes.com/user/Mothwick/</a>
+If you want a different commission, other ideas, feel free to contact me in private messages. Here (in the ych.commishes), on Telegram୧[ ˵ ͡ᵔ ͜ʟ ͡ᵔ ˵ ]୨
+Good luck ^^</span>
+		</p>
+		<div class="h-8"></div>
+		<div class="pt-4">
+			<span class="text-gray-700 dark:text-gray-300 text-xs bg-gray-100 dark:bg-slate-800 rounded-full px-1.5 py-1 mb-1 mr-2" >
+				Safe			</span>
+			<span class="text-gray-700 dark:text-gray-300 text-xs bg-gray-100 dark:bg-slate-800 rounded-full px-1.5 py-1 mb-1 mr-2" >
+				human			</span>
+		</div>
+		<div class="h-8 border-b border-slate-200"></div>
+		<div class="h-16"></div>
+		<!--User portfolio-->
+		<div id="portfolio-container">
+			<h2>Samples <small class="text-gray-600 dark:text-gray-400">These are examples of finished art</small></h2>
+			<div class="overflow-hidden">
+				<div id="portfolio-preview"></div>
+			</div>
+			<div class="h-2.5"></div>
+			<div class="text-right">
+				<a href="https://portfolio.commishes.com/user/Mothwick">Mothwick's portfolio</a>
+			</div>
+		</div>
+		<div class="h-8"></div>
+</div>
+</div>
+<div class="h-12"></div>
+<p class="text-center">
+	<a href="//ask-patch.tumblr.com"><img src="/assets/src/img/patch.png" class="inline" width="100" alt="Ask Patch on Tumblr" /></a><br>
+	Made with &#9829;&#xFE0E; by Patch
+</p>
+<script type="text/javascript">
+	/**
+	 * @deprecated
+	 */
+	window.loot = 'https://loot.commishes.com';
+	window.configuration.auction = {
+		ID: 6333258,
+		URL: '/auction/show/618QA/',
+		BIDS: '/auction/getbids/6333258/',
+		USER:'196422'
+	};
+</script>
+		</main>
+</body></html>

@@ -2,8 +2,8 @@
   "manifest_version": "0.4",
   "name": "mcp-devian",
   "display_name": "Адопты: DeviantArt и Toyhouse",
-  "version": "0.5.0",
-  "description": "Помогает продавать адоптов на DeviantArt и Toyhouse: рынок, покупатели, продвижение, учёт продаж и заработка, YCH и коммишены, защита, публикация по её «го».",
+  "version": "0.5.1",
+  "description": "Помогает продавать адоптов и YCH на DeviantArt, Toyhouse и ych.commishes: рынок, покупатели, продвижение, учёт продаж и заработка, YCH и коммишены, защита, публикация по её «го».",
   "long_description": "После установки просто напиши Claude «давай настроим помощника по адоптам» — он сам задаст вопросы. Публикует только после её «го» в чате.",
   "author": {
     "name": "Andrei Bugerov"
@@ -84,7 +84,7 @@
     },
     {
       "name": "market",
-      "description": "Рынок: цены похожих лотов, поиск, группы, спрос и цены Toyhouse, история"
+      "description": "Рынок: цены похожих лотов, поиск, группы, спрос и цены Toyhouse, цены ych.commishes, история"
     },
     {
       "name": "forecast",
@@ -92,7 +92,7 @@
     },
     {
       "name": "advice",
-      "description": "Советы: заработать больше, разбор недели, план адопта, перевод её текста для DA/X"
+      "description": "Советы: заработать больше, разбор недели, план адопта (и для ych.commishes), перевод её текста для DA/X"
     },
     {
       "name": "feedback",
@@ -100,7 +100,7 @@
     },
     {
       "name": "da_auctions",
-      "description": "Ставки и сроки её аукционов DeviantArt"
+      "description": "Ставки и сроки её аукционов DeviantArt и ych.commishes"
     },
     {
       "name": "da_groups",
@@ -136,7 +136,7 @@
     },
     {
       "name": "sales",
-      "description": "Её деньги: продажи, доход, часы и ₽ в час, цель месяца, YCH и коммишены, отчёт за месяц"
+      "description": "Её деньги: продажи (DA, Toyhouse, ych.commishes), доход, часы и ₽ в час, цель месяца, YCH и коммишены, отчёт за месяц"
     },
     {
       "name": "pinglist",
@@ -148,7 +148,7 @@
     },
     {
       "name": "promo",
-      "description": "Продвижение: X, группы, статус и журнал, раффл, воронка, чек-лист поста"
+      "description": "Продвижение: X, группы, статус и журнал, раффл, воронка, чек-лист поста (и кросспоста на ych.commishes)"
     }
   ],
   "tools_generated": true,
@@ -164,7 +164,8 @@
     "adopts",
     "monitoring",
     "sales",
-    "promotion"
+    "promotion",
+    "ych.commishes"
   ],
   "license": "MIT"
 }

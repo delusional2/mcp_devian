@@ -333,7 +333,9 @@ def cooldowns(conn: sqlite3.Connection, now: float | None = None) -> dict[str, s
     """Действующие паузы по классам адресов."""
     now = _now() if now is None else now
     try:
-        rows = conn.execute("SELECT * FROM da_cooldown WHERE until_ts > ?", (now,)).fetchall()
+        # Только свои классы: в той же таблице лежит пауза ych.commishes (commishes.KIND).
+        rows = conn.execute("SELECT * FROM da_cooldown WHERE until_ts > ? AND kind IN (?, ?)",
+                            (now, *KINDS)).fetchall()
     except sqlite3.Error:
         return {}
     return {r["kind"]: r for r in rows}

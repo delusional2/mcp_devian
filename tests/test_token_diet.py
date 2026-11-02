@@ -269,4 +269,4 @@ def test_public_text_tools_say_her_words_only():
     for name in ("prepare_deviantart_publish", "th_character"):
         assert "её слова, не сочиняй" in tools[name].description, name
     assert "th_character:new" in tools["characters"].description
-    assert "platform deviantart|toyhouse|other" in tools["sales"].description
+    assert "platform deviantart|toyhouse|commishes|other" in tools["sales"].description

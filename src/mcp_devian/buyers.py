@@ -167,7 +167,7 @@ def _interests(conn, username: str) -> dict[str, int]:
                            (username,)):
         ref = ev["ref"]
         title = ""
-        if not ref.startswith(("da:", "th:")):
+        if not ref.startswith(("da:", "th:", "cm:")):
             s = conn.execute("SELECT item_id, title FROM sales WHERE id = ?", (ref,)).fetchone()
             ref, title = (s["item_id"], s["title"]) if s else (None, "")
         for t in item_tags(conn, ref, title):
@@ -236,7 +236,9 @@ def _bidder_events(conn, me: str) -> int:
             user = b.get("user") if isinstance(b, dict) else None
             if not user or key(user) == me:
                 continue
-            plat = "toyhouse" if str(r["deviation_id"]).startswith("th:") else "deviantart"
+            # Ставки на ych.commishes (cm:) — не DA: тот же ник на DA может быть чужим, личного канала там не даёт.
+            ref = str(r["deviation_id"])
+            plat = "toyhouse" if ref.startswith("th:") else "other" if ref.startswith("cm:") else "deviantart"
             n += add_event(conn, user, "bidder", r["deviation_id"], b.get("ts") or r["updated_ts"], plat)
     return n
 

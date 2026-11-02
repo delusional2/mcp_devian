@@ -24,8 +24,12 @@ TRANSITIONS = {
 }
 STATUS_NAMES = {"won": "ждёт оплаты", "paid": "оплачено", "transferred": "перс передан", "done": "готово",
                 "cancelled": "отменена"}
-PLATFORMS = ("deviantart", "toyhouse", "other")
-FORMATS = ("auction", "flatsale", "ota", "bta", "raffle", "adopt", "other")
+PLATFORMS = ("deviantart", "toyhouse", "commishes", "other")
+# Как площадку называет она: DA, TH, ych.commishes… (общие с commissions; там есть и x — у продаж это other).
+PLATFORM_ALIASES = {"da": "deviantart", "deviant": "deviantart", "th": "toyhouse", "toyhou.se": "toyhouse",
+                    "twitter": "x", "tw": "x", "ych.commishes": "commishes", "ych.commishes.com": "commishes",
+                    "commishes.com": "commishes", "cm": "commishes"}
+FORMATS = ("auction", "flatsale", "ota", "bta", "raffle", "adopt", "ych", "other")
 CURRENCIES = ("usd", "points", "eur", "gbp", "rub")
 PAY_METHODS = ("boosty", "points", "other")
 FOREIGN = ("usd", "eur", "gbp")
@@ -80,6 +84,13 @@ def _checked_net(net_amount: float | None, net_currency: str | None, pay_method:
         if net_amount is not None:
             raise SaleError("У поинтов нет «сколько дошло в ₽»: поинты не выводятся в деньги")
     return net_amount, net_currency, pay_method
+
+
+def platform_of(value: str | None) -> str:
+    """Площадка продажи без учёта регистра и с короткими именами; X — other (в журнале продаж X нет)."""
+    p = (value or "").strip().lower()
+    p = PLATFORM_ALIASES.get(p, p)
+    return "other" if p == "x" else p
 
 
 def _checked_format(title: str, amount: float | None, currency: str | None, platform: str, format: str,
@@ -143,9 +154,11 @@ def record(conn, *, url: str = "", title: str, amount: float | None, currency: s
 
     Возвращает (id, что вышло): new — новая запись; merged — уточнила запись, которую помощник
     завёл сам по ставкам; exists — она эту продажу уже записывала, ничего не меняла."""
+    from . import commishes
     from . import th_auctions as ta
 
-    if not (platform or "").strip():  # не сказала, где продала: ссылка на перса Toyhouse — значит Toyhouse
+    platform = platform_of(platform)
+    if not platform:  # не сказала, где продала: ссылка на перса Toyhouse — значит Toyhouse
         platform = "toyhouse" if (character_url or "").strip().startswith("https://toyhou.se/") else "deviantart"
     item_id = None
     if (url or "").strip() and ta.THREAD_URL.match(url.strip()):
@@ -154,6 +167,13 @@ def record(conn, *, url: str = "", title: str, amount: float | None, currency: s
         except ValueError as e:
             raise SaleError(str(e)) from e
         platform = "toyhouse"
+    elif (url or "").strip() and commishes.parse_url(url):
+        # Аукцион ych.commishes: тот же лот, что заводит sync_sales (cm:<номер>, у слотов — cm:<номер>:<слот>).
+        try:
+            item_id = commishes.sale_item_id(conn, url.strip(), lot)
+        except ValueError as e:
+            raise SaleError(str(e)) from e
+        platform = "commishes"
     elif (url or "").strip():
         item_id = lot_id_for_url(conn, url)
         if not item_id:

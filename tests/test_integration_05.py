@@ -68,7 +68,7 @@ def _template(kind: str, text: str) -> None:
 def test_versions_and_manifest_match_server_tools():
     manifest = json.loads((ROOT / "manifest.json").read_text())
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert manifest["version"] == pyproject["project"]["version"] == mcp_devian.__version__ == "0.5.0"
+    assert manifest["version"] == pyproject["project"]["version"] == mcp_devian.__version__ == "0.5.1"
     tools = _tools()
     assert [t["name"] for t in manifest["tools"]] == list(tools)
     assert {"buyers", "promo"} <= set(tools) and len(tools) <= 40

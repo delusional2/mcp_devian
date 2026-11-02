@@ -107,6 +107,8 @@ def _check_job(args) -> int:
             if _toyhouse_read(results):
                 # Она сама попросила проверку: в режиме chrome её аукционы-треды читаются только здесь.
                 lines += _th_auctions(conn, cfg, None, interactive=True)
+            if args.source == "all":
+                lines += _commishes(conn, cfg, None)
         jobs.finish(args.job, lines)
         return 0
     except Exception as e:
@@ -149,6 +151,10 @@ def _check(args, tick: float | None) -> int:
                 report = None
             if report:
                 print(f"отчёт недели → {report}")
+        if args.source == "all":
+            # После запланированных постов: медленный ych.commishes (до таймаута) не задерживает её публикации.
+            for line in _commishes(conn, cfg, tick):
+                print(line)
         if args.notify or args.scheduled:
             sent = digest.deliver(conn, cfg, _problems(before, results, cfg.toyhouse.mode, conn))
             if sent["items"]:
@@ -178,6 +184,21 @@ def _growth(conn, cfg, tick: float | None) -> list[str]:
     try:
         return monitor.growth_pass(conn, cfg, tick)
     except Exception:  # noqa: BLE001 — growth_pass и так не бросает; на всякий случай
+        traceback.print_exc()
+        return []
+
+
+def _commishes(conn, cfg, tick: float | None) -> list[str]:
+    """Её аукционы ych.commishes (если указан ник): ставки → уведомления, итоги → продажи. Не мешает проверке."""
+    try:
+        problems: list[str] = []
+        lines, events = monitor.commishes_pass(conn, cfg, tick, problems=problems)
+        if events:
+            digest.notify_bids(cfg, events)
+        if problems:  # один раз на ошибку (не каждые 15 минут): опечатка в нике, пропавший аукцион
+            digest.notify_lines(cfg, "ych.commishes", problems)
+        return [*problems, *lines]
+    except Exception:  # noqa: BLE001 — commishes_pass и так не бросает; на всякий случай
         traceback.print_exc()
         return []
 

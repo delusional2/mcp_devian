@@ -50,3 +50,18 @@ def no_real_spawns(monkeypatch):
         return real(cmd, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", guarded)
+
+
+@pytest.fixture(autouse=True)
+def no_real_commishes(monkeypatch):
+    """ych.commishes.com — только через подменённый транспорт httpx: в сеть тесты не ходят."""
+    from mcp_devian import commishes
+
+    real = commishes.make_http
+
+    def guarded(transport=None):
+        if transport is None:
+            raise AssertionError("тест попытался сходить на настоящий ych.commishes.com")
+        return real(transport=transport)
+
+    monkeypatch.setattr(commishes, "make_http", guarded)

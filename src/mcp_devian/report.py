@@ -41,7 +41,7 @@ MONTHS = ("январь", "февраль", "март", "апрель", "май"
 FORMAT_NAMES = {"auction": "аукционы", "flatsale": "фикс-цена", "ota": "OTA", "bta": "BTA", "raffle": "рафлы",
                 "adopt": "адопты", "other": "другое",
                 "bundle": "наборы", "ych": "YCH", "commission": "коммишены"}
-PLATFORM_NAMES = {"deviantart": "DeviantArt", "toyhouse": "Toyhouse", "other": "другое"}
+PLATFORM_NAMES = {"deviantart": "DeviantArt", "toyhouse": "Toyhouse", "commishes": "ych.commishes", "other": "другое"}
 _MONTH_RE = (re.compile(r"^\s*(\d{4})[-/.](\d{1,2})\s*$"), re.compile(r"^\s*(\d{1,2})[-/.](\d{4})\s*$"))
 
 

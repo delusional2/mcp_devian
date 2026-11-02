@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Loyal Shepherd Dog - Adopt - YCH.Commishes</title>
+<link type="application/atom+xml" rel="alternate" href="/home/index.rss"/>
+</head><body>
+<main class="mb-auto">
+<!-- 
+	Here go the tabs that separate the auctions depending on the category they're
+	placed in.
+-->
+<div class="h-2.5"></div>
+<!-- Started: bin/templates/elements/auction-tabs.php -->
+<div class="tabs"><a class='tab' href='/'>Featured</a><a class='tab' href='/category/furry/'>Furry</a><a class='tab' href='/category/brony/'>Pony</a><a class='tab' href='/category/human/'>Human</a><a class='tab active' href='/category/adopt/'>Adoptables</a><a class='tab' href='/category/crafts/'>Crafts</a></div>
+<!-- Ended: bin/templates/elements/auction-tabs.php -->	
+<div class="h-2.5"></div>
+<div class="row3">
+	<div class="span2" >
+		<a href="https://ych.commishes.com/image/download/6334553/" style="display: block;">
+						<img src="https://ych.commishes.com/image/resize/6334553/" class="w-full" width="700">
+					</a>
+		<div class="h-1"></div>
+		<div class="h-1"></div>
+	</div>
+	<div id="auction" class="span1" data-endtime="1793646341">
+		<bid-form 
+			v-if="endtime > ((+new Date()) / 1000)" 
+			:slots="slots"
+			:action="'/bids/post.json'"
+			:auction="'6334553'"
+			:csrf="'CSRF'"
+			:guest="true"
+			></bid-form>
+		<watchlist-button 
+			v-if="false"
+			auction="6334553" 
+			:active="false"
+			></watchlist-button>
+		<div class="border border-gray-300 dark:border-gray-800 dark:bg-slate-600 shadow-md rounded-md">
+			<timer :end="this.endtime"></timer>
+			<div class="border-b border-b-gray-200 dark:border-b-gray-700"></div>
+			<div class="h-8"></div>
+			<slots :slots="slots"></slots>
+		</div>
+		<div class="h-2"></div>
+		<form 
+			v-if="endtime < ((+new Date()) / 1000)" 
+			action="/user/subscribe/" 
+			METHOD="POST" 
+			class="border border-gray-300 dark:border-gray-800 dark:bg-slate-600 shadow-md rounded-md p-4 bg-slate-50">
+			<span class="text-lg">This auction is over!</span>
+			<p class="text-sm">But if you tell us your email we will notify you when this user starts a new one</p>
+			<div class="h-2"></div>
+			<input type="hidden" name="csrf" value="CSRF" />
+			<input type="hidden" name="user" value="">
+			<input type="email" name="email" placeholder="Email" class="rounded border border-gray-300 w-full mr-4">
+			<div class="h-2"></div>
+			<button class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded text-xl w-full">Subscribe</button>
+		</form>
+		<div class="h-2"></div>
+		<div class="p-4">
+			<!-- User icon and name go here-->
+			<div class="flex">
+				<div class="w-16 shrink-0">
+					<a href="/user/Pinecrow/">
+						<img class="w-full rounded-full" src="https://account.commishes.com/image/user/195459/64/?t=1792590600">
+					</a>
+				</div>
+				<div class="px-2">
+					<a href="/user/Pinecrow/" class="text-black dark:text-white text-lg font-semibold">Pinecrow</a>
+										<loot-badges :badges="badges"></loot-badges>
+				</div>
+			</div>
+		</div>
+		<div class="h-5"></div>
+		<div class="h-6"></div>
+		<div class="settings-badges">
+						<div class="setting-badge">
+				<img class="icon" alt="Sniping protection" src="/assets/src/img/sniping.png" />
+				<span class="title">Sniping protection enabled</span>
+				<span class="additional">Bids in the last 10 minutes extend the auction</span>
+			</div>
+					</div>
+		<div class="h-2.5"></div>
+			</div>
+</div>
+<div class="row3">
+	<div class="span2">
+		<h1 class="text-3xl">
+			<small class="text-sm font-semibold leading-4 block text-sky-400">! Read Description !</small>
+			<span class="force-wrap font-extrabold leading-6 tracking-tight">Loyal Shepherd Dog - Adopt</span>
+		</h1>
+		<div class="h-4"></div>
+		<!-- Description of the auction goes here-->
+		<p class="text-slate-600 text-lg">
+			<span class="whitespace-pre-wrap">SB: 10$
+Min: 5$
+➤ Payment plan is available from bid over 200$
+➤ Commercial use from bid over 100$
+➤ Rules:
+- USD ONLY
+- No refunds
+- Payment only via Hipolink/Lava.top (PayPal/Bank card, it would be better if you'll have both options just in case)
+- Payment must be completed within 24h after your win (but if you need more time, we can negotiate)
+- When payment is complete I'll send you full-size png without watermark and signs
+✶ You can see my works in my social media:
+FA: <a href="https://www.furaffinity.net/user/pinecrow">https://www.furaffinity.net/user/pinecrow</a>
+X: <a href="https://x.com/pinecrow_art">https://x.com/pinecrow_art</a>
+➤ My discord is pinecrow! Take a note on that to not be scammed and remember that I don't write to people first.
+➤ I may not answer to you immediately since I may have the different time zone or be busy at the moment. Yet I'll make sure to answer as soon as I can!</span>
+		</p>
+		<div class="h-8"></div>
+		<div class="pt-4">
+			<span class="text-gray-700 dark:text-gray-300 text-xs bg-gray-100 dark:bg-slate-800 rounded-full px-1.5 py-1 mb-1 mr-2" >
+				Safe			</span>
+						<span class="text-gray-700 dark:text-gray-300 text-xs bg-gray-100 dark:bg-slate-800 rounded-full px-1.5 py-1 mb-1 mr-2" >
+				Promoted
+			</span>
+			<span class="text-gray-700 dark:text-gray-300 text-xs bg-gray-100 dark:bg-slate-800 rounded-full px-1.5 py-1 mb-1 mr-2" >
+				adopt			</span>
+		</div>
+		<div class="h-8 border-b border-slate-200"></div>
+		<div class="h-16"></div>
+		<!--User portfolio-->
+		<div id="portfolio-container">
+			<h2>Samples <small class="text-gray-600 dark:text-gray-400">These are examples of finished art</small></h2>
+			<div class="overflow-hidden">
+				<div id="portfolio-preview"></div>
+			</div>
+			<div class="h-2.5"></div>
+			<div class="text-right">
+				<a href="https://portfolio.commishes.com/user/Pinecrow">Pinecrow's portfolio</a>
+			</div>
+		</div>
+		<div class="h-8"></div>
+</div>
+</div>
+<div class="h-12"></div>
+<p class="text-center">
+	<a href="//ask-patch.tumblr.com"><img src="/assets/src/img/patch.png" class="inline" width="100" alt="Ask Patch on Tumblr" /></a><br>
+	Made with &#9829;&#xFE0E; by Patch
+</p>
+<script type="text/javascript">
+	/**
+	 * @deprecated
+	 */
+	window.loot = 'https://loot.commishes.com';
+	window.configuration.auction = {
+		ID: 6334553,
+		URL: '/auction/show/61A2P/',
+		BIDS: '/auction/getbids/6334553/',
+		USER:'195459'
+	};
+</script>
+		</main>
+</body></html>

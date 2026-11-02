@@ -27,7 +27,7 @@ DAY = 86400
 WEEK = 7 * DAY
 KINDS = ("ych", "commission")
 KIND_NAMES = {"ych": "YCH", "commission": "коммишен"}
-PLATFORMS = ("deviantart", "toyhouse", "x", "other")
+PLATFORMS = ("deviantart", "toyhouse", "x", "commishes", "other")
 SLOT_STATUSES = ("claimed", "deposit", "in_progress", "wip_sent", "final_paid", "delivered", "cancelled")
 ACTIVE = ("claimed", "deposit", "in_progress", "wip_sent", "final_paid")
 RANK = {s: i for i, s in enumerate(SLOT_STATUSES[:-1])}
@@ -171,12 +171,11 @@ def _currency(value: str | None, default: str = "rub") -> str:
     return (value or "").strip().lower() or default
 
 
-PLATFORM_ALIASES = {"da": "deviantart", "deviant": "deviantart", "th": "toyhouse", "toyhou.se": "toyhouse",
-                    "twitter": "x", "tw": "x"}
+PLATFORM_ALIASES = sales.PLATFORM_ALIASES
 
 
 def _platform(value: str | None, default: str = "other") -> str:
-    """deviantart | toyhouse | x | other — без учёта регистра, с короткими именами (DA, TH, Twitter)."""
+    """deviantart | toyhouse | x | commishes | other — без учёта регистра, с короткими именами (DA, TH, Twitter)."""
     p = (value or "").strip().lower()
     if not p:
         return default

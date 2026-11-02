@@ -1,0 +1,80 @@
+{
+ "result": "200 OK",
+ "time": 1793624015,
+ "payload": {
+  "id": 6334553,
+  "user": 195459,
+  "username": "Pinecrow",
+  "title": "Loyal Shepherd Dog - Adopt",
+  "subtitle": "! Read Description !",
+  "description": "SB: 10$\r\nMin: 5$\r\n\r\n➤ Payment plan is available from bid over 200$\r\n➤ Commercial use from bid over 100$\r\n\r\n➤ Rules:\r\n- USD ONLY\r\n- No refunds\r\n- Payment only via Hipolink/Lava.top (PayPal/Bank card, it would be better if you'll have both options just in case)\r\n- Payment must be completed within 24h after your win (but if you need more time, we can negotiate)\r\n- When payment is complete I'll send you full-size png without watermark and signs\r\n\r\n✶ You can see my works in my social media:\r\nFA: https://www.furaffinity.net/user/pinecrow\r\nX: https://x.com/pinecrow_art\r\n\r\n➤ My discord is pinecrow! Take a note on that to not be scammed and remember that I don't write to people first.\r\n➤ I may not answer to you immediately since I may have the different time zone or be busy at the moment. Yet I'll make sure to answer as soon as I can!",
+  "ends": "Mon, 02 Nov 2026 20:05:41 +0100",
+  "endsunix": 1793646341,
+  "rating": 0,
+  "adult": false,
+  "promoted": true,
+  "sale": {
+   "discount": false,
+   "previous": 0
+  },
+  "media": {
+   "preview": "https://ych.commishes.com/image/resize/6334553/",
+   "thumb": "https://ych.commishes.com/image/thumb/6334553/",
+   "original": "https://ych.commishes.com/image/download/6334553/"
+  },
+  "slots": {
+   "6334553": {
+    "name": "Loyal Shepherd Dog - Adopt",
+    "highestbid": 37,
+    "media": {
+     "preview": "https://ych.commishes.com/image/resize/6334553/",
+     "thumb": "https://ych.commishes.com/image/thumb/6334553/",
+     "original": "https://ych.commishes.com/image/download/6334553/"
+    },
+    "startbid": 10,
+    "autobuy": null,
+    "minincrease": 5,
+    "bids": [
+     {
+      "name": "Brindlefox",
+      "guest": false,
+      "user": {
+       "id": "445281",
+       "name": "Brindlefox",
+       "sponsor": false
+      },
+      "bid": 37,
+      "created": 1793616569
+     },
+     {
+      "name": "LadyQuill",
+      "guest": false,
+      "user": {
+       "id": "391469",
+       "name": "LadyQuill",
+       "sponsor": false
+      },
+      "bid": 15,
+      "created": 1793603183
+     },
+     {
+      "name": "Fernbyte_Arts",
+      "guest": false,
+      "user": {
+       "id": "437454",
+       "name": "Fernbyte_Arts",
+       "sponsor": false
+      },
+      "bid": 10,
+      "created": 1793582285
+     }
+    ]
+   }
+  },
+  "settings": {
+   "bidding.allow_questions": "ON",
+   "security.sniping_disabled": "ON",
+   "bidding.autobid_enabled": null
+  }
+ }
+}

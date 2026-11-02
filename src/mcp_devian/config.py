@@ -179,6 +179,26 @@ class Posting:
     goal_nudges: bool = False
 
 
+COMMISHES_DEFAULT_CATEGORIES: tuple[str, ...] = ("adopt", "furry", "human")
+
+
+@dataclass
+class Commishes:
+    # Её ник на ych.commishes.com: без него помощник туда в фоне не ходит совсем.
+    username: str = ""
+    # Категории для небольшой выборки рынка (лента категории, 1 запрос на категорию, кэш 30 мин). Адопты — в
+    # Adoptables, а YCH — в лентах по виду персонажа (Furry, Human): без них цен YCH почти не будет.
+    categories: list[str] = field(default_factory=lambda: list(COMMISHES_DEFAULT_CATEGORIES))
+    # Фон: её аукционы (ставки, итоги, продажи) и выборка рынка раз в 6 ч — только если ник указан.
+    background: bool = True
+    market: bool = True
+
+
+COMMISHES_CATEGORIES = ("furry", "brony", "human", "adopt", "crafts")
+COMMISHES_CATEGORIES_MAX = 3
+COMMISHES_USERNAME = re.compile(r"^(?=.*[A-Za-z0-9])[A-Za-z0-9_.-]{1,40}$")  # не «..»
+
+
 @dataclass
 class Config:
     filters: Filters = field(default_factory=Filters)
@@ -186,6 +206,7 @@ class Config:
     toyhouse: Toyhouse = field(default_factory=Toyhouse)
     notify: Notify = field(default_factory=Notify)
     posting: Posting = field(default_factory=Posting)
+    commishes: Commishes = field(default_factory=Commishes)
     configured: bool = False
     configured_at: float = 0
     path: Path | None = None
@@ -194,7 +215,7 @@ class Config:
 
 
 SECTIONS = {"filters": Filters, "deviantart": DeviantArt, "toyhouse": Toyhouse, "notify": Notify,
-            "posting": Posting}
+            "posting": Posting, "commishes": Commishes}
 
 
 def settings_path() -> Path:
@@ -248,6 +269,7 @@ def load_config(path: Path | None = None) -> Config:
         toyhouse=_pick(Toyhouse, _section(raw, "toyhouse", warnings), "toyhouse", warnings),
         notify=_pick(Notify, _section(raw, "notify", warnings), "notify", warnings),
         posting=_pick(Posting, _section(raw, "posting", warnings), "posting", warnings),
+        commishes=_pick(Commishes, _section(raw, "commishes", warnings), "commishes", warnings),
         configured=bool(raw.get("configured")),
         configured_at=float(raw.get("configured_at") or 0),
         path=path,
@@ -272,7 +294,20 @@ def load_config(path: Path | None = None) -> Config:
     _check_posting(cfg.posting, warnings)
     _check_deviantart(cfg.deviantart, warnings)
     _bool_or_default(cfg.toyhouse, "toyhouse", "background_lf", warnings)
+    _check_commishes(cfg.commishes, warnings)
     return cfg
+
+
+def _check_commishes(c: "Commishes", warnings: list[str]) -> None:
+    """Руками исправленный файл: кривой ник — не ходим на сайт; лишние категории — не больше трёх."""
+    c.username = _lenient(parse_commishes_username, c.username, "", "commishes.username", warnings)
+    dropped: list[str] = []
+    cats = _lenient(lambda v: parse_commishes_categories(v, strict=False, dropped=dropped), c.categories,
+                    list(COMMISHES_DEFAULT_CATEGORIES), "commishes.categories", warnings)
+    _warn_dropped("commishes.categories", dropped, warnings)
+    c.categories = cats
+    for key in ("background", "market"):
+        _bool_or_default(c, "commishes", key, warnings)
 
 
 def _check_posting(p: "Posting", warnings: list[str]) -> None:
@@ -721,6 +756,31 @@ def parse_usernames(value, name: str) -> list[str]:
     return out
 
 
+def parse_commishes_username(value) -> str:
+    """«@name», «https://ych.commishes.com/user/name/» → name. Пусто — сбросить."""
+    if not isinstance(value, str):
+        raise SettingsError("commishes_username: её ник на ych.commishes.com")
+    name = value.strip().rstrip("/")
+    if "commishes.com/user/" in name:
+        name = name.split("commishes.com/user/", 1)[1].split("?")[0]
+    name = name.lstrip("@")
+    if name and ("/" in name or not COMMISHES_USERNAME.match(name)):
+        raise SettingsError("commishes_username: ник ych.commishes — латинские буквы, цифры, _ . -")
+    return name
+
+
+def parse_commishes_categories(value, strict: bool = True, dropped: list[str] | None = None) -> list[str]:
+    cats = parse_choices(value, COMMISHES_CATEGORIES, "commishes_categories", strict=strict, dropped=dropped)
+    if len(cats) > COMMISHES_CATEGORIES_MAX:
+        if strict:
+            raise SettingsError(f"commishes_categories: не больше {COMMISHES_CATEGORIES_MAX} — выборка рынка маленькая "
+                                "на совесть: помощник одной художницы, а не сборщик данных")
+        if dropped is not None:
+            dropped.append(f"{', '.join(cats[COMMISHES_CATEGORIES_MAX:])} — больше {COMMISHES_CATEGORIES_MAX} не беру")
+        cats = cats[:COMMISHES_CATEGORIES_MAX]
+    return cats
+
+
 def _ranged(key: str, value) -> int:
     _sec, low, high = RANGES[key]
     number = _whole(value, low, high)
@@ -767,6 +827,8 @@ SETTING_KEYS: dict[str, str] = {
     "commission_weekly_hours": "0–168 (0 — не считать загрузку)", "commission_deposit_pct": "0–100",
     "commission_deposit_days": "1–60", "commission_deadline_warn_days": "1–60", "commission_final_days": "1–60",
     "commission_deliver_days": "1–60", "commission_reminders": "true|false", "goal_nudges": "true|false",
+    "commishes_username": "её ник ych.commishes", "commishes_categories": f"≤{COMMISHES_CATEGORIES_MAX} из "
+    + "|".join(COMMISHES_CATEGORIES), "commishes_background": "true|false", "commishes_market": "true|false (фон)",
 }
 
 
@@ -910,6 +972,12 @@ def apply_changes(cfg: Config, changes: dict) -> list[str]:
             da.similar_artists = parse_usernames(value, key)
         elif key == "toyhouse_background_lf":
             th.background_lf = _flag(value, key)
+        elif key == "commishes_username":
+            cfg.commishes.username = parse_commishes_username(value)
+        elif key == "commishes_categories":
+            cfg.commishes.categories = parse_commishes_categories(value)
+        elif key in ("commishes_background", "commishes_market"):
+            setattr(cfg.commishes, key.removeprefix("commishes_"), _flag(value, key))
         elif key == "weekly_report":
             nt.weekly_report = bool(value)
         elif key == "notify_market_lots":

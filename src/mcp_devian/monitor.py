@@ -966,6 +966,78 @@ def money_pass(conn, cfg: Config, now: float | None = None) -> list[str]:
     return lines
 
 
+CM_MARKET_SOURCE = "commishes_market_bg"
+CM_MARKET_INTERVAL_S = 6 * 3600        # выборка рынка ych.commishes — не чаще раза в 6 часов
+CM_PROFILE_SOURCE = "commishes_profile"   # last_error — ошибка профиля, о которой ей уже сказали
+
+
+def _since_last(conn, source: str, ts: float, interval: float) -> bool:
+    last = db.last_run(conn, source)
+    return not (last and last["last_run_ts"] and ts - last["last_run_ts"] < interval)
+
+
+def commishes_pass(conn, cfg: Config, now: float | None = None, client=None,
+                   problems: list[str] | None = None) -> tuple[list[str], list]:
+    """ych.commishes в фоне — только если она указала ник (commishes_username), без входа, в бюджете сайта:
+    каждый проход — её аукционы (профиль из кэша 30 мин + JSON только изменившихся) и победители в продажи;
+    раз в 6 ч — лента её категорий и до 3 итогов чужих лотов (низкий приоритет). Чистка раз в сутки — всегда.
+    Ставок не делает и ничего на сайте не меняет. (строки, события ставок). Не бросает.
+    problems — сюда то, что ей надо сказать один раз (профиль не открылся, её аукцион пропал)."""
+    from . import auctions
+    from . import commishes as cm
+
+    ts = now or time.time()
+    _bg("commishes.prune", lambda: cm.maybe_prune(conn, ts))
+    c = cfg.commishes
+    if not c.username or not (c.background or c.market):
+        return [], []
+    lines: list[str] = []
+    events: list = []
+    tell = problems if problems is not None else lines
+
+    def work(client) -> None:
+        if c.background:
+            res = cm.track_mine(conn, client, c.username, now=ts)
+            events.extend(res.events)
+            if res.throttled:
+                lines.append(f"ych.commishes: {res.throttled}")
+            last = db.last_run(conn, CM_PROFILE_SOURCE)
+            if res.profile_error and (not last or last["last_error"] != res.profile_error):
+                tell.append(f"ych.commishes: {res.profile_error}.")
+            if res.profile_error or not res.throttled:
+                db.record_run(conn, CM_PROFILE_SOURCE, res.profile_error, ts)
+            tell.extend(f"ych.commishes: твой аукцион {u} больше не читается (удалён или скрыт) — не слежу за ним."
+                        for u in res.gone)
+            new = cm.sync_sales(conn, ts)
+            if new:
+                lines.append(f"продажи: записала победителей аукционов ych.commishes — {len(new)}")
+        if c.market and c.categories and _since_last(conn, CM_MARKET_SOURCE, ts, CM_MARKET_INTERVAL_S):
+            # Проход по рынку засчитан, даже если лента сломана: иначе раз в 6 ч превратилось бы в каждые 15 мин.
+            db.record_run(conn, CM_MARKET_SOURCE, None, ts)
+            for cat in c.categories:
+                try:
+                    cm.sample_market(conn, client, cat, now=ts)
+                except cm.Throttled:
+                    return  # бюджет часа, пауза сайта или сеть: доберу в следующий раз
+                except cm.CommishesError as e:
+                    log.warning("commishes market %s: %s", cat, e)  # одна лента не мешает другим
+            done = cm.finalize_market(conn, client, now=ts)
+            if done:
+                lines.append(f"ych.commishes: итогов чужих лотов для цен — {done}")
+
+    try:
+        if client is not None:
+            work(client)
+        else:
+            with cm.client_for(conn) as real:
+                work(real)
+    except Exception as e:  # noqa: BLE001 — сеть, сайт, разбор: проверка идёт дальше
+        log.warning("commishes pass failed: %s: %s", type(e).__name__, e)
+        lines.append(f"ych.commishes: не получилось ({type(e).__name__}) — попробую в следующий раз")
+    lines += [auctions.describe_event(e) for e in events]
+    return lines, events
+
+
 def format_results(results: list[SourceResult]) -> list[str]:
     lines = []
     for r in results:

@@ -57,7 +57,10 @@ SETUP_QUESTIONS = """\
    новые треды, где ищут персов, и (если подключит DeviantArt) новые ставки на её аукционах.
 6. Как ей платят: ссылка на её Boosty (boosty_url) и способы (payment_methods: boosty, points, other);
    её ник в X (x_handle), если бывает там, — для черновиков постов, «Post» жмёт она сама.
-7. По желанию, оба выключены, пока она не скажет «да»: уведомлять о новых LF-тредах Toyhouse под её персов
+7. Продаёт ли она на ych.commishes.com (YCH и адопты): её ник там (commishes_username). Помощник без входа
+   следит за ставками её аукционов и итогами, цены рынка — по маленькой выборке лент (commishes_categories,
+   до 3: adopt — адопты, furry/human — там почти все YCH); ставок не делает никогда.
+8. По желанию, оба выключены, пока она не скажет «да»: уведомлять о новых LF-тредах Toyhouse под её персов
    в фоне (toyhouse_background_lf) и ранний доступ для пинглиста — за сколько часов до всех (pinglist_early_access_hours).
 Сохраняй update_settings(changes={…}). В конце update_settings(finish_setup=True), коротко и по-доброму
 перескажи, что настроено,
@@ -131,6 +134,17 @@ MONEY_RULE = (
     "{\"price\": 25}. Перевод (advice:translate) — только её текст и только для DeviantArt или X: переведи по "
     "инструкции из ответа, затем translate с text и translation — покажи ей оба текста и жди её «ок» "
     "(translate_ok). На Toyhouse перевод не идёт никогда (правило 4.8): помощник его там блокирует.")
+COMMISHES_RULE = (
+    "ych.commishes.com: da_auctions:mine — и её аукционы там (по commishes_username), status url=… — один по "
+    "ссылке (у её аукциона — и готовая строка для поста DA: вставляет она, опубликованный пост DA помощник не "
+    "правит), deadlines — когда кончится (с сайта); market:commishes — цены YCH по типам и адоптов (keywords "
+    "[\"ych\",\"icon\"] — только YCH; только $, своя опора «рынок ych.commishes», с DA не смешивай; YCH — из "
+    "лент furry/human в commishes_categories); advice:plan format=commishes — план лота; promo:checklist "
+    "variant=commishes — её описание лота (текст или ссылка на её аукцион), без variant — пост DA с ссылкой туда; "
+    "sales platform=commishes (победителей помощник записывает сам; у аукциона со слотами — lot). «Когда "
+    "закончить аукцион там»: данных о лучшем времени конца по ych.commishes нет, forecast:best_time — только DA, "
+    "так и скажи; срок — её выбор. Ставок помощник не делает, форму аукциона заполняет и отправляет она; AI-арт "
+    "там запрещён. Все запросы — в маленьком часовом бюджете сайта.")
 SETTING_KEYS_TEXT = "Ключи настроек и пределы: " + describe_keys() + "."
 GROWTH_RULE = (
     "Покупатели и продвижение (buyers, promo): личные предложения — только тем, кто у неё покупал, ставил на ЕЁ "
@@ -303,6 +317,7 @@ def describe_settings(cfg: Config) -> str:
         f"Публикация: шаблонов {len(cfg.posting.reply_templates)}, персов {len(cfg.posting.characters)}, "
         f"наборов групп DA {len(cfg.posting.group_presets)}; ник Toyhouse {cfg.posting.th_username or 'не указан'}; "
         f"отклики {'отправляются по «го»' if cfg.posting.th_auto_submit else 'вставляются, «Post» жмёт она'}",
+        commishes_line(cfg),
         f"Фоновая проверка: {'включена' if background.is_enabled() else 'выключена'}; "
         f"уведомления macOS {'да' if cfg.notify.macos else 'нет'}, Telegram {'да' if cfg.notify.telegram else 'нет'}",
         *growth_lines(cfg),
@@ -311,6 +326,16 @@ def describe_settings(cfg: Config) -> str:
     if not cfg.configured:
         lines += ["", SETUP_QUESTIONS]
     return "\n".join(lines)
+
+
+def commishes_line(cfg: Config) -> str:
+    c = cfg.commishes
+    if not c.username:
+        return ("ych.commishes: ник не указан — если она продаёт там YCH или адоптов, спроси ник "
+                "(commishes_username): ставки на её аукционах и итоги — в фоне, без входа")
+    cats = ", ".join(c.categories) or "нет"
+    return (f"ych.commishes: ник {c.username}; в фоне её аукционы {'да' if c.background else 'нет'}, "
+            f"выборка рынка раз в 6 ч ({cats}) {'да' if c.market and c.categories else 'нет'}")
 
 
 def growth_lines(cfg: Config) -> list[str]:
@@ -342,7 +367,7 @@ def growth_lines(cfg: Config) -> list[str]:
 def guide(cfg: Config) -> str:
     """Правила и подсказки: один раз за разговор, в ответе get_settings."""
     lines = [TONE, POSTING_RULE, TEXT_RULE, NUMBERS_RULE, GALLERY_CAN, HOW_TO, GROWTH_RULE, MONEY_RULE,
-             SETTING_KEYS_TEXT]
+             COMMISHES_RULE, SETTING_KEYS_TEXT]
     if cfg.configured and feedback.should_ask(configured_since=cfg.configured_at):
         lines.append(ASK_FEEDBACK)
     return "\n\n".join(lines)
@@ -392,7 +417,7 @@ def update_settings(changes: dict | str | None = None, finish_setup: bool = Fals
     return "Сохранено: " + (", ".join(done) or "ничего не менялось") + "\n\n" + describe_settings(cfg)
 
 
-@tool(SAFE, name="update_settings")
+@tool(SAFE, name="update_settings", whole=True)  # при настройке там вопросы целиком и finish_setup
 def update_settings_tool(changes: dict | None = None, finish_setup: bool = False) -> str:
     """changes={ключ: значение} — только то, что меняется (ключи — в get_settings);
     finish_setup=True — настройка пройдена."""
@@ -711,6 +736,52 @@ def market_similar(days: int = 30) -> str:
                               cfg=cfg)
 
 
+def market_commishes(days: int = 30, keywords: list[str] | None = None) -> str:
+    """market:commishes — цены YCH (по типам) и адоптов на ych.commishes: маленькая выборка лент категорий
+    (кэш 30 мин, общий бюджет сайта), итоги — у закончившихся. Только $, отдельно от DA и Toyhouse.
+    keywords со словом ych или типом (icon, chibi…) — только YCH; без лент YCH в настройках — разово
+    добавляю furry (всего лент не больше трёх)."""
+    from . import commishes as cm
+    from .config import COMMISHES_CATEGORIES_MAX
+
+    cfg = load_config()
+    c = cfg.commishes
+    words = " ".join(keywords or ())
+    sub = cm.ych_type_of(words) if words else None
+    focus = (f"ych:{sub}" if sub else "ych") if words and (sub or cm.YCH_WORD.search(words)) else None
+    cats = list(c.categories)
+    notes: list[str] = []
+    if focus and not any(x in cm.YCH_CATEGORIES for x in cats):
+        cats = [*cats[:COMMISHES_CATEGORIES_MAX - 1], "furry"]
+        notes.append("YCH-лент в commishes_categories нет — в этот раз взяла и Furry; чтобы всегда, добавь "
+                     "furry или human в commishes_categories.")
+    with db.session() as conn:
+        _cm_prune(conn)
+        try:
+            with cm.client_for(conn) as client:
+                for cat in cats:
+                    try:
+                        cm.sample_market(conn, client, cat)
+                    except cm.Throttled as e:
+                        notes.append(f"Новую выборку не взяла: {e}.")
+                        break
+                    except cm.CommishesError as e:
+                        notes.append(f"Лента {cat}: {e}.")
+                else:
+                    cm.finalize_market(conn, client, limit=CHAT_CM_FINALS)
+        except cm.CommishesError as e:
+            notes.append(f"ych.commishes: {e}.")
+        span = max(1, min(int(days), cm.MARKET_SAMPLE_DAYS))
+        lists, _ = cm.price_lists(conn, days=span)
+        text = cm.render_stats(cm.price_stats(conn, days=span), lists=lists, configured=cats, focus=focus,
+                               background=bool(c.username and c.market and background.is_enabled()))
+        notes.append(cm.health_line(conn))
+    return text + "\n\n" + "\n".join(notes)
+
+
+CHAT_CM_FINALS = 2  # итогов чужих лотов за один вопрос в чате (остальное — фон, раз в 6 ч)
+
+
 def market_th_prices(days: int = 30) -> str:
     """Заявленные цены Toyhouse из первых постов тредов продаж + спрос LF."""
     from . import th_market as thm
@@ -797,14 +868,86 @@ def my_auctions(refresh: bool = True) -> str:
         rows = conn.execute(
             "SELECT * FROM items WHERE source='deviantart' AND own=1 AND lot_type IN ('auction','bta') "
             "AND status != 'closed' ORDER BY COALESCE(published_ts, first_seen_ts) DESC LIMIT 15").fetchall()
-        if not rows:
-            return ("Открытых аукционов у неё не нашла. Проверь ник на DA в настройках "
-                    "и что check:run source=deviantart уже прошёл.")
         out = [f"- {r['title']} — {auctions.summary_for(conn, r)}\n  {r['url']}" for r in rows]
-    tail = ("" if any("обновлено" in line for line in lines) else
+        cm_text = _commishes_mine(conn, cfg, refresh)
+    cm_hint = ("" if cfg.commishes.username else
+               "ych.commishes: ник там не указан (commishes_username) — её аукционы оттуда не вижу; один можно "
+               "прочитать по ссылке: da_auctions:status url=….")
+    if not rows and not cm_text:
+        return "\n\n".join(x for x in ("Открытых аукционов у неё не нашла. Проверь ник на DA в настройках "
+                                        "и что check:run source=deviantart уже прошёл.", cm_hint) if x)
+    if not rows and cfg.deviantart.my_username:
+        cm_text = "На DA открытых аукционов у неё нет.\n" + cm_text
+    tail = ("" if not rows or any("обновлено" in line for line in lines) else
             "\n\nСтавки обновляются сами, когда подключён DeviantArt (accounts:da_connect). Без этого можно прочитать "
             "один аукцион в её Chrome: da_auctions:status url=….")
-    return "\n".join([*lines, *out]) + tail
+    da_part = "\n".join([*lines, *out]) + tail if rows else ""
+    return "\n\n".join(p for p in (da_part, cm_text or cm_hint) if p)
+
+
+def _cm_prune(conn) -> None:
+    """Чистка данных ych.commishes раз в сутки — и из чата (без ника фон туда не ходит и не чистит)."""
+    from . import commishes as cm
+
+    with contextlib.suppress(Exception):  # чистка необязательна для ответа
+        cm.maybe_prune(conn)
+
+
+def _cm_watched(cfg: Config) -> bool:
+    """Следит ли фоновая проверка за её аукционами ych.commishes (ник, флаг и сама фоновая проверка)."""
+    return bool(cfg.commishes.username and cfg.commishes.background and background.is_enabled())
+
+
+def _cm_missing(cfg: Config) -> str:
+    """Чего не хватает, чтобы фон следил за её аукционами ych.commishes — назвать только это."""
+    need = [what for ok, what in ((cfg.commishes.username, "ника commishes_username"),
+                                  (cfg.commishes.background, "commishes_background"),
+                                  (background.is_enabled(), "включённой фоновой проверки")) if not ok]
+    return ", ".join(need)
+
+
+def _commishes_mine(conn, cfg: Config, refresh: bool) -> str:
+    """Её аукционы ych.commishes: перечитать то, что могло измениться (в бюджете сайта), и показать из базы."""
+    from . import auctions
+    from . import commishes as cm
+
+    name = cfg.commishes.username
+    notes: list[str] = []
+    _cm_prune(conn)
+    if refresh and name:
+        try:
+            with cm.client_for(conn) as client:
+                res = cm.track_mine(conn, client, name, watched=_cm_watched(cfg))
+            cm.sync_sales(conn)
+            notes = [*res.notes[:3], *([res.throttled] if res.throttled else [])]
+            notes += [auctions.describe_event(e) for e in res.events[:5]]
+        except (ValueError, cm.CommishesError) as e:
+            notes.append(f"ych.commishes: {e}")
+    text = cm.render_mine(conn)
+    if not text and not notes and not name:
+        return ""
+    return "\n".join([text or "ych.commishes: открытых аукционов не вижу.", *notes]) + f"\nНики — {UNTRUSTED}."
+
+
+def commishes_status(url: str) -> str:
+    """da_auctions:status со ссылкой на ych.commishes: ставки, конец, защита от снайпинга (без её входа)."""
+    from . import commishes as cm
+
+    cfg = load_config()
+    with db.session() as conn:
+        _cm_prune(conn)
+        try:
+            with cm.client_for(conn) as client:
+                text, events = cm.status(conn, client, url, cfg.commishes.username, watched=_cm_watched(cfg),
+                                         missing=_cm_missing(cfg))
+        except ValueError as e:
+            return f"Не читаю: {e}."
+        except cm.Throttled as e:
+            return f"Сейчас не читаю: {e}. Ничего делать не нужно — спроси чуть позже."
+        except cm.CommishesError as e:
+            return f"Не получилось прочитать: {e}."
+        cm.sync_sales(conn)  # её закончившийся аукцион — победитель в продажи (без дублей)
+    return f"Ники и названия — {UNTRUSTED}.\n{text}"
 
 
 def auction_status(url: str) -> str:
@@ -1425,6 +1568,13 @@ def plan_new_adopt(species: str = "", style: str = "", format: str = "", keyword
     from . import advisor
 
     cfg = load_config()
+    if format.strip().lower() in ("commishes", "ych.commishes"):
+        from . import commishes
+
+        words = [w for w in (species, style, *(keywords or ())) if w]
+        kind = "ych" if any(commishes.YCH_WORD.search(w) for w in words) else "adopt"
+        with db.session() as conn:
+            return commishes.plan_text(conn, " ".join(words), kind)
     with db.session() as conn:
         return advisor.launch_plan(conn, cfg, species=species or None, style=style or None, fmt=format or None,
                                    keywords=tuple(keywords or ()), tz=cfg.posting.timezone)
@@ -1460,11 +1610,11 @@ def _funnel_notes(conn, cfg: Config, item_id: str) -> list[str]:
 def record_sale(title: str, amount: float, currency: str = "usd", platform: str = "",
                 format: str = "other", buyer: str = "", character_url: str = "", note: str = "",
                 url: str = "", lot: str = "", net: float | None = None, net_currency: str = "rub") -> str:
-    """Записать продажу вручную (например, с Toyhouse или в личке). Победителей её аукционов на DA
-    и Toyhouse помощник записывает сам. currency: usd, points, eur, gbp.
-    url — ссылка на её лот на DeviantArt или тред-аукцион Toyhouse (lot — номер лота, если их в треде
-    несколько): тогда автоматическая запись по ставкам не задвоит эту продажу, а если уже завела её —
-    уточнит сумму и покупателя."""
+    """Записать продажу вручную (например, с Toyhouse или в личке). Победителей её аукционов на DA,
+    Toyhouse и ych.commishes помощник записывает сам. currency: usd, points, eur, gbp.
+    url — ссылка на её лот на DeviantArt, тред-аукцион Toyhouse или аукцион ych.commishes (lot — номер лота
+    или слота, если их несколько): тогда автоматическая запись по ставкам не задвоит эту продажу, а если уже
+    завела её — уточнит сумму и покупателя. Ставки были на ych.commishes — лучше ссылка оттуда, не кросспост DA."""
     from . import sales
 
     cfg = load_config()
@@ -1627,14 +1777,18 @@ def data_health() -> str:
     какая доля выборки дочитана после окончания, сколько лотов из поиска, точность прогноза, продажи по валютам.
     Вызывай, если она спрашивает «можно ли этому верить», и перед price_plan/niche_forecast, если там
     уверенность низкая."""
-    from . import backfill, evidence
+    from . import backfill, commishes, evidence
 
+    cfg = load_config()
     with db.session() as conn:
         text = evidence.render_health(conn)
         try:
             line = backfill.progress(conn, time.time())
         except Exception:  # noqa: BLE001 — строка о истории рынка необязательна
             line = ""
+        if cfg.commishes.username or db.last_run(conn, f"{commishes.SOURCE}_market"):
+            cm_line = _bg_text(lambda: commishes.health_line(conn))
+            line = "\n".join(x for x in (line, cm_line) if x)
     return f"{text}\n{line}" if line else text
 
 
@@ -1875,11 +2029,16 @@ def unsold_lots(limit: int = 5) -> str:
 
 def auction_deadlines() -> str:
     """Когда заканчиваются её открытые аукционы на DA (по описанию) и какие уже кончились."""
-    from . import selling
+    from . import commishes, selling
 
     tz = load_config().posting.timezone
     with db.session() as conn:
-        return selling.render_ends(selling.auction_ends(conn, tz=tz), tz)
+        rows = selling.auction_ends(conn, tz=tz)
+        cm_lines = commishes.deadline_lines(conn)
+    if cm_lines and not rows:
+        return "Открытые аукционы ych.commishes (по часам её мака, конец с сайта):\n" + "\n".join(cm_lines)
+    text = selling.render_ends(rows, tz)
+    return text + ("\nych.commishes (конец с сайта, по часам её мака):\n" + "\n".join(cm_lines) if cm_lines else "")
 
 
 def unpaid_sales(older_than_days: int | None = None) -> str:
@@ -2050,9 +2209,15 @@ def ych_action(action: str, *, sale_id: str = "", title: str = "", amount: float
                 return h(word, id=sid)
             if not kind:
                 return "Нужно: format — ych или commission."
-            return h("offer", kind=kind, title=title, price=amount, currency=currency, slots=slots, hours=hours,
-                     platform=platform, deposit_pct=deposit_pct,
-                     turnaround_days=float(days) if days is not None else None)
+            out = h("offer", kind=kind, title=title, price=amount, currency=currency, slots=slots, hours=hours,
+                    platform=platform, deposit_pct=deposit_pct,
+                    turnaround_days=float(days) if days is not None else None)
+            if kind == "ych" and out.startswith("Сохранила"):
+                from . import commishes
+
+                hint = _bg_text(lambda: commishes.price_hint(conn, title, "ych", amount, currency or "rub"))
+                out += f"\nДля ориентира — {hint}" if hint else ""
+            return out
 
         def claim() -> str:
             return h("claim", client=buyer, what=title, id=sid, kind=kind, price=amount,
@@ -2263,6 +2428,14 @@ def _translation_note(text: str, target: str) -> str:
 # Claude Desktop шлёт имена, описания и схемы всех инструментов с каждым её сообщением, поэтому
 # инструментов мало, описания короткие, а длинные правила — в get_settings. Функции выше — их начинка.
 
+def _bg_text(fn) -> str:
+    """Необязательная строка (подсказка, здоровье): её сбой не ломает основной ответ."""
+    try:
+        return fn() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _need(**values) -> str:
     missing = [k for k, v in values.items() if v in (None, "", [], {})]
     return f"Нужно: {', '.join(missing)}." if missing else ""
@@ -2308,14 +2481,14 @@ def th_thread(thread: str, action: Literal["read", "reply_form"] = "read") -> st
 
 @tool(READ_ONLY, name="market")
 def market_tool(action: Literal["forecast", "search", "groups", "buyers", "what_sells", "norms", "my_works",
-                                "th", "th_mine", "th_prices", "similar", "backfill"],
+                                "th", "th_mine", "th_prices", "similar", "backfill", "commishes"],
                 keywords: list[str] | None = None, lot_type: str = "", my_price_usd: float | None = None,
                 my_price_points: float | None = None, deviation: str = "", query: str = "", pages: int = 1,
                 groups: list[str] | None = None, days: int | None = None, limit: int = 10,
                 by: Literal["species", "styles", "themes", "all"] = "species") -> str:
-    """forecast — цены похожих (keywords, lot_type, my_price_*, deviation); search (query); groups;
+    """forecast — цены похожих (keywords или deviation; lot_type, my_price_*); search (query); groups;
     buyers — кто ставит; what_sells; norms; my_works; th — спрос TH (by); th_mine; th_prices;
-    similar — похожие продавцы; backfill — история рынка."""
+    similar — похожие продавцы; backfill — история рынка; commishes — цены ych.commishes ($)."""
     return _pick(action, {
         "forecast": lambda: market_forecast(keywords, lot_type or None, my_price_usd, my_price_points,
                                             deviation or None),
@@ -2330,6 +2503,7 @@ def market_tool(action: Literal["forecast", "search", "groups", "buyers", "what_
         "th_prices": lambda: market_th_prices(days or 30),
         "similar": lambda: market_similar(days or 30),
         "backfill": market_backfill,
+        "commishes": lambda: market_commishes(days or 30, keywords),
     })
 
 
@@ -2355,7 +2529,7 @@ def forecast_tool(action: Literal["niches", "price", "accuracy", "best_time", "h
 def advice(action: Literal["tips", "week", "plan", "review", "unsold", "translate", "translate_ok", "translate_forget"],
            species: str = "", style: str = "", format: str = "", keywords: list[str] | None = None, url: str = "",
            limit: int = 5, text: str = "", translation: str = "", target: str = "") -> str:
-    """Советы: tips; week; plan — адопт (species, style, format); review (url поста DA); unsold;
+    """Советы: tips; week; plan — адопт (species, style, format; commishes — там); review (url поста DA); unsold;
     translate — английский её текста для DA/X, НЕ Toyhouse (text, target da|x; translation — показать);
     translate_ok / translate_forget (text id)."""
     return _pick(action, {
@@ -2384,11 +2558,16 @@ def feedback_tool(action: Literal["save", "declined", "report", "sent"], text: s
 
 @tool(SAFE_WEB)  # status пополняет её пинглист из «ping me» — пишет, значит не READ_ONLY
 def da_auctions(action: Literal["mine", "open", "status", "deadlines"], url: str = "", refresh: bool = True) -> str:
-    """Её аукционы DA: mine — ставки (refresh); open — открытые; status — один (url); deadlines."""
+    """Её аукционы DA и ych.commishes: mine — ставки (refresh); open — открытые; status — один (url); deadlines."""
+    def status() -> str:
+        if "commishes.com" in url.lower():
+            return commishes_status(url)
+        return auction_status(url)
+
     return _pick(action, {
         "mine": lambda: my_auctions(refresh),
         "open": list_my_open_auctions,
-        "status": lambda: _need(url=url) or auction_status(url),
+        "status": lambda: _need(url=url) or status(),
         "deadlines": auction_deadlines,
     })
 
@@ -2436,7 +2615,7 @@ def prepare_gallery(action: Literal["close", "folders", "rename"], works: list[s
                     rename: dict[str, str] | None = None, move: dict[str, list[str]] | None = None,
                     renames: dict[str, str] | None = None) -> str:
     """Черновик правок её галереи DA через API, без браузера; до «го» ничего не меняет: close — закрыть аукционы (works, пусто —
-    все; word CLOSED|SOLD; folder; from_folder; comment её слова, {winner} {amount}); folders — create,
+    все; word CLOSED|SOLD; folder, from_folder — убрать из; comment её слова, {winner} {amount}); folders — create,
     rename, move; rename — renames {работа: название}."""
     return _pick(action, {
         "close": lambda: prepare_close_auctions(works, word, folder, comment, record_sales, from_folder),
@@ -2516,7 +2695,7 @@ def sales_tool(action: Literal["record", "status", "list", "income", "unpaid", "
                url: str = "", lot: str = "", character_url: str = "", note: str = "", days: int | None = None,
                include_lots: bool = False, net: float | None = None, slots: int | None = None,
                hours: float | None = None, date: str = "", deposit_pct: float | None = None) -> str:
-    """Её деньги: record (title, amount, currency, platform deviantart|toyhouse|other, url, net — ₽ ей);
+    """Её деньги: record (title, amount, currency, platform deviantart|toyhouse|commishes|other, url, net — ₽ ей);
     status (sale_id; status и/или net; refunded|chargeback|disputed|no_pay — отметка); list; income; unpaid;
     remind; export; hours (ч), hourly, goal (₽), plan (адоптов/нед); report (date 2026-10); ych* — YCH и коммишены."""
     def record() -> str:
@@ -2880,9 +3059,17 @@ def promo_experiment(ref: str = "", text: str = "", items: list[str] | None = No
 
 def _stored_description(url: str) -> tuple[str | None, str]:
     """Ссылка на её работу → (полное описание из базы, название) или (None, почему нет)."""
-    from . import auctions, da_feeds
+    from . import auctions, commishes, da_feeds
 
+    got = commishes.parse_url(url)
     with db.session() as conn:
+        if got:
+            # Аукцион ych.commishes: описание есть только у её лотов (у чужих не храним).
+            rows = [r for r in commishes.lot_rows(conn, got[0]) if r["own"] and r["snippet"]]
+            if not rows:
+                return None, ("описания этого аукциона ych.commishes в базе нет (храню только у её аукционов, "
+                              "прочитанных da_auctions:status url=…) — вставь текст описания")
+            return str(rows[0]["snippet"]), str(rows[0]["title"] or "").split(" — ")[0]
         item = auctions.item_for_url(conn, url)
         if item is None:
             return None, "этой работы нет в базе — вставь текст описания или проверь пост через advice:review url=…"
@@ -2894,7 +3081,7 @@ def _stored_description(url: str) -> tuple[str | None, str]:
 
 
 def promo_checklist(text: str, lot_type: str = "") -> str:
-    from . import checklist
+    from . import checklist, commishes
     from .classify import classify_lot
 
     cfg = load_config()
@@ -2904,9 +3091,16 @@ def promo_checklist(text: str, lot_type: str = "") -> str:
         if desc is None:
             return f"Не проверяю: {title}."
         text = f"{title}\n{desc}"
-    kind = lot_type.strip().lower() or classify_lot("", text).lot_type
-    return checklist.render(checklist.check(text, kind, cfg.posting)) + (
-        "\nГотовые строки — подсказка: в пост она вставляет их сама, если согласна.")
+    if lot_type.strip().lower() == "commishes":
+        first = text.strip().split("\n", 1)[0]
+        items = commishes.listing_check(text, commishes.kind_of(first, text))
+        notes = commishes.listing_notes(text)
+    else:
+        kind = lot_type.strip().lower() or classify_lot("", text).lot_type
+        items = checklist.check(text, kind, cfg.posting) + commishes.crosspost_check(text)
+        notes = []
+    return "\n".join([checklist.render(items), *notes,
+                      "Готовые строки — подсказка: в пост она вставляет их сама, если согласна."])
 
 
 def promo_facts() -> str:
